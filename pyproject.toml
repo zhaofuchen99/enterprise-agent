@@ -1,0 +1,137 @@
+[project]
+name = "enterprise-data-agent"
+version = "0.1.0"
+description = "企业智能数据分析与决策 Agent"
+readme = "README.md"
+requires-python = "==3.12.*"
+
+# 依赖在此一次性锁定（开发流程 4.3）：避免 Phase 1.5 才发现版本冲突。
+# 约束故意放宽，具体版本以 uv.lock 为准。
+dependencies = [
+    # --- Web / API ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    # --- 配置与校验 ---
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # --- 数据库（Agent 运行库 + 演示业务库）---
+    "sqlalchemy[asyncio]>=2.0.36",
+    "alembic>=1.14",
+    "asyncmy>=0.2.10",
+    "cryptography>=43.0",
+    # --- Redis / 队列 ---
+    "redis>=5.2",
+    "arq>=0.26",
+    # --- Agent 编排 ---
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    # --- 向量库（TBC-05：须支持 SPARSE_FLOAT_VECTOR）---
+    "pymilvus>=2.4",
+    # --- 中文分词 ---
+    "jieba>=0.42.1",
+    # --- 可观测 ---
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
+    "opentelemetry-instrumentation-redis>=0.50b0",
+    "sentry-sdk>=2.19",
+    # --- 对象存储 ---
+    "aioboto3>=13.2",
+    # --- 通用 ---
+    "httpx>=0.28",
+    "tenacity>=9.0",
+    "pyjwt>=2.10",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "fakeredis>=2.26",
+    "pre-commit>=4.0",
+]
+# 不引入 types-redis：它是为 redis 4.x 编写的第三方 stub，而 redis>=5 自带 py.typed，
+# 两者同时存在会让 mypy 用过期签名覆盖真实类型（aclose 等新 API 会被误报为不存在）。
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app"]
+extend-exclude = ["docs", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle / pyflakes
+    "I",             # isort
+    "N",             # pep8-naming
+    "UP",            # pyupgrade
+    "B",             # flake8-bugbear
+    "C4",            # flake8-comprehensions
+    "SIM",           # flake8-simplify
+    "ASYNC",         # flake8-async
+    "RUF",           # ruff 专有
+    "S",             # flake8-bandit（本项目关心 SQL 注入与硬编码密钥）
+]
+ignore = [
+    "S101",   # assert：测试中大量使用
+    "B008",   # FastAPI 的 Depends() 默认值写法
+    # 本项目注释、文档字符串与用户可见文案均为中文，全角标点是正确写法而非笔误。
+    # RUF001/002/003 会把「（）：，」一律报为 ambiguous，属于纯噪音。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"app/tests/**" = ["S105", "S106", "S311"]
+"scripts/**" = ["S101", "S603", "S607"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "scripts"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "."
+explicit_package_bases = true
+warn_unreachable = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# 无类型标注的第三方库
+module = ["jieba.*", "arq.*", "aioboto3.*", "asyncmy.*", "fakeredis.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["app.tests.*"]
+disallow_untyped_defs = false
+warn_unreachable = false
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "integration: 需要真实外部依赖（Redis / MySQL / Milvus）",
+    "e2e: 需要完整多进程栈",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/tests/*"]

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 环境与密钥：任何情况下不得提交
+.env
+.env.*
+!.env.example
+
+# 本地数据（容器卷、语料、原始文档）
+data/
+.minio/
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# 操作系统
+.DS_Store
+Thumbs.db

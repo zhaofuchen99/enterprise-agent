@@ -1,0 +1,49 @@
+# CI 门禁（开发流程 7.3）：lint -> typecheck -> 分层约束 -> unit test
+#
+# 分层约束检查是**必经步骤**而非可选优化：违反进程边界的改动带来的性能与
+# 扩缩容问题要到运行时才暴露（开发流程 5.2）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装 Python 3.12
+        run: uv python install 3.12
+
+      - name: 安装依赖（锁定版本）
+        run: uv sync --frozen
+
+      - name: lint（ruff）
+        run: uv run ruff format --check app scripts && uv run ruff check app scripts
+
+      - name: typecheck（mypy）
+        run: uv run mypy app scripts
+
+      - name: 分层约束检查
+        run: uv run python scripts/check_layering.py
+
+      - name: 单元测试
+        run: uv run pytest -m "not integration and not e2e"
+
+      - name: 校验 Compose 语法
+        run: docker compose -f docker-compose.dev.yml config -q

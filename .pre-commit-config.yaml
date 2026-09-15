@@ -1,0 +1,40 @@
+# 提交前自动执行的检查（开发流程 4.3）
+# 注意：pre-commit 只做快速反馈，权威门禁是 CI（见 .github/workflows/ci.yml），
+# 因为 --no-verify 可以绕过本地钩子。
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy（类型检查）
+        entry: uv run mypy app scripts
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: layering
+        name: 分层约束检查
+        entry: uv run python scripts/check_layering.py
+        language: system
+        types: [python]
+        pass_filenames: false

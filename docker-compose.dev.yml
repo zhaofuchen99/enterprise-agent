@@ -1,0 +1,126 @@
+# 开发环境有状态组件（开发流程 4.1 / 6.1）
+#
+# Milvus 放在 rag profile 下：它单独就要 4–8GB 内存，而本机 WSL 只有 7.6GB。
+# Phase 0–4 不需要它，Phase 5 开工前再决定是调 WSL 内存还是换向量库。
+#   make up        -> redis / agent-mysql / business-mysql / minio
+#   make rag-up    -> 额外拉起 milvus
+
+name: enterprise-agent-dev
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ea-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    ports:
+      # 宿主端口用 6381 而非 6379：本机 WSL 的原生 redis-server 已占用 6379
+      # 且存有另一个在跑项目的缓存数据；6380 被 redis-stack 占用。
+      # 容器内仍是 6379，只有宿主映射不同，改 REDIS_URL 即可。
+      - "6381:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent-mysql:
+    image: mysql:8.0
+    container_name: ea-agent-mysql
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --innodb-buffer-pool-size=256M
+      --max-connections=200
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pw
+      MYSQL_DATABASE: agent
+      MYSQL_USER: agent
+      MYSQL_PASSWORD: agent_pw
+    ports:
+      - "3306:3306"
+    volumes:
+      - agent-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pw"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  business-mysql:
+    # 演示业务库：SQL Tool 只允许用只读账号访问（详细设计 19.2）
+    image: mysql:8.0
+    container_name: ea-business-mysql
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --innodb-buffer-pool-size=256M
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pw
+      MYSQL_DATABASE: business
+      MYSQL_USER: readonly
+      MYSQL_PASSWORD: readonly_pw
+    ports:
+      - "3307:3306"
+    volumes:
+      - business-mysql-data:/var/lib/mysql
+      - ./scripts/init-business-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pw"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  minio:
+    # 用 quay.io 而非 Docker Hub 引用：本机 daemon 配的 docker.m.daocloud.io 镜像源
+    # 对 minio/minio 返回 403。quay.io 是 MinIO 官方的备用发布地址，不经过该镜像源。
+    # （开发环境本可用 STORAGE_BACKEND=local 免去 MinIO，但保留它才能验证 s3 存储契约。）
+    image: quay.io/minio/minio:latest
+    container_name: ea-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  milvus:
+    profiles: ["rag"]
+    image: milvusdb/milvus:v2.4.15
+    container_name: ea-milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      COMMON_STORAGETYPE: local
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus-data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+volumes:
+  redis-data:
+  agent-mysql-data:
+  business-mysql-data:
+  minio-data:
+  milvus-data:
