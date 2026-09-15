@@ -1,10 +1,14 @@
 # 提交前自动执行的检查（开发流程 4.3）
-# 注意：pre-commit 只做快速反馈，权威门禁是 CI（见 .github/workflows/ci.yml），
-# 因为 --no-verify 可以绕过本地钩子。
+#
+# pre-commit 只做快速反馈，权威门禁是 CI（.github/workflows/ci.yml）——
+# 本地钩子可以用 --no-verify 绕过，CI 不能。
+#
+# 安装：uv run pre-commit install
+# 手动全量跑：uv run pre-commit run --all-files
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
         exclude: \.md$
@@ -16,8 +20,16 @@ repos:
         args: ["--maxkb=2048"]
       - id: detect-private-key
 
+  # 密钥扫描：拦截 sk-ant- / sk- / AKIA / ghp_ 等常见 API key 格式。
+  # 这一道比 .gitignore 更靠得住——它检查**内容**，不管文件叫什么名字，
+  # 因此能抓住「把 key 写进 config.py」这类 gitignore 防不住的情况。
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
+    rev: v0.16.7
     hooks:
       - id: ruff
         args: ["--fix"]
@@ -25,6 +37,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: no-env-staged
+        name: 禁止提交 .env 类密钥文件
+        entry: uv run python scripts/check_no_env_staged.py
+        language: system
+        always_run: true
+        pass_filenames: false
+
       - id: mypy
         name: mypy（类型检查）
         entry: uv run mypy app scripts
