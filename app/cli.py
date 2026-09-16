@@ -66,6 +66,23 @@ async def _model_smoke(settings: Settings) -> int:
     """
     gateway = build_model_gateway(settings)
     failures: list[str] = []
+
+    def report_failure(label: str, exc: AgentError | EmbeddingDimensionError) -> None:
+        """报告一次失败。**必须带 details**。
+
+        自检命令的全部价值在于给出可行动的线索。只打印 `AgentError.message`
+        （面向用户的通用文案，如「向量化服务返回错误」）等于什么都没说——
+        真正有用的 `status_code` / `attempts` 都在 `details` 里。
+        本项目自己的诊断工具尤其不能犯这个错。
+        """
+        if isinstance(exc, AgentError):
+            failures.append(f"{label}：{exc.code.value} - {exc.message}")
+            print(f"  ✗ {label}失败：{exc.code.value} - {exc.message}")
+            print(f"    详情（仅诊断）：{exc.details}")
+        else:
+            failures.append(f"{label}：{exc}")
+            print(f"  ✗ {label}失败：{exc}")
+
     try:
         print(f"主模型   ：{settings.model_name} @ {settings.model_base_url}")
         try:
@@ -73,9 +90,7 @@ async def _model_smoke(settings: Settings) -> int:
                 SMOKE_PROMPT, SmokeAnswer, question="请判断：1 + 1 是否等于 2？"
             )
         except AgentError as exc:
-            failures.append(f"结构化调用：{exc.code.value} - {exc.message}")
-            print(f"  ✗ 结构化调用失败：{exc.code.value} - {exc.message}")
-            print(f"    详情（仅诊断）：{exc.details}")
+            report_failure("结构化调用", exc)
         else:
             print(f"  ✓ 结构化调用成功：{result.value.model_dump()}")
             print(
@@ -84,15 +99,15 @@ async def _model_smoke(settings: Settings) -> int:
                 f"prompt {SMOKE_PROMPT.name}({result.prompt_version})"
             )
 
-        print(
-            f"向量模型：{settings.embedding_model} @ "
-            f"{settings.embedding_base_url or settings.model_base_url}"
-        )
+        # 打印**生效的**端点而不是配置里的那一项：`EMBEDDING_BASE_URL` 缺省时
+        # 会回落到 `MODEL_BASE_URL`，于是向量化请求会被悄悄发到聊天模型的服务商那里。
+        # 这一行是发现那类「配漏了但没报错」问题的第一现场。
+        effective_embedding_url = settings.embedding_base_url or settings.model_base_url
+        print(f"向量模型：{settings.embedding_model} @ {effective_embedding_url}")
         try:
             vectors = await gateway.embed(["华东地区 Q3 净销售额"])
         except (AgentError, EmbeddingDimensionError) as exc:
-            failures.append(f"向量化：{exc}")
-            print(f"  ✗ 向量化失败：{exc}")
+            report_failure("向量化", exc)
         else:
             print(f"  ✓ 向量化成功：{len(vectors)} 条 × {len(vectors[0])} 维")
     finally:
