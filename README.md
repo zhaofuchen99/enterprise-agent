@@ -62,6 +62,28 @@ curl -s localhost:8000/health/ready    # {"status":"ready","checked":["redis"]}
 make check                             # lint + 类型 + 分层约束 + 测试
 ```
 
+### 5. 调一次接口（Phase 1 起可用）
+
+演示账号 `analyst` / `admin`，口令见 `app/repositories/user_repo.py` 的 `DEMO_ACCOUNTS`
+（开发环境占位，`APP_ENV=prod` 时不会写入任何用户）。
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"analyst","password":"analyst-dev-pass"}' | python -c 'import sys,json;print(json.load(sys.stdin)["data"]["access_token"])')
+
+curl -s -X POST localhost:8000/api/agent/chat -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
+  -d '{"message":"华东区第三季度销售额是多少"}'
+
+# 拿上一步返回的 task_id 查状态
+curl -s localhost:8000/api/agent/tasks/<task_id> -H "Authorization: Bearer $TOKEN"
+```
+
+所有响应（含错误）都是统一外壳 `{code, message, data, trace_id, retryable}`；
+`trace_id` 与响应头 `X-Trace-Id` 一致，可直接拿去日志里检索。
+
+> **Phase 1 的任务会停在 `QUEUED`**——本阶段只登记不入队，入队与执行在 Phase 1.5 接入。
+
 ---
 
 ## 常用命令
@@ -126,14 +148,14 @@ make layering
 app/
 ├── main.py                     # API 进程入口
 ├── worker.py                   # Worker 进程入口
-├── api/            鉴权、路由、参数校验
+├── api/            schemas / errors / middleware / deps / auth / chat / tasks / ...
 ├── agent/          LangGraph 编排：graph / state / routing / nodes / prompts / schemas
 ├── tools/          sql（schema/generator/validator/executor）、rag、search
-├── domain/         evidence / conflict / task / plan / loop / review（纯模型）
-├── services/       task_runner / event_bus / rate_limit / ...
-├── repositories/   数据访问实现
+├── domain/         user / conversation / task / evidence / conflict / plan / loop / review（纯模型）
+├── services/       auth_service / task_service / task_runner / event_bus / rate_limit / ...
+├── repositories/   user_repo / conversation_repo / task_repo（Protocol + 实现）
 ├── infrastructure/ db / redis / milvus / storage / model_gateway / observability / logging
-├── core/           config / cache / errors / security
+├── core/           config / ids / cache / errors / security
 └── tests/
 ```
 
@@ -161,6 +183,9 @@ LOOP__MAX_TOTAL_STEPS=30
 | 本机 WSL 内存 7.6GB | Milvus 需 4–8GB，与 MySQL/Redis/MinIO 并存会很紧张 | Milvus 置于 `rag` profile，Phase 0–4 不受影响；Phase 5 前需决定是否上调 WSL 内存或更换向量库 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
 | `MODEL_*` / `EMBEDDING_*` 未选型（TBC-04） | Phase 3 起才真正需要 | 见开发流程 12.2 |
+| 仓储与限流是进程内实现 | 重启丢数据、多实例互不可见 | Phase 1.5 / 2 替换；替换面收敛在 `app/main.py` 的 `wire_dependencies()` |
+| `POST /api/agent/chat` 不入队 | 任务停在 `QUEUED`，无 Worker 执行 | 预期行为，Phase 1.5 接入队列 |
+| 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |
 
 ---
 
