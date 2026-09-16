@@ -35,6 +35,7 @@ from app.repositories import Repositories
 from app.repositories.conversation_repo import InMemoryConversationRepository
 from app.repositories.task_repo import InMemoryTaskRepository
 from app.repositories.user_repo import InMemoryUserRepository, seed_demo_users
+from app.tools.sql.schemas import SqlExecutionResult, ValidatedSql
 
 
 @dataclass
@@ -255,6 +256,48 @@ def _failure_error(failure: FakeFailure) -> AgentError:
 def build_model_gateway() -> ModelGateway:
     """类型标注成协议，让用例里的替身与生产实现受同一份契约约束。"""
     return FakeModelGateway()
+
+
+@dataclass
+class FakeSqlRunner:
+    """`SqlRunner` 的替身：按脚本返回执行结果或抛错。
+
+    **为什么执行器要替身而校验器不要**（本文件开头的头号纪律是「能跑真实实现时
+    就别写替身」）：`SqlValidator` 是纯函数，跑真实实现的成本几乎为零，
+    替身它只会让「校验规则写错了」这类缺陷逃过测试。而执行器连的是真实 MySQL，
+    单元测试既不能依赖它，也无法用它构造「第 3 次修复时返回除零错误」这类时序。
+
+    真实 `SqlExecutor` 的 SQL 路径并未因此失去覆盖：`make test-integration`
+    下的用例对着真实业务库跑同一条链路，两条路径各有各的验证。
+
+    Attributes:
+        results: 按序弹出的脚本。每项是 `SqlExecutionResult` 或 `Exception` 实例；
+            **用尽后重复最后一项**，与 `FakeModelGateway` 同一约定。
+        calls: 收到的 `ValidatedSql`，用于断言「执行的是重写后的 SQL 而不是原文」。
+        closed: 是否已被 `aclose()`。
+    """
+
+    results: list[Any] = field(default_factory=list)
+    calls: list[ValidatedSql] = field(default_factory=list)
+    closed: bool = False
+    _cursor: int = 0
+
+    async def execute(self, validated: ValidatedSql) -> SqlExecutionResult:
+        self.calls.append(validated)
+        if not self.results:
+            raise AssertionError(
+                "FakeSqlRunner 没有脚本可返回：请在用例里显式设置 results。"
+                "刻意不提供默认成功——否则「忘了配脚本」会表现为一个看似通过的用例。"
+            )
+        reply = self.results[min(self._cursor, len(self.results) - 1)]
+        self._cursor += 1
+        if isinstance(reply, Exception):
+            raise reply
+        assert isinstance(reply, SqlExecutionResult)  # 替身脚本写错了要立刻炸
+        return reply
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def build_memory_repositories(settings: Settings) -> Repositories:

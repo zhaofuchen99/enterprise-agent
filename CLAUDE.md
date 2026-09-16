@@ -22,7 +22,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 1.5 基础设施接入 | ✅ 完成 | Redis 键与 Lua 脚本、Redis 限流 + 降级 + 熔断、Redis 任务仓储（临时）、arq 队列与 Worker 骨架（含自愈重启）、事件流、取消链路、对象存储抽象、OTel 与跨进程 trace。`make check` 全绿（267 测试）+ 7 条 integration 用例；验收记录见开发流程 11.1 |
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
-| 4–9 冲刺切片 | ⬜ 未开始 | 秋招冲刺路线见下方，分两批交付 |
+| 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
+| 5–9 冲刺切片 | ⬜ 未开始 | 第 2 批：RAG 裁剪版 → 最小 Graph → Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -55,13 +56,22 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
    向量那半条只需本机 Ollama 在跑）。
 6. **`.env` 里的 `MODEL_API_KEY` 需要你手动填**：它是密钥，不入库、不由脚本生成。
    其余模型配置（`deepseek-flash` / `bge-m3` / 两个 base_url / 45s 超时）已写好。
+7. **`configs/schema_catalog.yaml` 是安全白名单**：SQL Tool 放行哪些表、列、JOIN、
+   函数，全由它决定，代码里没有第二份。往里面加一行等于放开一条权限，改动要 review，
+   并**同时升 `version`**（版本号会随结果进 Trace，用于回答「昨天还能查今天为什么被拦」）。
+8. **`SqlAttempt` 还没有落库的调用方**：SQL Tool 把每次尝试（生成/修复/执行）组装成
+   该对象放进 `ToolResult.payload["attempts"]`，形状对齐 `agent_tool_call` 表。
+   落库在 Phase 6/7 的 Tool 执行器里做——那时才有 `task_id` / `step_id`。
+9. **SQL 自修复的预算在 `LOOP__MAX_SQL_REPAIRS`**（不是 `SQL_TOOL__*`）：它属于
+   5.4 那四类「相互独立、不可借用」的循环预算，与 `max_replans` 放在一起看。
 
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
 |---|---|
 | ~~任务仓储换 MySQL~~ **已完成**（`RedisTaskRepository` 与 5 个索引键已删） | ✅ Phase 2 |
-| `agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_trace_event` 的仓储实现（表已建，仓储待写；调用方在 Phase 6/7 才出现） | Phase 6 / 7 |
+| `agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_trace_event` 的仓储实现（表已建，仓储待写；调用方在 Phase 6/7 才出现）。**`agent_tool_call` 的待写数据已经就位**：SQL Tool 的 `ToolResult.payload["attempts"]` 就是它的行 | Phase 6 / 7 |
+| `schema_catalog` / `agent_config` 建表（切片内目录是 `configs/schema_catalog.yaml`，SQL Tool 已按它的形状写好 `SchemaCatalog`；接表只需换 `SchemaProvider` 的加载实现） | 后置 |
 | `make cleanup` 的保留期策略与实现（详细设计 16.12） | Phase 2 收尾 |
 | 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |
 | `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
@@ -161,6 +171,19 @@ make seed-business ROWS=20000  # 快速试跑业务库（改规模）
 make test-integration  # 需要真实 Redis / MySQL（前置 make up；会自动建 agent_test 库）
 make redis-cli   # 排查队列与 Stream
 ```
+
+SQL Tool（Phase 4，**当前唯一能端到端演示的链路**）：
+
+```bash
+make sql Q="2025年华东地区Q3的净销售额是多少"          # 自然语言 → SQL → 真数据 → 证据
+make sql Q="2025年Q3各区域的净销售额" REGION=华东      # 模拟 data_scope（受限用户只看得到华东）
+make sql Q="帮我把表清空" SQL="DROP TABLE dim_region"  # 跳过生成、仍走全部校验：单独证明「安全由代码保证」
+make eval-sql    # 金标评测（10 题），同时打印「内容正确率」与「列形状一致率」
+```
+
+> 危险 SQL 的演示**必须走 `--sql`**：模型在正常对话下不会写出 `DROP TABLE`，
+> 这本身是第一层防线在工作。要证明「代码层拦得住」，就得绕过模型直接喂一条
+> 危险 SQL 进同一个校验器——否则演示出来的只是「模型很乖」。
 
 单独跑：`make lint` / `make typecheck` / `make layering` / `make test` / `make fmt`
 

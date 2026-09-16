@@ -36,7 +36,10 @@ class AgentEvidence(Base):
     task_id: Mapped[ulid_ref]
     #: 产生该证据的工具调用。非工具来源（如用户输入）可空。
     tool_call_id: Mapped[ulid_ref_opt]
-    #: SQL / RAG / SEARCH
+    #: SQL / DOCUMENT / WEB —— 取值按详细设计 13.1 的 `Evidence.source_type`，
+    #: 不是「SQL / RAG / SEARCH」。RAG 产出的证据按 13.1 记为 `DOCUMENT`：
+    #: `locator` 与 `reliability` 都是按「文档」的语义定义的（document_id /
+    #: version / chunk_id）。表结构未变，`String(16)` 两者都装得下。
     source_type: Mapped[str] = mapped_column(String(16))
     title: Mapped[str | None] = mapped_column(String(255))
     #: 该证据支撑的具体陈述。这是「答案有证据」里被引用的那一句。

@@ -1,0 +1,295 @@
+# 业务库 Schema 目录（详细设计 10.2 / 16.9）
+#
+# ## 为什么是 YAML 而不是 `schema_catalog` 表
+#
+# 详设 16.9 规定目录由管理员发布版本、存 `schema_catalog` 表。冲刺方案 §10 把
+# 「建 `schema_catalog` / `agent_config` 表」列为**后置项**——切片内目录以本文件承载，
+# 表结构与版本语义（下文的 `version`）先按同一形状留好，接表时只需换 `SchemaProvider`
+# 的加载实现，调用方与校验逻辑一行不动。
+#
+# ## 这个文件是**安全白名单**，不是文档
+#
+# @see 详细设计 10.5「分层安全责任」：AST 校验依赖的不是「模型应该会遵守」，
+# 而是这份目录。**目录里没写的表、列、函数、JOIN，一律拒绝执行**——
+# 因此往这里加一行等于放开一条权限，改动需要 review。
+#
+# `version` 进 Trace 与 `SqlToolResult`：一次「昨天还能查、今天被拦了」的排查，
+# 必须能回答「是目录变了还是模型变了」。改动本文件必须同时升版本号。
+version: "2026.09.16-1"
+
+# ------------------------------------------------------- 数据权限谓词（10.4 第 11 步）
+#
+# `app_user.data_scope_json` 里存的是**区域名称**（TBC-03；演示库的 analyst 账号
+# 是 `["华东"]`，见 `app/repositories/user_repo.py` 的 `DEMO_ACCOUNTS`）。
+# 而事实表上只有 `region_id`，因此需要一个「名称 -> ID」的解析路径。
+#
+# 这里把解析方式**声明在目录里**而不是写死在代码中：换一套权限维度
+# （按产品线、按渠道）时改的是这份 YAML，不是校验器。
+# 判定规则：表的 `scope_column` 恰好等于 `resolve.match_column` 时直接过滤，
+# 否则用子查询把名称解析成 `scope_column` 需要的值。
+scope:
+  resolve:
+    table: dim_region
+    match_column: region_name
+    key_column: region_id
+
+# --------------------------------------------------------------------- 表
+tables:
+  - name: fact_sales_order_item
+    description: 销售订单明细事实表，一行 = 一个订单行
+    grain: 订单行
+    time_column: order_date
+    #: 数据权限注入落点（详设 10.4 第 11 步）：目录驱动的服务端谓词加在这一列上。
+    #: 没有这一项的表表示不按区域划分，权限过滤对它不产生谓词。
+    scope_column: region_id
+    columns:
+      - { name: order_id, data_type: CHAR(26), description: 订单 ID, sensitive_level: PUBLIC }
+      - { name: order_date, data_type: DATE, description: 下单日期，同比环比一律按它切, sensitive_level: PUBLIC }
+      - { name: region_id, data_type: CHAR(26), description: 区域 ID, sensitive_level: PUBLIC }
+      - { name: channel_id, data_type: CHAR(26), description: 渠道 ID, sensitive_level: PUBLIC }
+      - { name: product_id, data_type: CHAR(26), description: 产品 ID, sensitive_level: PUBLIC }
+      - { name: customer_id, data_type: CHAR(26), description: 客户 ID（不直接暴露客户名称）, sensitive_level: PUBLIC }
+      - { name: quantity, data_type: INT, description: 数量, sensitive_level: PUBLIC }
+      - { name: gross_amount, data_type: "DECIMAL(14,2)", description: 含税销售额, sensitive_level: INTERNAL }
+      - { name: discount_amount, data_type: "DECIMAL(14,2)", description: 折扣金额, sensitive_level: INTERNAL }
+      - { name: return_amount, data_type: "DECIMAL(14,2)", description: 退货冲减金额, sensitive_level: INTERNAL }
+      - { name: net_amount, data_type: "DECIMAL(14,2)", description: 净销售额 = 含税 - 折扣 - 退货, sensitive_level: INTERNAL }
+      - { name: currency, data_type: CHAR(3), description: 币种, sensitive_level: PUBLIC }
+    joins:
+      - { to: dim_region, condition: "fact_sales_order_item.region_id = dim_region.region_id", cardinality: many_to_one }
+      - { to: dim_channel, condition: "fact_sales_order_item.channel_id = dim_channel.channel_id", cardinality: many_to_one }
+      - { to: dim_product, condition: "fact_sales_order_item.product_id = dim_product.product_id", cardinality: many_to_one }
+      - { to: dim_customer, condition: "fact_sales_order_item.customer_id = dim_customer.customer_id", cardinality: many_to_one }
+
+  - name: sales_target
+    description: 销售目标表，一行 = 某月 × 区域 × 产品线的目标净销售额
+    grain: 月 × 区域 × 产品线
+    time_column: period_month
+    scope_column: region_id
+    columns:
+      - { name: period_month, data_type: DATE, description: 目标月份（取当月 1 日）, sensitive_level: PUBLIC }
+      - { name: region_id, data_type: CHAR(26), description: 区域 ID, sensitive_level: PUBLIC }
+      - { name: product_line_id, data_type: CHAR(26), description: 产品线 ID, sensitive_level: PUBLIC }
+      - { name: target_amount, data_type: "DECIMAL(16,2)", description: 目标净销售额, sensitive_level: INTERNAL }
+    joins:
+      - { to: dim_region, condition: "sales_target.region_id = dim_region.region_id", cardinality: many_to_one }
+      - { to: dim_product_line, condition: "sales_target.product_line_id = dim_product_line.product_line_id", cardinality: many_to_one }
+
+  - name: inventory_snapshot
+    description: 库存周快照，一行 = 某周 × 区域 × 产品线
+    grain: 周 × 区域 × 产品线
+    time_column: snapshot_week
+    scope_column: region_id
+    columns:
+      - { name: snapshot_week, data_type: DATE, description: 快照周（取当周周一）, sensitive_level: PUBLIC }
+      - { name: region_id, data_type: CHAR(26), description: 区域 ID, sensitive_level: PUBLIC }
+      - { name: product_line_id, data_type: CHAR(26), description: 产品线 ID, sensitive_level: PUBLIC }
+      - { name: available_qty, data_type: INT, description: 可用库存, sensitive_level: INTERNAL }
+      - { name: safety_stock, data_type: INT, description: 安全库存线, sensitive_level: INTERNAL }
+      - { name: warehouse_count, data_type: INT, description: 仓库数, sensitive_level: PUBLIC }
+    joins:
+      - { to: dim_region, condition: "inventory_snapshot.region_id = dim_region.region_id", cardinality: many_to_one }
+      - { to: dim_product_line, condition: "inventory_snapshot.product_line_id = dim_product_line.product_line_id", cardinality: many_to_one }
+
+  - name: dim_region
+    description: 区域维度
+    grain: 区域
+    time_column: null
+    #: dim_region 是权限谓词的**来源表**：对它自己按 region_name 过滤，
+    #: 使受限用户连其他区域的维度行都看不到（否则可反推出区域清单）。
+    scope_column: region_name
+    columns:
+      - { name: region_id, data_type: CHAR(26), description: 区域 ID, sensitive_level: PUBLIC }
+      - { name: region_code, data_type: VARCHAR(16), description: 区域编码, sensitive_level: PUBLIC }
+      - { name: region_name, data_type: VARCHAR(32), description: 区域名称，如「华东」, sensitive_level: PUBLIC }
+      - { name: province_count, data_type: INT, description: 下辖省份数（口径，语料中的 SCOPE 冲突比对依据）, sensitive_level: PUBLIC }
+    joins: []
+
+  - name: dim_channel
+    description: 渠道维度
+    grain: 渠道
+    time_column: null
+    columns:
+      - { name: channel_id, data_type: CHAR(26), description: 渠道 ID, sensitive_level: PUBLIC }
+      - { name: channel_code, data_type: VARCHAR(16), description: 渠道编码, sensitive_level: PUBLIC }
+      - { name: channel_name, data_type: VARCHAR(32), description: 渠道名称（直营/经销/电商/KA）, sensitive_level: PUBLIC }
+      - { name: channel_type, data_type: VARCHAR(16), description: 渠道类型 DIRECT/PARTNER/ONLINE, sensitive_level: PUBLIC }
+    joins: []
+
+  - name: dim_product_line
+    description: 产品线维度
+    grain: 产品线
+    time_column: null
+    columns:
+      - { name: product_line_id, data_type: CHAR(26), description: 产品线 ID, sensitive_level: PUBLIC }
+      - { name: product_line_code, data_type: VARCHAR(16), description: 产品线编码, sensitive_level: PUBLIC }
+      - { name: product_line_name, data_type: VARCHAR(64), description: 产品线名称, sensitive_level: PUBLIC }
+      - { name: category, data_type: VARCHAR(32), description: 品类, sensitive_level: PUBLIC }
+    joins: []
+
+  - name: dim_product
+    description: 产品维度
+    grain: 产品
+    time_column: launch_date
+    columns:
+      - { name: product_id, data_type: CHAR(26), description: 产品 ID, sensitive_level: PUBLIC }
+      - { name: product_code, data_type: VARCHAR(32), description: 产品编码, sensitive_level: PUBLIC }
+      - { name: product_name, data_type: VARCHAR(128), description: 产品名称, sensitive_level: PUBLIC }
+      - { name: product_line_id, data_type: CHAR(26), description: 产品线 ID, sensitive_level: PUBLIC }
+      - { name: list_price, data_type: "DECIMAL(12,2)", description: 标价, sensitive_level: INTERNAL }
+      - { name: launch_date, data_type: DATE, description: 上市日期, sensitive_level: PUBLIC }
+      - { name: status, data_type: VARCHAR(16), description: 产品状态 ACTIVE/INACTIVE, sensitive_level: PUBLIC }
+    joins:
+      - { to: dim_product_line, condition: "dim_product.product_line_id = dim_product_line.product_line_id", cardinality: many_to_one }
+
+  - name: dim_customer
+    description: 客户维度
+    grain: 客户
+    time_column: null
+    scope_column: region_id
+    columns:
+      - { name: customer_id, data_type: CHAR(26), description: 客户 ID, sensitive_level: PUBLIC }
+      - { name: customer_code, data_type: VARCHAR(32), description: 客户编码, sensitive_level: INTERNAL }
+      #: SENSITIVE + allowed_roles 是「敏感字段」这条安全规则的唯一落点。
+      #: 客户名称属于客户隐私，只有 ADMIN 可取——这也让 10.4 第 7 步
+      #: 「列存在且用户角色可访问」有真实用例可测，而不是一条没执行过的分支。
+      - name: customer_name
+        data_type: VARCHAR(128)
+        description: 客户名称（客户隐私，仅 ADMIN 可取）
+        sensitive_level: SENSITIVE
+        allowed_roles: [ADMIN]
+      - { name: region_id, data_type: CHAR(26), description: 所属区域 ID, sensitive_level: PUBLIC }
+      - { name: channel_id, data_type: CHAR(26), description: 归属渠道 ID, sensitive_level: PUBLIC }
+      - { name: customer_level, data_type: VARCHAR(16), description: 客户等级 A/B/C, sensitive_level: INTERNAL }
+    joins:
+      - { to: dim_region, condition: "dim_customer.region_id = dim_region.region_id", cardinality: many_to_one }
+      - { to: dim_channel, condition: "dim_customer.channel_id = dim_channel.channel_id", cardinality: many_to_one }
+
+# ------------------------------------------------------------------- 指标
+#
+# 指标目录是**口径的唯一出处**（详设 10.9：生产 SQL 必须由指标目录注入口径，
+# 不从示例硬编码推断）。`expression` 会被原样渲染进 prompt，因此这里写错
+# 等于全项目的净销售额都算错——改动须与数据负责人确认并升 `version`。
+#
+# `aliases` 供 SchemaProvider 做**确定性**指标匹配（10.2「先匹配指标目录」）：
+# 命中别名即代表这条指标进上下文，不进模型判断，避免「该带的口径没带上」。
+metrics:
+  - code: net_sales
+    name: 净销售额
+    aliases: [净销售额, 净销售, 销售额, 收入]
+    expression: "SUM(fact_sales_order_item.net_amount)"
+    unit: CNY
+    grain: 订单行
+    required_filters: ["order_date 区间"]
+    owner: 财务部
+    version: v1.2
+    note: 净销售额 = 含税 - 折扣 - 退货。月度经营报告中的「销售额」若未特别说明，多为含税口径，与本指标存在 1–2% 差异。
+
+  - code: gross_sales
+    name: 含税销售额
+    aliases: [含税销售额, 含税收入, 毛销售额]
+    expression: "SUM(fact_sales_order_item.gross_amount)"
+    unit: CNY
+    grain: 订单行
+    required_filters: ["order_date 区间"]
+    owner: 财务部
+    version: v1.2
+
+  - code: discount_amount
+    name: 折扣金额
+    aliases: [折扣金额, 折扣额, 折扣]
+    expression: "SUM(fact_sales_order_item.discount_amount)"
+    unit: CNY
+    grain: 订单行
+    required_filters: ["order_date 区间"]
+    owner: 财务部
+    version: v1.1
+
+  - code: return_amount
+    name: 退货金额
+    aliases: [退货金额, 退货额, 退货]
+    expression: "SUM(fact_sales_order_item.return_amount)"
+    unit: CNY
+    grain: 订单行
+    required_filters: ["order_date 区间"]
+    owner: 财务部
+    version: v1.1
+
+  - code: order_count
+    name: 订单行数
+    aliases: [订单数, 订单量, 订单行数, 单量]
+    # 写成 `COUNT(表.列)` 而不是 `COUNT(*)`：order_id 非空，两者等价，
+    # 但表达式里带上表名后 SchemaProvider 才能把它归到 fact_sales_order_item
+    # （见 `SchemaProvider._expand_tables` 的「指标表达式 → 表」那一步）。
+    # 写成 `COUNT(*)` 的话它一个表都匹配不到，只能退回「全部事实表」，
+    # 于是 target 与 inventory 会被无关地送进 prompt。
+    expression: "COUNT(fact_sales_order_item.order_id)"
+    unit: 行
+    grain: 订单行
+    required_filters: ["order_date 区间"]
+    owner: 销售运营部
+    version: v1.0
+
+  - code: sales_target_amount
+    name: 目标净销售额
+    aliases: [目标净销售额, 目标销售额, 销售目标, 目标]
+    expression: "SUM(sales_target.target_amount)"
+    unit: CNY
+    grain: 月 × 区域 × 产品线
+    required_filters: ["period_month 区间"]
+    owner: 财务部
+    version: v1.0
+    note: 目标按月 × 区域 × 产品线存储，与事实表的日粒度不同。做达成率时先把事实聚合到月，再按 (月, 区域, 产品线) 关联，不要直接按日关联。
+
+  - code: available_qty
+    name: 可用库存
+    aliases: [可用库存, 库存, 库存量, 安全库存]
+    expression: "inventory_snapshot.available_qty"
+    unit: 件
+    grain: 周 × 区域 × 产品线
+    required_filters: ["snapshot_week 区间"]
+    owner: 供应链部
+    version: v1.0
+    note: 安全线在同行的 safety_stock 列，库存是否低于安全线应比较 available_qty < safety_stock，不要硬编码阈值。
+
+# ----------------------------------------------------------------- 函数白名单
+#
+# 详设 10.4 第 9 步：函数属于允许集合。**默认拒绝**——没列在这里的函数
+# （含 SLEEP / BENCHMARK / LOAD_FILE 这类资源与侧信道函数）一律不执行。
+# 用大写写：校验时统一转大写比对，MySQL 函数名大小写不敏感。
+allowed_functions:
+  # 聚合
+  - SUM
+  - COUNT
+  - AVG
+  - MIN
+  - MAX
+  - ROUND
+  - ABS
+  - CEIL
+  - FLOOR
+  # 日期
+  - DATE
+  - YEAR
+  - MONTH
+  - QUARTER
+  - DATE_FORMAT
+  - STR_TO_DATE
+  - DATE_ADD
+  - DATE_SUB
+  - DATEDIFF
+  - LAST_DAY
+  - TIMESTAMPDIFF
+  # 条件与类型
+  - COALESCE
+  - IFNULL
+  - NULLIF
+  - IF
+  - CAST
+  - CONVERT
+  # 字符串
+  - CONCAT
+  - SUBSTRING
+  - TRIM
+  - UPPER
+  - LOWER

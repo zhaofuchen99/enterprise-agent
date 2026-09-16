@@ -92,6 +92,45 @@ class ModelTuning(BaseModel):
     thinking_enabled: bool = False
 
 
+class SqlToolTuning(BaseModel):
+    """SQL Tool 参数（详细设计 19.5 的 `sql_tool` 段）。
+
+    **段名为什么可以直接叫 `sql_tool`**：同 `RedisTuning` / `ModelTuning` 的说明——
+    那两个是「已有扁平同名字段、怕 `extra="ignore"` 静默吞掉写错的键」才加的
+    后缀，而本项目没有扁平的 `SQL_*` 字段，因此这里与文档同名即可，
+    环境变量是 `SQL_TOOL__MAX_ROWS` 而不是 `SQL_TUNING__MAX_ROWS`。
+
+    **修复预算不在这里**：详设 19.5 的 `sql_tool.max_repairs=2` 在本项目里是
+    `LOOP__MAX_SQL_REPAIRS`。理由是它属于 5.4 那四类「相互独立、不可借用」的
+    循环预算，与 `max_replans` / `max_reviewer_evidence` 必须放在一起看，
+    拆到两个配置段里迟早出现「改了这边忘了那边」。
+    """
+
+    #: 单次查询返回的最大行数（详设 10.4 第 10 步）。**不区分明细与聚合**：
+    #: 详设写的是「明细必须有 LIMIT，聚合也设置最大结果行数」，两者同值。
+    max_rows: int = Field(default=1000, ge=1, le=100_000)
+    #: 结果序列化后的最大字节数（详设 10.6 的「2MB 双截断」）。
+    #: 光限行数不够：一行里塞进一个 MEDIUMTEXT 就足以把内存打满。
+    max_result_bytes: int = Field(default=2_097_152, ge=1024, le=64 * 1024 * 1024)
+    #: 查询最大执行时间。**这是数据库侧的 `MAX_EXECUTION_TIME` 与客户端
+    #: `wait_for` 的双重上限**，理由见 `executor.py`。
+    timeout_seconds: int = Field(default=10, ge=1, le=300)
+    #: 单条待校验 SQL 的文本长度上限（详设 10.4 第 1 步）。
+    #: 作用不是防注入（注入由 AST 校验拦），而是防「模型吐出一段几万字符的
+    #: SQL」把校验与日志拖垮——超长本身就是异常信号，直接拒绝比慢慢解析好。
+    max_sql_chars: int = Field(default=8000, ge=100, le=100_000)
+    #: 单次注入模型的 SchemaContext 最多几张表（详设 10.2）。
+    #: 超限时**不是截断**，而是记进 `omitted_tables` 让调用方知道问题需要拆分——
+    #: 静默丢掉需要的表，表现是「模型生成的 SQL 引用了不存在的表」，
+    #: 排查方向会完全跑偏。
+    max_schema_tables: int = Field(default=8, ge=1, le=64)
+    #: Schema 目录文件（详设 16.9；表结构后置，见 `configs/schema_catalog.yaml`）。
+    catalog_path: str = "configs/schema_catalog.yaml"
+    #: 一次查询结果最多生成多少条 Evidence。超过则退化成「一条覆盖整段切片」的
+    #: 汇总证据——逐行生成会在「查了 1000 行明细」时炸出 1000 条证据。
+    max_evidence_rows: int = Field(default=20, ge=1, le=1000)
+
+
 class WorkerTuning(BaseModel):
     """Worker 与队列参数（开发流程 6.3 / 详细设计 19.5 的 worker 段）。"""
 
@@ -184,6 +223,9 @@ class Settings(BaseSettings):
     #: 给出明确提示并退出（见 `_rw_url`），不会退化成静默跳过。
     database_url_business_rw: str | None = None
     db_pool_size: int = Field(default=10, ge=1, le=100)
+
+    #: SQL Tool 的执行与校验参数（详细设计 19.5 的 `sql_tool` 段）
+    sql_tool: SqlToolTuning = Field(default_factory=SqlToolTuning)
 
     # ------------------------------------------------------------------ Redis
     redis_url: str = Field(min_length=1)

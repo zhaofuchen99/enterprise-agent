@@ -43,6 +43,8 @@ dependencies = [
     "httpx>=0.28",
     "tenacity>=9.0",
     "pyjwt>=2.10",
+    "sqlglot>=25.11",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -54,6 +56,7 @@ dev = [
     "fakeredis>=2.26",
     "pre-commit>=4.0",
     "lupa>=2.8",
+    "types-pyyaml>=6.0",
 ]
 # 不引入 types-redis：它是为 redis 4.x 编写的第三方 stub，而 redis>=5 自带 py.typed，
 # 两者同时存在会让 mypy 用过期签名覆盖真实类型（aclose 等新 API 会被误报为不存在）。

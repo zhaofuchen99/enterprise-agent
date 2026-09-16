@@ -1,0 +1,159 @@
+# SQL 金标评测集（开发流程 6.6 的门禁：金标 SQL 正确率达到阶段基线）
+#
+# ## 判定标准是「结果集等价」，不是「SQL 字符串相同」
+#
+# 详设 22.2 明写：结果集等价判断，不要求 SQL 字符串与金标完全相同。
+# 同一条业务问题可以有十种写法（子查询 / JOIN / CASE 聚合…），
+# 比对文本只会奖励「抄得像」，而不是「算得对」。
+#
+# ## 与安全用例的分工
+#
+# 这个文件里的 10 题测的是**正确性**。安全与越权那 15+ 条在
+# `app/tests/tools/sql/test_validator.py` 里，判定标准是**100% 阻断率**，
+# 不随这个文件一起缩（冲刺方案 §6）。
+#
+# ## 金标是怎么来的
+#
+# 金标 SQL 是**对着 Phase 2 冻结的演示数据手写**的，不是让模型生成后
+# 回填的——后者只能验证「模型等于它自己」。这与详设 16.11.3 的纪律同源：
+# 金标不得与实现由同一批次产出。业务数据在 Phase 2 就冻结了，
+# 本文件写于 Phase 4，因此两条链路之间隔了一次交付。
+#
+# `ordered: true` 表示结果顺序有业务含义（TOP-N），按顺序比对；
+# 否则按**多重集**比对——SQL 不保证 GROUP BY 的输出顺序，
+# 按顺序比会把一个正确的查询判成错的。
+version: "2026.09.16-1"
+
+cases:
+  - id: sql-01
+    question: 2025 年华东地区 Q3 的净销售额是多少？
+    golden_sql: |
+      SELECT SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE r.region_name = '华东'
+        AND s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+    ordered: false
+    proves: 一步 SQL，端到端通（演示问题 1）
+
+  - id: sql-02
+    question: 2025 年各区域的净销售额分别是多少？
+    golden_sql: |
+      SELECT r.region_name, SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE s.order_date >= '2025-01-01' AND s.order_date < '2026-01-01'
+      GROUP BY r.region_name
+    ordered: false
+    proves: 维度分组 + 五区域对照（下钻案例的第一步）
+
+  - id: sql-03
+    question: 2025 年华东地区 Q3 净销售额同比下降了多少个百分点？
+    golden_sql: |
+      SELECT ROUND(
+        (SUM(CASE WHEN s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+                  THEN s.net_amount ELSE 0 END)
+       - SUM(CASE WHEN s.order_date >= '2024-07-01' AND s.order_date < '2024-10-01'
+                  THEN s.net_amount ELSE 0 END))
+        / SUM(CASE WHEN s.order_date >= '2024-07-01' AND s.order_date < '2024-10-01'
+                   THEN s.net_amount ELSE 0 END) * 100, 2) AS yoy_pct
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE r.region_name = '华东'
+    ordered: false
+    # 问「同比降多少」时，模型返回「去年同期 / 本期 / 差值 / 百分比」四列比
+    # 只返回百分比信息更全——判成错衡量的是「形状与金标一致」而不是「算得对」。
+    # `subset` 仍要求那个百分比真的出现在结果里：少算或算错照样不通过。
+    compare: subset
+    proves: 同比口径（需正确构造去年同期区间，且不能把两年混在一个 WHERE 里）
+
+  - id: sql-04
+    question: 2025 年华东地区 Q3 各渠道的净销售额分别是多少？
+    golden_sql: |
+      SELECT c.channel_name, SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      JOIN dim_channel AS c ON c.channel_id = s.channel_id
+      WHERE r.region_name = '华东'
+        AND s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+      GROUP BY c.channel_name
+    ordered: false
+    proves: 下钻案例第二步（按渠道拆）
+
+  - id: sql-05
+    question: 2025 年 Q3 各产品线的净销售额分别是多少？
+    golden_sql: |
+      SELECT pl.product_line_name, SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_product AS p ON p.product_id = s.product_id
+      JOIN dim_product_line AS pl ON pl.product_line_id = p.product_line_id
+      WHERE s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+      GROUP BY pl.product_line_name
+    ordered: false
+    # 同上：模型会带上 product_line_id。
+    compare: subset
+    proves: 两跳 JOIN（事实 → 产品 → 产品线），SchemaProvider 必须把这条路径带上
+
+  - id: sql-06
+    question: 2025 年华东地区净销售额最高的月份是哪个月？
+    golden_sql: |
+      SELECT DATE_FORMAT(s.order_date, '%Y-%m') AS month, SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE r.region_name = '华东'
+        AND s.order_date >= '2025-01-01' AND s.order_date < '2026-01-01'
+      GROUP BY month
+      ORDER BY net_sales DESC
+      LIMIT 1
+    ordered: true
+    proves: TOP-1 取数（顺序有业务含义）
+
+  - id: sql-07
+    question: 2025 年华东地区 Q3 的订单行数是多少？
+    golden_sql: |
+      SELECT COUNT(s.order_id) AS order_count
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE r.region_name = '华东'
+        AND s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+    ordered: false
+    proves: 计数指标走「订单行数」口径而不是销售额
+
+  - id: sql-08
+    question: 2025 年退货金额最高的区域是哪个？
+    golden_sql: |
+      SELECT r.region_name, SUM(s.return_amount) AS return_amount
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      WHERE s.order_date >= '2025-01-01' AND s.order_date < '2026-01-01'
+      GROUP BY r.region_name
+      ORDER BY return_amount DESC
+      LIMIT 1
+    ordered: true
+    # 模型会额外带上 region_id（机器可读的主键）——那是无害的附加信息，
+    # 判成错等于在考「列数是否与金标一致」而不是「算得对不对」。
+    compare: subset
+    proves: 另一个指标（退货金额）的口径被正确识别，不混用净销售额
+
+  - id: sql-09
+    question: 2025 年华东地区 Q3 智能家居产品线的净销售额是多少？
+    golden_sql: |
+      SELECT SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      JOIN dim_region AS r ON r.region_id = s.region_id
+      JOIN dim_product AS p ON p.product_id = s.product_id
+      JOIN dim_product_line AS pl ON pl.product_line_id = p.product_line_id
+      WHERE r.region_name = '华东'
+        AND pl.product_line_name = '智能家居'
+        AND s.order_date >= '2025-07-01' AND s.order_date < '2025-10-01'
+    ordered: false
+    proves: 下钻案例第三步（异常产品线的绝对量）
+
+  - id: sql-10
+    question: 2024 年全年的净销售额是多少？
+    golden_sql: |
+      SELECT SUM(s.net_amount) AS net_sales
+      FROM fact_sales_order_item AS s
+      WHERE s.order_date >= '2024-01-01' AND s.order_date < '2025-01-01'
+    ordered: false
+    proves: 上一年整年（时间区间边界：不能把 2025-01-01 那天算进来）

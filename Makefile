@@ -5,7 +5,7 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
         test test-integration layering check clean
-.PHONY: migrate revision seed seed-business verify-business cleanup model-smoke
+.PHONY: migrate revision seed seed-business verify-business cleanup model-smoke sql eval-sql
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -106,3 +106,11 @@ cleanup:  ## 按保留期清理过期数据（幂等，供 cron 调用，见详�
 
 model-smoke:  ## 打一次真实模型与向量化（前置：.env 已填 MODEL_API_KEY；向量模型需 Ollama 在跑）
 	uv run python -m app.cli model-smoke
+
+# ------------------------------------------------------------------ SQL Tool（Phase 4）
+sql:  ## 跑一次自然语言 → SQL → 真数据 → 证据：make sql Q="2025年华东地区Q3净销售额"
+	@test -n "$(Q)" || (echo '用法：make sql Q="问题" [REGION=华东]' && exit 1)
+	uv run python -m app.cli sql "$(Q)" $(if $(REGION),$(foreach r,$(REGION),--region $(r)),)
+
+eval-sql:  ## 跑金标 SQL 评测集，产出正确率（前置：make up + 业务库已灌数）
+	uv run python scripts/eval_sql.py $(if $(ONLY),--only $(ONLY),)

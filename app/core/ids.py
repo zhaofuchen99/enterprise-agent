@@ -41,6 +41,11 @@ class IdPrefix(StrEnum):
     CONVERSATION = "cnv"
     TASK = "tsk"
     TRACE = "trc"
+    #: 工具调用与证据（Phase 4 起）。两者都是「答案为什么成立」的追溯入口，
+    #: `tcl_` / `evd_` 在日志里互不混淆——证据的 locator 里同时出现这两个 ID，
+    #: 前缀相同的话一眼看不出谁指谁（详见 `SqlToolResult.evidence`）。
+    TOOL_CALL = "tcl"
+    EVIDENCE = "evd"
 
     # 业务演示库的维度表（Phase 2 的 `scripts/business_seed.py`）。
     # 它们属于「企业已有数据」，本可以自定编号方案；沿用同一套前缀 + 26 位
