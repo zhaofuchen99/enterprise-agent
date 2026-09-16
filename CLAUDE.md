@@ -20,8 +20,9 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 0 项目初始化 | ✅ 完成 | 骨架、配置、错误码、结构化日志、健康探针、分层约束检查、CI、pre-commit 密钥防护 |
 | 1 基础 API | ✅ 完成 | 统一响应外壳、全局异常映射（400/401/403/404/409/429/500）、`trc_` trace 中间件、本地 JWT 登录、`/api/agent/chat` 与 `/api/agent/tasks/{id}` 占位、OpenAPI 定制 |
 | 1.5 基础设施接入 | ✅ 完成 | Redis 键与 Lua 脚本、Redis 限流 + 降级 + 熔断、Redis 任务仓储（临时）、arq 队列与 Worker 骨架（含自愈重启）、事件流、取消链路、对象存储抽象、OTel 与跨进程 trace。`make check` 全绿（267 测试）+ 7 条 integration 用例；验收记录见开发流程 11.1 |
-| 2 数据库 | 🔶 进行中 | **已完成**：Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。**未完成**：`agent_task_step`/`tool_call`/`evidence`/`trace` 仓储、`make cleanup` 的保留期实现 |
-| 3–9 冲刺切片 | ⬜ 未开始 | 秋招冲刺路线见下方，分两批交付 |
+| 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
+| 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
+| 4–9 冲刺切片 | ⬜ 未开始 | 秋招冲刺路线见下方，分两批交付 |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -48,6 +49,12 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 4. **单元测试注入内存仓储，不连 MySQL**（`app/tests/fakes.py` 的
    `build_memory_repositories`）。仓储的 MySQL 实现由 `make test-integration`
    下的**同一批契约断言**覆盖——两条路径各有各的验证，不重叠也不留空。
+5. **模型网关已接入装配点，但还没有业务消费者**——Phase 4 的 SQL Tool 是第一个。
+   现在接进来是为了让「模型调用可被替身替换」这条门禁在 Phase 3 就有实证。
+   排查模型连通性用 `make model-smoke`（需 `.env` 里的 `MODEL_API_KEY`；
+   向量那半条只需本机 Ollama 在跑）。
+6. **`.env` 里的 `MODEL_API_KEY` 需要你手动填**：它是密钥，不入库、不由脚本生成。
+   其余模型配置（`deepseek-flash` / `bge-m3` / 两个 base_url / 45s 超时）已写好。
 
 ### 【后续扩展】登记
 
@@ -66,6 +73,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 对象存储 `s3` 实现（契约测试已就绪，加进参数表即被覆盖） | Phase 5 |
 | 登录接口限流（当前配额按已认证用户计，登录不受保护，可被口令爆破） | Phase 12 |
 | 未注册路径复用 `TASK_NOT_FOUND` 的语义含混（错误码表封闭所致） | 待定 |
+| token / 成本进 **OTel Metrics**（详设 19.4.3）。Phase 3 先落 span 属性，`observability.py` 目前只有 tracer、没有 meter | Phase 11「节点埋点」 |
+| `MODEL_TUNING__THINKING_ENABLED=true` 时，带 `tools` 的历史轮次必须回传 `reasoning_content`，否则 DeepSeek 返回 400。切片内不开思考模式，故未实现该回传路径 | 需要时 |
 
 **冲刺期后置**（由 `docs/秋招冲刺方案.md` §10 冻结，切片内不要顺手做）：
 
@@ -233,7 +242,6 @@ Windows 通过 `wslrelay` 转发 `127.0.0.1:<宿主端口>` 访问。**主机一
 
 | 编号 | 内容 | 何时需要定 |
 |---|---|---|
-| TBC-04 | **模型选型**：主聊天模型、embedding、reranker。本机已装 Ollama，本地模型可省 API 成本 | Phase 3 开工前 |
 | TBC-05 | **向量库**：Milvus Standalone 本机内存不足。候选为 Milvus Lite（嵌入式，`pymilvus` 同一客户端，只改 URI）、Qdrant、Chroma。**勘察性实测已有数据**（`scripts/spike_milvus_lite.py`：嵌入式方案支持 `SPARSE_FLOAT_VECTOR` + RRF 混合检索，2000 条 768 维下峰值 RSS 317MB），**但选型仍不结案** | Phase 5 开工前，三候选同口径对比后再定 |
 
 **处理未决项的原则**：先做最小验证拿到数据再决策，不要靠读文档空猜。

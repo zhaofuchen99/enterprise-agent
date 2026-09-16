@@ -38,6 +38,7 @@ from app.infrastructure.logging import (
     clear_context,
     setup_logging,
 )
+from app.infrastructure.model_gateway import build_model_gateway
 from app.infrastructure.observability import (
     business_trace_id_from_context,
     restore_trace_context,
@@ -137,9 +138,15 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     # 与 API 进程各持一个池：两者是不同的进程，共用一个池在语言层面就不成立。
     engine = create_engine(settings)
 
+    # 模型网关持有两个 httpx 连接池（chat 与 embedding 各一个），
+    # 与 db_engine 同样归本进程所有，退出时在 on_shutdown 里释放。
+    # Phase 4 的 SQL Tool 是它的第一个消费者。
+    gateway = build_model_gateway(settings)
+
     ctx["redis"] = redis
     ctx["queue"] = queue
     ctx["db_engine"] = engine
+    ctx["model_gateway"] = gateway
     ctx["worker_id"] = _worker_id()
     ctx["runner"] = _build_runner(settings, redis, queue, engine)
     logger.info("worker 启动完成", extra={"status": ctx["worker_id"]})
@@ -163,6 +170,9 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
     engine: AsyncEngine | None = ctx.get("db_engine")
     if engine is not None:
         await engine.dispose()
+    gateway = ctx.get("model_gateway")
+    if gateway is not None:
+        await gateway.aclose()
     clear_context()
 
 

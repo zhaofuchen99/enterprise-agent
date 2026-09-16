@@ -5,7 +5,7 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
         test test-integration layering check clean
-.PHONY: migrate revision seed seed-business verify-business cleanup
+.PHONY: migrate revision seed seed-business verify-business cleanup model-smoke
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -103,3 +103,6 @@ verify-business:  ## 只跑业务库的四条约束断言与 EXPLAIN 检查（�
 
 cleanup:  ## 按保留期清理过期数据（幂等，供 cron 调用，见详细设计 16.12）
 	uv run python -m app.cli cleanup
+
+model-smoke:  ## 打一次真实模型与向量化（前置：.env 已填 MODEL_API_KEY；向量模型需 Ollama 在跑）
+	uv run python -m app.cli model-smoke

@@ -15,6 +15,7 @@ _MINIMAL: dict[str, str] = {
     "MODEL_PROVIDER": "p",
     "MODEL_NAME": "m",
     "MODEL_API_KEY": "k",
+    "MODEL_BASE_URL": "https://example.invalid/v1",
     "EMBEDDING_MODEL": "e",
     "EMBEDDING_API_KEY": "k",
     "DATABASE_URL_AGENT": "mysql+asyncmy://a@127.0.0.1:3306/agent",
@@ -82,6 +83,52 @@ def test_otel_enabled_requires_endpoint(monkeypatch: pytest.MonkeyPatch) -> None
 def test_search_enabled_requires_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValidationError, match="SEARCH_PROVIDER"):
         _load(monkeypatch, SEARCH_ENABLED="true")
+
+
+def test_reranker_enabled_requires_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValidationError, match="RERANKER_MODEL"):
+        _load(monkeypatch, RERANKER_ENABLED="true")
+
+
+def test_model_timeout_follows_design_doc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """详细设计 19.5 定的是 45s；Phase 3 之前这里是 120s，属代码与文档不一致。"""
+    assert _load(monkeypatch).model_timeout_seconds == 45
+
+
+def test_thinking_mode_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DeepSeek V4 服务端默认开启思考，必须由我们显式关掉。
+
+    这是「默认值错了但不会报错」的典型：开着也能跑，只是更贵、更慢、
+    且 `temperature` 静默失效。因此把默认值本身钉成断言。
+    """
+    assert _load(monkeypatch).model_tuning.thinking_enabled is False
+
+
+def test_model_nested_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """前缀是 `MODEL_TUNING__` 而不是 `MODEL__`——嵌套字段名叫 `model_tuning`。
+
+    写成 `MODEL__MAX_TOKENS` 不会报错，只会**静默走默认值**（`extra="ignore"`），
+    是这套配置里最容易踩且最难发现的一种。因此把正确前缀钉成断言。
+    """
+    settings = _load(monkeypatch, MODEL_TUNING__MAX_REPAIR_RETRIES="2")
+    assert settings.model_tuning.max_repair_retries == 2
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("MODEL_TUNING__MAX_TRANSPORT_RETRIES", "9"),
+        ("MODEL_TUNING__MAX_REPAIR_RETRIES", "-1"),
+        ("MODEL_TUNING__BACKOFF_BASE_SECONDS", "0"),
+        ("MODEL_TUNING__MAX_TOKENS", "1"),
+    ],
+)
+def test_model_tuning_bounds_enforced(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    """重试上限必须有界——无界重试会让一次失败的任务卡满整个 task_timeout。"""
+    with pytest.raises(ValidationError):
+        _load(monkeypatch, **{key: value})
 
 
 def test_loop_nested_override_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

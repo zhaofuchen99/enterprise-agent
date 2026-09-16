@@ -23,8 +23,12 @@ _TEST_ENV: dict[str, str] = {
     "MODEL_PROVIDER": "test-provider",
     "MODEL_NAME": "test-model",
     "MODEL_API_KEY": "test-key",
+    # .invalid 是 RFC 2606 保留的顶级域名，**保证不可解析**：
+    # 万一哪天单元测试真的发起了请求，这里会立刻失败而不是打到一个真实服务上
+    "MODEL_BASE_URL": "https://model.invalid/v1",
     "EMBEDDING_MODEL": "test-embedding",
     "EMBEDDING_API_KEY": "test-key",
+    "EMBEDDING_BASE_URL": "https://embedding.invalid/v1",
     # 指向**独立的测试库** agent_test，不是开发库 agent：
     # 契约测试会反复建表与清数据，指向开发库等于把本地数据当消耗品。
     # 凭据与 docker-compose.dev.yml 里的 agent-mysql 一致。
@@ -102,7 +106,12 @@ def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None =
     """
     from app.core.config import get_settings
     from app.main import create_app, wire_dependencies
-    from app.tests.fakes import FakeJobQueue, FakeSessionFactory, build_memory_repositories
+    from app.tests.fakes import (
+        FakeJobQueue,
+        FakeModelGateway,
+        FakeSessionFactory,
+        build_memory_repositories,
+    )
 
     settings = get_settings()
     application = create_app()
@@ -114,6 +123,10 @@ def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None =
         application,
         settings,
         queue=queue or FakeJobQueue(),
+        # 模型网关注入替身：真实实现会建两个指向 `.invalid` 的 httpx 连接池，
+        # 没人关它。替身的行为契约由 test_model_gateway_contract.py 的
+        # 参数化用例与真实实现对齐。
+        gateway=FakeModelGateway(),
         repositories=build_memory_repositories(settings),
     )
     return application

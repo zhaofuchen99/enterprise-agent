@@ -64,6 +64,34 @@ class RedisTuning(BaseModel):
     operation_timeout_seconds: float = Field(default=1.0, gt=0.0, le=10.0)
 
 
+class ModelTuning(BaseModel):
+    """模型调用参数（开发流程 6.5 / 详细设计 9.4 的错误分类表）。
+
+    **字段名为什么是 `model_tuning` 而不是 `model`**：同 `RedisTuning` 的理由——
+    本类已有扁平的 `model_name` / `model_api_key`，再挂一个名为 `model` 的嵌套模型，
+    环境变量里 `MODEL_NAME` 与 `MODEL__NAME` 会指向两个不同的东西，
+    而 `extra="ignore"` 会把写错的那一个**静默丢掉**。
+
+    代价是环境变量前缀变长：`MODEL_TUNING__MAX_TOKENS=8192`，
+    **不是** `MODEL__MAX_TOKENS`（后者不会报错，只会静默走默认值）。
+
+    两项重试预算**相互独立、不可借用**（与 `loop` 的四类预算同一条纪律）：
+    传输失败不消耗修复次数，反之亦然。详见 `model_gateway.py` 的说明。
+    """
+
+    #: TRANSIENT 类（429 / 5xx / 连接失败 / 超时）的退避重试次数
+    max_transport_retries: int = Field(default=1, ge=0, le=3)
+    #: VALIDATION 类（JSON 解析或 Schema 校验失败）的修复重试次数
+    max_repair_retries: int = Field(default=1, ge=0, le=3)
+    #: 指数退避的基数。第 n 次重试前等待 `base * 2**(n-1)` 秒
+    backoff_base_seconds: float = Field(default=0.5, gt=0.0, le=10.0)
+    #: 单次响应的输出上限。**不是可选的**——DeepSeek 的 JSON 模式明确要求设置它，
+    #: 否则返回的 JSON 可能被中途截断，表现为「解析失败」而不是「输出太长」
+    max_tokens: int = Field(default=4096, ge=256, le=32_768)
+    #: 是否启用思考模式。**默认关闭**，理由见 `config.py` 模型段的注释
+    thinking_enabled: bool = False
+
+
 class WorkerTuning(BaseModel):
     """Worker 与队列参数（开发流程 6.3 / 详细设计 19.5 的 worker 段）。"""
 
@@ -111,19 +139,38 @@ class Settings(BaseSettings):
     rate_limit_status_per_minute: int = Field(default=120, ge=1, le=10_000)
     rate_limit_upload_per_hour: int = Field(default=10, ge=1, le=1000)
 
-    # ------------------------------------------------------ 模型（TBC-04 未决）
+    # ------------------------------------- 模型（TBC-04 已决议，见 CLAUDE.md）
+    #: 主聊天模型。当前为 `deepseek-flash`（`deepseek-chat` 与 `deepseek-v4-pro`
+    #: 均已停用/被路由，实际只剩这一个可用模型名）。
     model_provider: str = Field(min_length=1)
     model_name: str = Field(min_length=1)
     model_api_key: str = Field(min_length=1)
-    model_base_url: str | None = None
-    model_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    #: OpenAI 兼容端点。云模型与本地 Ollama 走**同一套协议**，
+    #: 因此网关只有一个实现，换 provider 的成本是一个配置值而不是一段 `if`。
+    #: **必填**：本项目的 provider 都不是 OpenAI 官方，没有可用的默认端点；
+    #: 留空会让错误推迟到第一个任务跑起来之后，那时看到的是「任务失败」
+    #: 而不是「配置没填」，排查成本差一个数量级。
+    model_base_url: str = Field(min_length=1)
+    #: 单次模型调用超时。详细设计 19.5 定的是 45s；Phase 3 前这里是 120s，
+    #: 属代码与文档不一致，已按文档对齐
+    model_timeout_seconds: int = Field(default=45, ge=5, le=600)
 
+    #: Embedding 走本地 Ollama（bge-m3，1024 维），**base_url 与聊天模型不同**，
+    #: 故必须单独配置。不配则回落到 `model_base_url`
     embedding_model: str = Field(min_length=1)
     embedding_api_key: str = Field(min_length=1)
+    embedding_base_url: str | None = None
     embedding_dim: int = Field(default=1024, ge=64, le=8192)
 
     reranker_model: str | None = None
     reranker_enabled: bool = False
+
+    #: **默认关闭思考**（`MODEL__THINKING_ENABLED=false`）。DeepSeek V4 的思考模式
+    #: 默认开启且 effort=high，而本项目是**节点密集调用 + 全是结构化输出**：
+    #: 思考态下 `temperature` 被忽略、思考 token 按输出计费，且带 `tools` 时
+    #: 历史轮次的 `reasoning_content` 必须原样回传否则 400。
+    #: 这些代价换不来结构化抽取的准确率，需要时再按节点开。
+    model_tuning: ModelTuning = Field(default_factory=ModelTuning)
 
     # ------------------------------------------------------------------ 数据库
     database_url_agent: str = Field(min_length=1)
@@ -205,6 +252,9 @@ class Settings(BaseSettings):
 
         if self.search_enabled and not self.search_provider:
             raise ValueError("SEARCH_ENABLED=true 时必须提供 SEARCH_PROVIDER")
+
+        if self.reranker_enabled and not self.reranker_model:
+            raise ValueError("RERANKER_ENABLED=true 时必须提供 RERANKER_MODEL")
 
         # 心跳 TTL 必须留出「漏掉一拍」的余量。判死的判据是
         # `heartbeat_at < now - ttl`，与扫描周期无关，所以这里约束的是

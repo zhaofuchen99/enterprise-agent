@@ -23,6 +23,7 @@ from app.api.middleware import TraceContextMiddleware
 from app.core.config import Settings, get_settings
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_API, clear_context, setup_logging
+from app.infrastructure.model_gateway import ModelGateway, build_model_gateway
 from app.infrastructure.observability import setup_error_tracking, setup_observability
 from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
@@ -57,6 +58,7 @@ def wire_dependencies(
     settings: Settings,
     *,
     queue: JobQueue,
+    gateway: ModelGateway,
     repositories: Repositories | None = None,
 ) -> None:
     """装配服务依赖。
@@ -69,10 +71,15 @@ def wire_dependencies(
     - 队列 / 事件总线 → arq / Redis Stream
     - 取消信号 / 重投计数 / 心跳快通道 → 仍在 Redis（是跨进程信号，不是任务存储）
 
-    **`queue` 与 `repositories` 都从外部传入**，理由相同：它们的生命周期
-    不属于本函数。`queue` 在 API 进程里是 arq 连接池、在测试里是替身；
-    仓储在进程里连 MySQL、在单元测试里是内存实现。在这里 new 死一个，
-    测试要么连不上库，要么观察不到投递行为。
+    **`queue`、`gateway` 与 `repositories` 都从外部传入**，理由相同：它们的
+    生命周期不属于本函数。`queue` 在 API 进程里是 arq 连接池、在测试里是替身；
+    仓储在进程里连 MySQL、在单元测试里是内存实现；模型网关持有两个 httpx
+    连接池，**必须由 lifespan 成对创建与释放**。在这里 new 死一个，
+    测试要么连不上库，要么观察不到投递行为，要么留下没人关的连接池。
+
+    `gateway` 目前**还没有业务消费者**——Phase 4 的 SQL Tool 是第一个。
+    现在接进来是为了让「模型调用可被替身替换」这条门禁在 Phase 3 就有实证，
+    而不是等到 Phase 4 才发现替换点没留。
 
     默认值 `repositories=None` 时才构造 MySQL 实现——**单元测试必须显式
     注入内存实现**，因为「测试跑不跑得起来」取决于开发机上有没有起 MySQL，
@@ -95,6 +102,7 @@ def wire_dependencies(
     app.state.task_repo = repos.tasks
     app.state.task_runner = runner
     app.state.job_queue = queue
+    app.state.model_gateway = gateway
     app.state.rate_limiter = RedisFixedWindowLimiter(redis=redis, settings=settings)
     app.state.auth_service = AuthService(repos.users, settings)
     app.state.task_service = TaskService(
@@ -120,11 +128,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessions = create_session_factory(db_engine)
 
     queue = await ArqJobQueue.create(settings)
-    wire_dependencies(app, settings, queue=queue)
+    # 模型网关持有两个 httpx 连接池（chat 与 embedding 各一个），
+    # 归本进程所有，退出时在 finally 里释放。
+    gateway = build_model_gateway(settings)
+    wire_dependencies(app, settings, queue=queue, gateway=gateway)
     try:
         yield
     finally:
         clear_context()
+        await gateway.aclose()
         await queue.aclose()
         await redis.aclose()
         await db_engine.dispose()

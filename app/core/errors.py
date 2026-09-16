@@ -8,6 +8,13 @@ Graph 内异常统一包装为 AgentError 写入 State；HTTP 映射只在全局
 经确认，从需求规格 7.3 取 `AUTHENTICATION_REQUIRED`、`TASK_NOT_FOUND`、
 `TASK_CONFLICT`、`RATE_LIMITED` 四个码补入，命名与需求规格保持一致，
 不另起同义名。已回写详细设计 19.1。
+
+**Phase 3 的补齐说明（2026-09-16）**：开发流程 6.5 施工项 4 要求「结构化输出解析失败 →
+`MODEL_OUTPUT_INVALID`」，但详细设计 19.1 的正式表里没有这个码——两份文档自相矛盾。
+它也不能由现有码兼任：`PLAN_INVALID` 是计划语义，`UPSTREAM_UNAVAILABLE` 是「服务不可用」，
+而这里是服务一切正常、只是输出不合规。需求 12.2.1 把「结构化输出不稳」列为本项目的
+头号返工风险，需要它作为可观测落点。**这是补一个被遗漏的码，不是新增同义码**，
+处理方式与上面的四项一致。已回写详细设计 19.1。
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ class ErrorCode(StrEnum):
     SQL_VALIDATION_FAILED = "SQL_VALIDATION_FAILED"
     SQL_EXECUTION_REPAIRABLE = "SQL_EXECUTION_REPAIRABLE"
     NO_RELEVANT_KNOWLEDGE = "NO_RELEVANT_KNOWLEDGE"
+    MODEL_OUTPUT_INVALID = "MODEL_OUTPUT_INVALID"
     RATE_LIMITED = "RATE_LIMITED"
     WORKER_INTERRUPTED = "WORKER_INTERRUPTED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
@@ -50,6 +58,7 @@ HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.SQL_VALIDATION_FAILED: 422,
     ErrorCode.SQL_EXECUTION_REPAIRABLE: 422,
     ErrorCode.NO_RELEVANT_KNOWLEDGE: 422,
+    ErrorCode.MODEL_OUTPUT_INVALID: 422,
     ErrorCode.RATE_LIMITED: 429,
     ErrorCode.WORKER_INTERRUPTED: 500,
     ErrorCode.INTERNAL_ERROR: 500,
@@ -76,6 +85,9 @@ DEFAULT_RETRYABLE: dict[ErrorCode, bool] = {
     ErrorCode.SQL_VALIDATION_FAILED: False,
     ErrorCode.SQL_EXECUTION_REPAIRABLE: False,
     ErrorCode.NO_RELEVANT_KNOWLEDGE: False,
+    #: 网关内部已按详设 9.4 的 VALIDATION 类别重试过一次；模型对同一 prompt
+    #: 再答一遍大概率还是同样的结构，让客户端原样重试没有意义
+    ErrorCode.MODEL_OUTPUT_INVALID: False,
     #: 限流与容量类：等一会儿再来是对的
     ErrorCode.RATE_LIMITED: True,
     ErrorCode.WORKER_INTERRUPTED: True,
