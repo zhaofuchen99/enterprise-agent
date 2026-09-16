@@ -13,14 +13,19 @@ _QUESTION = "结合销售数据和渠道政策，分析华东2025年第三季度
 
 
 async def _count_tasks(app: FastAPI) -> int:
-    """白盒读取仓储里的任务总数。
+    """数一数存储里真的建了几条任务记录。
 
     「幂等键在有效期内只能创建一个任务」（FR-CHAT-001 业务规则）
-    是这条接口最容易写错的地方，而接口本身不提供任务列表，
-    只能直接看仓储。这里刻意白盒，换来的是一条真正断言了不变量、
-    而不是「两次返回的 task_id 一样」这种可能被巧合满足的用例。
+    是这条接口最容易写错的地方，而接口本身不提供任务列表，只能直接看存储。
+    这里刻意白盒，换来的是一条真正断言了不变量、而不是「两次返回的 task_id
+    一样」这种可能被巧合满足的用例。
+
+    Phase 1.5 起任务记录存在 Redis（`task:{id}:record`），因此这里扫键。
+    用 KEYS 而不是维护一个计数器：测试要看到的是**存储的真实状态**，
+    再维护一份计数就变成「用一个可能同样写错的实现去验证另一个实现」。
     """
-    return len(app.state.task_repo._by_id)
+    redis = app.state.redis
+    return len(await redis.keys("task:tsk_*:record"))
 
 
 async def test_create_task_returns_202_with_accepted(
@@ -206,6 +211,47 @@ async def test_replay_works_even_when_quota_is_full(make_app: Any) -> None:
     assert replay.status_code == 202
     assert replay.json()["data"]["task_id"] == first.json()["data"]["task_id"]
     assert fresh.status_code == 429
+
+
+async def test_create_task_enqueues_the_job(
+    client: AsyncClient, analyst_headers: dict[str, str], app: FastAPI
+) -> None:
+    """Phase 1.5 起创建任务会真的投递（开发流程 6.3 的「空任务闭环」）。
+
+    投递载荷里必须带上 trace 上下文，否则 Worker 侧的 span 会另起一条 trace，
+    Phase 11 的跨进程追踪验收过不了（详细设计 19.4.1）。
+    """
+    response = await client.post(
+        "/api/agent/chat", json={"message": _QUESTION}, headers=analyst_headers
+    )
+    task_id = response.json()["data"]["task_id"]
+
+    queued = app.state.job_queue.jobs
+    assert [job.task_id for job in queued] == [task_id]
+    assert queued[0].trace_id == response.json()["data"]["trace_id"]
+    assert isinstance(queued[0].trace_context, dict)
+
+
+async def test_task_is_still_accepted_when_enqueue_fails(
+    client: AsyncClient, analyst_headers: dict[str, str], app: FastAPI
+) -> None:
+    """投递失败**不**改变接口结果（详细设计 17.1）。
+
+    任务已经写库成功了，它只是还没进队列——由 Worker 侧的补偿扫描重投。
+    把这种情况报成 500 会让客户端以为任务没建，于是重试；而重试带幂等键时
+    会命中同一个任务、看起来「成功」了却仍然没入队，问题反而更难查。
+    """
+    app.state.job_queue.fail_with = True
+
+    response = await client.post(
+        "/api/agent/chat", json={"message": _QUESTION}, headers=analyst_headers
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["data"]["task_id"]
+    # 任务确实存在，状态停在 QUEUED 等补偿扫描
+    detail = await client.get(f"/api/agent/tasks/{task_id}", headers=analyst_headers)
+    assert detail.json()["data"]["status"] == "QUEUED"
 
 
 async def test_message_too_long_is_400(make_app: Any) -> None:

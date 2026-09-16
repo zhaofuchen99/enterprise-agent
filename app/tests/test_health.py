@@ -20,8 +20,15 @@ async def test_ready_reports_redis(client: AsyncClient) -> None:
     assert response.json()["checked"] == ["redis"]
 
 
-async def test_ready_degrades_when_redis_down(app: FastAPI) -> None:
-    """Redis 不可用时必须是 503 not_ready，而不是 500 或挂起。"""
+async def test_ready_reports_degraded_when_redis_down(app: FastAPI) -> None:
+    """Redis 不可用时必须报 degraded，而不是 500、挂起、或直接判死。
+
+    **为什么是 200 而不是 503**：Phase 1.5 起 Redis 有了降级路径
+    （限流退回本地令牌桶、投递失败由补偿扫描兜底），API 仍然能对外服务。
+    此时报 not_ready 会让编排层摘掉这个实例——而摘掉它恰恰是最不该做的事，
+    降级路径本来就是为了「Redis 挂了也要撑住」才存在的。
+    开发流程 6.3 的验收命令同样要求「期望 degraded，而非 500」。
+    """
 
     class _Broken:
         async def ping(self) -> None:
@@ -31,7 +38,8 @@ async def test_ready_degrades_when_redis_down(app: FastAPI) -> None:
     async with build_client(app) as client:
         response = await client.get("/health/ready")
 
-    assert response.status_code == 503
+    assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "not_ready"
-    assert body["failed"] == ["redis"]
+    assert body["status"] == "degraded"
+    assert body["degraded"] == ["redis(ConnectionError)"]
+    assert body["checked"] == ["redis"]

@@ -14,7 +14,16 @@ import json
 import logging
 import sys
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
+
+#: 进程角色，写进每条日志与每个 span 的 `service` 字段（详细设计 19.4.2）。
+#:
+#: **刻意做成常量而不是配置项**：本地开发用 `make run` 同时起 api 与 worker，
+#: 两个进程读的是同一份 `.env`，因此任何「用 OTEL_SERVICE_NAME 区分进程」的
+#: 做法都会让两边都自称 `api`——而这条字段存在的唯一理由就是区分来源。
+#: 角色是入口模块的属性，不是部署环境的属性。
+SERVICE_API: Final[str] = "api"
+SERVICE_WORKER: Final[str] = "worker"
 
 #: 允许出现在日志记录上的上下文字段（其余 extra 一律丢弃，防止误写敏感数据）
 CONTEXT_FIELDS: tuple[str, ...] = (

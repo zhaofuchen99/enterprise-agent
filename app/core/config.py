@@ -34,6 +34,54 @@ class LoopSettings(BaseModel):
     max_reviewer_evidence: int = Field(default=1, ge=0, le=5)
 
 
+class RedisTuning(BaseModel):
+    """Redis 使用参数（详细设计 4.4 的键生命周期 / 19.5 的 redis 段）。
+
+    **字段名为什么是 `redis_tuning` 而不是文档里的 `redis`**：本类已有扁平字段
+    `redis_url` / `redis_max_connections`，若再挂一个名为 `redis` 的嵌套模型，
+    环境变量里 `REDIS_URL` 与 `REDIS__URL` 会指向两个不同的东西，而
+    `extra="ignore"` 会把写错的那一个**静默丢掉**。宁可名字长一点。
+    """
+
+    #: 事件流 `task:{id}:events` 的长度上限，约等于「保留最近多少次事件」
+    stream_maxlen: int = Field(default=10_000, ge=100, le=1_000_000)
+    #: 任务结束后事件流的保留时长（详细设计 4.4）
+    stream_ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
+    #: 互斥锁（孤儿回收等）的持有时长，必须大于这类操作的最坏耗时
+    lock_ttl_seconds: int = Field(default=30, ge=1, le=600)
+    #: `cache:{name}:{version}` 的默认 TTL
+    cache_ttl_seconds: int = Field(default=3600, ge=1, le=86_400)
+    #: Redis 不可用时的本地限流收紧系数（详细设计 19.3）。
+    #: 0.5 等价于「按 2 个实例均分」；**只允许收紧，不允许放宽**，故上限就是 1.0。
+    rate_limit_degraded_factor: float = Field(default=0.5, gt=0.0, le=1.0)
+    #: 限流器在 Redis 失败后的熔断冷却时长。
+    #: 没有它的话，Redis 挂掉期间**每个请求**都要先等满一次命令超时才降级，
+    #: 降级就从「保住可用性」变成了「给每个请求加一秒延迟」。
+    rate_limit_breaker_seconds: float = Field(default=5.0, ge=0.0, le=60.0)
+    #: 单次 Redis 命令的超时。限流与健康检查必须**快速失败**：
+    #: 一个卡住 30 秒的 Redis 调用会让降级路径永远来不及生效，
+    #: 结果是 Redis 挂了整个 API 一起挂，降级形同不存在。
+    operation_timeout_seconds: float = Field(default=1.0, gt=0.0, le=10.0)
+
+
+class WorkerTuning(BaseModel):
+    """Worker 与队列参数（开发流程 6.3 / 详细设计 19.5 的 worker 段）。"""
+
+    concurrency: int = Field(default=4, ge=1, le=64, description="单 Worker 进程并发任务数")
+    heartbeat_interval_seconds: int = Field(default=10, ge=1, le=300)
+    #: 心跳键 TTL，超过它没续期即视为 Worker 已死（详细设计 4.4）
+    heartbeat_ttl_seconds: int = Field(default=30, ge=2, le=600)
+    #: QUEUED 任务超过多久仍未被领取就重新投递（详细设计 17.1 的补偿扫描）
+    queue_reconcile_seconds: int = Field(default=30, ge=5, le=3600)
+    #: 同一任务最多重投几次，超过即置 FAILED + ENQUEUE_FAILED（详细设计 17.1）
+    max_requeue_attempts: int = Field(default=2, ge=0, le=10)
+    #: 孤儿任务回收扫描周期
+    orphan_scan_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    #: 收到停机信号后等多久再中断在跑任务。取 0 会让 `Ctrl-C` 立刻打断任务，
+    #: 任务停在 RUNNING 只能等孤儿回收；取 task_timeout 则本地开发要等太久。
+    shutdown_grace_seconds: int = Field(default=10, ge=0, le=600)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -85,6 +133,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ Redis
     redis_url: str = Field(min_length=1)
     redis_max_connections: int = Field(default=50, ge=1, le=500)
+    redis_tuning: RedisTuning = Field(default_factory=RedisTuning)
 
     # ------------------------------------------------------------------ 向量库
     milvus_uri: str = Field(min_length=1)
@@ -110,7 +159,7 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = Field(default=60, ge=1, le=10080)
 
     # ------------------------------------------------------------------ 可观测
-    otel_service_name: str = Field(min_length=1)
+    #: 进程角色（api / worker）**不是配置项**，见 infrastructure/logging.py
     otel_enabled: bool = False
     otlp_endpoint: str | None = None
     otel_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -120,6 +169,9 @@ class Settings(BaseSettings):
     search_enabled: bool = False
     search_provider: str | None = None
     search_api_key: str | None = None
+
+    # ------------------------------------------------------- Worker 与队列
+    worker: WorkerTuning = Field(default_factory=WorkerTuning)
 
     # ------------------------------------------------------------------ 循环预算
     loop: LoopSettings = Field(default_factory=LoopSettings)
@@ -145,6 +197,18 @@ class Settings(BaseSettings):
 
         if self.search_enabled and not self.search_provider:
             raise ValueError("SEARCH_ENABLED=true 时必须提供 SEARCH_PROVIDER")
+
+        # 心跳 TTL 必须留出「漏掉一拍」的余量。判死的判据是
+        # `heartbeat_at < now - ttl`，与扫描周期无关，所以这里约束的是
+        # ttl 与 interval 的关系而不是 ttl 与扫描周期的关系。
+        # 违反时不会有任何启动报错，只表现为「Worker 活着，任务却被回收成
+        # WORKER_INTERRUPTED」——从配置上根本看不出来，因此必须在启动时挡住。
+        if self.worker.heartbeat_ttl_seconds < 2 * self.worker.heartbeat_interval_seconds:
+            raise ValueError(
+                "WORKER__HEARTBEAT_TTL_SECONDS 至少要是 WORKER__HEARTBEAT_INTERVAL_SECONDS "
+                f"的两倍（要容忍漏掉一拍），当前为 {self.worker.heartbeat_ttl_seconds} / "
+                f"{self.worker.heartbeat_interval_seconds}"
+            )
         return self
 
     @property

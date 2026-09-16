@@ -14,6 +14,8 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from app.infrastructure.queue import JobQueue
+
 #: 测试用最小环境变量。
 _TEST_ENV: dict[str, str] = {
     "APP_ENV": "test",
@@ -30,7 +32,6 @@ _TEST_ENV: dict[str, str] = {
     # 长度 >= 32 字节：HS256 的密钥短于摘要长度会被 PyJWT 警告（RFC 7518 3.2）
     "JWT_SECRET": "test-secret-not-for-production-but-long-enough",
     "STORAGE_BACKEND": "local",
-    "OTEL_SERVICE_NAME": "api",
 }
 
 # 必须在任何测试模块导入 app.* 之前写入 os.environ：
@@ -81,19 +82,23 @@ async def fake_redis() -> AsyncIterator[fakeredis.aioredis.FakeRedis]:
     await client.aclose()
 
 
-def build_app(fake_redis: fakeredis.aioredis.FakeRedis) -> FastAPI:
+def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None = None) -> FastAPI:
     """绕开 lifespan 构造应用。
 
-    lifespan 会去连真实 Redis，单元测试里不能跑；改为直接注入 fakeredis，
-    并显式调用 `wire_dependencies`——**与生产走的是同一个装配函数**，
+    lifespan 会去连真实 Redis 与 arq，单元测试里不能跑；改为直接注入 fakeredis
+    与队列替身，并显式调用 `wire_dependencies`——**与生产走的是同一个装配函数**，
     这样测试覆盖到的依赖图不会和实际运行的那份分家。
+
+    队列默认用 `FakeJobQueue`（arq 需要真实连接）。需要断言投递行为的用例
+    可以自己传一个进来，之后从 `app.state.job_queue` 取回。
     """
     from app.core.config import get_settings
     from app.main import create_app, wire_dependencies
+    from app.tests.fakes import FakeJobQueue
 
     application = create_app()
     application.state.redis = fake_redis
-    wire_dependencies(application, get_settings())
+    wire_dependencies(application, get_settings(), queue=queue or FakeJobQueue())
     return application
 
 

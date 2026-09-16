@@ -16,7 +16,7 @@ from functools import lru_cache
 from typing import Protocol
 
 from app.core.config import Settings
-from app.core.ids import IdPrefix, new_id
+from app.core.ids import IdPrefix, deterministic_id
 from app.core.security import hash_password
 from app.domain.user import User, UserRole
 
@@ -68,14 +68,19 @@ class InMemoryUserRepository:
 
 
 def seed_demo_users(settings: Settings) -> list[User]:
-    """返回演示账号；`APP_ENV=prod` 时返回空列表。"""
+    """返回演示账号；`APP_ENV=prod` 时返回空列表。
+
+    **ID 是确定性派生的**（见 `deterministic_id` 的说明）：两个 API 实例
+    必须看到同一个 `usr_`，否则多实例的限流与并发配额各算各的，
+    开发流程 6.3 的验收命令根本跑不起来。
+    """
     if settings.is_prod:
         return []
 
     hashes = _demo_password_hashes()
     return [
         User(
-            id=new_id(IdPrefix.USER),
+            id=deterministic_id(IdPrefix.USER, username),
             username=username,
             display_name=username,
             role=role,

@@ -67,10 +67,10 @@ async def app_client(
 ) -> AsyncIterator[tuple[AsyncClient, dict[str, str]]]:
     """为**新构造的应用实例**建客户端并登录，返回 (client, headers)。
 
-    `make_app` 造出来的是另一个应用实例，它有自己的内存仓储：
-    演示用户会被重新播种、拿到新的 ULID，因此默认 app 上签发的令牌
-    在新实例里查不到对应用户，直接复用会 401。
-    Phase 2 接入 MySQL 后用户 ID 稳定，这个约束自然消失。
+    演示账号的 ID 是确定性派生的，因此在**多个应用实例之间是同一个用户**，
+    默认 app 上签发的令牌在新实例里同样有效——多实例限流与并发配额
+    因此可以被端到端验收（开发流程 6.3 验收命令 1）。
+    会话与任务仓储仍是进程内的，跨实例的可见性要等 Phase 2 接入 MySQL。
     """
     async with build_client(app) as client:
         yield client, await login_headers(client, username)

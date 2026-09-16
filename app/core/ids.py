@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import time
 from enum import StrEnum
@@ -57,6 +58,22 @@ def new_id(prefix: IdPrefix) -> str:
     body = _encode(timestamp_ms, _TIMESTAMP_CHARS) + _encode(
         secrets.randbits(_RANDOM_BITS), _RANDOM_CHARS
     )
+    return f"{prefix}_{body}"
+
+
+def deterministic_id(prefix: IdPrefix, seed: str) -> str:
+    """由种子确定性派生 ID，格式与长度同 `new_id`。
+
+    **只给演示夹具用**。真实实体的 ID 必须随机——可预测的主键意味着
+    别人能枚举出你的任务、会话，`new_id` 的 60 位随机部分正是为此存在的。
+
+    之所以需要它：开发流程 6.3 的多实例验收要求两个 API 实例看到**同一个用户**，
+    而两个进程各自播种演示账号时若拿到不同的随机 ID，令牌互不认、限流计数
+    也各算各的，那条验收命令从根上跑不起来。演示账号是夹具不是实体，
+    固定下来才是它该有的样子。Phase 2 接入 MySQL 后真实用户走 `new_id`。
+    """
+    digest = hashlib.sha256(f"{prefix.value}:{seed}".encode()).digest()
+    body = _encode(int.from_bytes(digest[:12], "big"), _TIMESTAMP_CHARS + _RANDOM_CHARS)
     return f"{prefix}_{body}"
 
 

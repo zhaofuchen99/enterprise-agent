@@ -5,7 +5,14 @@ from __future__ import annotations
 import re
 import time
 
-from app.core.ids import IdPrefix, id_pattern, new_conversation_id, new_task_id, new_trace_id
+from app.core.ids import (
+    IdPrefix,
+    deterministic_id,
+    id_pattern,
+    new_conversation_id,
+    new_task_id,
+    new_trace_id,
+)
 
 
 def test_id_is_fixed_26_chars_with_prefix() -> None:
@@ -58,3 +65,51 @@ def test_id_pattern_rejects_malformed_ids() -> None:
         "cnv_000000000000000000000O",  # 也没有 O
     ):
         assert not pattern.match(bad), bad
+
+
+def test_deterministic_id_is_stable_across_calls():
+    """演示夹具的 ID 必须稳定：两个 API 实例要看到同一个用户，
+    否则多实例的限流与并发配额各算各的（开发流程 6.3 验收命令 1 的前提）。"""
+    first = deterministic_id(IdPrefix.USER, "analyst")
+    second = deterministic_id(IdPrefix.USER, "analyst")
+
+    assert first == second
+
+
+def test_deterministic_id_differs_by_seed_and_prefix():
+    assert deterministic_id(IdPrefix.USER, "analyst") != deterministic_id(IdPrefix.USER, "admin")
+    assert deterministic_id(IdPrefix.USER, "analyst") != deterministic_id(
+        IdPrefix.CONVERSATION, "analyst"
+    )
+
+
+def test_deterministic_id_matches_the_normal_shape():
+    """格式必须与 `new_id` 一致，否则接口层的入参校验会拒掉演示用户的 ID。"""
+    value = deterministic_id(IdPrefix.USER, "analyst")
+
+    assert len(value) == 26
+    assert re.fullmatch(id_pattern(IdPrefix.USER), value)
+
+
+def test_deterministic_demo_users_share_identity_across_instances():
+    """两次播种（模拟两个 API 实例）必须得到同一个用户 ID。"""
+    from app.core.config import Settings
+    from app.repositories.user_repo import seed_demo_users
+
+    settings = Settings(
+        model_provider="p",
+        model_name="m",
+        model_api_key="k",
+        embedding_model="e",
+        embedding_api_key="k",
+        database_url_agent="mysql+asyncmy://a@localhost/a",
+        database_url_business_ro="mysql+asyncmy://a@localhost/b",
+        redis_url="redis://localhost:6379/0",
+        milvus_uri="http://localhost:19530",
+        jwt_secret="x" * 32,
+    )
+
+    first = {user.username: user.id for user in seed_demo_users(settings)}
+    second = {user.username: user.id for user in seed_demo_users(settings)}
+
+    assert first == second

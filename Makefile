@@ -4,7 +4,7 @@ SHELL := /bin/bash
 COMPOSE := docker compose -f docker-compose.dev.yml
 
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
-        test layering check clean
+        test test-integration layering check clean
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -35,16 +35,16 @@ logs:  ## 跟踪组件日志
 redis-cli:  ## 进入 Redis 排查队列与 Stream
 	$(COMPOSE) exec redis redis-cli
 
-api:  ## 只起 API 进程
-	uv run uvicorn app.main:app --reload --host $${API_HOST:-0.0.0.0} --port $${API_PORT:-8000}
+api:  ## 只起 API 进程（多实例验收用 PORT=8001 指定端口）
+	uv run uvicorn app.main:app --reload --host $${API_HOST:-0.0.0.0} --port $${PORT:-$${API_PORT:-8000}}
 
-worker:  ## 只起 Worker 进程
-	uv run arq app.worker.WorkerSettings
+worker:  ## 只起 Worker 进程（带依赖抖动的自动重启，见 app/worker.py）
+	uv run python -m app.worker
 
 run:  ## 同时起 api + worker（本地开发必须用这个，见开发流程 4.5 调试纪律）
 	@echo "启动 worker（后台）与 api（前台）…"
 	@trap 'kill 0' EXIT INT TERM; \
-		uv run arq app.worker.WorkerSettings 2>&1 | sed 's/^/[worker] /' & \
+		uv run python -m app.worker 2>&1 | sed 's/^/[worker] /' & \
 		uv run uvicorn app.main:app --reload --host $${API_HOST:-0.0.0.0} --port $${API_PORT:-8000} 2>&1 | sed 's/^/[api]    /' & \
 		wait
 
@@ -59,8 +59,11 @@ lint:  ## 静态检查（不修改文件）
 typecheck:  ## 类型检查
 	uv run mypy app scripts
 
-test:  ## 单元测试
+test:  ## 单元测试（不含 integration，默认依赖都已用替身）
 	uv run pytest
+
+test-integration:  ## 需要真实 Redis 的用例（前置：make up）
+	uv run pytest -m integration app/tests/integration -v
 
 layering:  ## 分层约束检查
 	uv run python scripts/check_layering.py

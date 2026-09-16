@@ -22,7 +22,6 @@ _MINIMAL: dict[str, str] = {
     "MILVUS_URI": "http://127.0.0.1:19530",
     "REDIS_URL": "redis://127.0.0.1:6379/0",
     "JWT_SECRET": "a-sufficiently-long-secret",
-    "OTEL_SERVICE_NAME": "api",
 }
 
 

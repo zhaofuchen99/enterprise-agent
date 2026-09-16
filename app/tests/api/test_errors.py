@@ -172,3 +172,34 @@ async def test_trace_id_present_and_consistent(
 async def test_trace_id_on_every_response(client: AsyncClient, path: str) -> None:
     response = await client.get(path)
     assert response.headers["X-Trace-Id"].startswith("trc_")
+
+
+async def test_redis_down_returns_503_redis_unavailable(app: FastAPI) -> None:
+    """Redis 不可达必须是 503 `REDIS_UNAVAILABLE`，不是笼统的 500。
+
+    两者的处置方式不同：前者等一会儿重试就行，后者重试没有意义。
+    错误码表 19.1 里本来就有这个码，在 Phase 1.5 之前它没有任何产生点。
+    """
+    import json
+
+    from app.tests.api.conftest import login_headers
+
+    async with build_client(app) as client:
+        headers = await login_headers(client)
+        for key in await app.state.redis.keys("rl:*"):
+            await app.state.redis.delete(key)
+        # 让仓储在写入时抛 RedisError，模拟 Redis 掉线
+        app.state.redis.execute_command = _raise
+
+        response = await client.post("/api/agent/chat", json={"message": "问题"}, headers=headers)
+
+    assert response.status_code == 503
+    body = json.loads(response.content)
+    assert body["code"] == "REDIS_UNAVAILABLE"
+    assert body["retryable"] is True
+
+
+async def _raise(*args: object, **kwargs: object) -> None:
+    import redis.asyncio as aioredis
+
+    raise aioredis.ConnectionError("redis 不可达")

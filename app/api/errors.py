@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import logging
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.errors import DEFAULT_RETRYABLE, AgentError, ErrorCode
+from app.core.errors import DEFAULT_RETRYABLE, AgentError, ErrorCode, http_status_of
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,27 @@ def register_exception_handlers(app: FastAPI) -> None:
             code=ErrorCode.INVALID_ARGUMENT,
             message=message,
             retryable=False,
+        )
+
+    @app.exception_handler(aioredis.RedisError)
+    async def _handle_redis_error(request: Request, exc: aioredis.RedisError) -> JSONResponse:
+        """Redis 不可达时返回 503 `REDIS_UNAVAILABLE`，而不是笼统的 500。
+
+        错误码表里本来就有这个码（19.1），而它此前没有任何产生点——
+        于是「Redis 挂了」和「代码抛了异常」对客户端长得一模一样。
+        两者的处置方式完全不同：前者等一会儿重试就行，后者重试没有意义。
+
+        **这是 Phase 1.5 的临时处理**：任务仓储此刻是 Redis 实现，
+        所以 Redis 挂了确实建不了任务。Phase 2 换成 MySQL 后，
+        这条路径只会覆盖限流与队列，创建任务将不再受 Redis 可用性影响。
+        """
+        logger.warning("Redis 不可用：%s", type(exc).__name__, extra={"status": "DEGRADED"})
+        return _envelope(
+            request,
+            status_code=http_status_of(ErrorCode.REDIS_UNAVAILABLE),
+            code=ErrorCode.REDIS_UNAVAILABLE,
+            message="存储暂时不可用，请稍后重试",
+            retryable=True,
         )
 
     @app.exception_handler(StarletteHTTPException)

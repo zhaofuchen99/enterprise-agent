@@ -3,57 +3,269 @@
 **分层硬约束（开发流程 5.2）**：本模块及 `app/agent/`、`app/tools/` 下任何模块，
 不得 import `fastapi`。破坏后 Worker 无法独立扩缩容。
 该约束由 `scripts/check_layering.py` 在 CI 中强制。
+
+**注意约束的实质而不只是字面**：`app/infrastructure/observability.py`
+刻意不 import FastAPI 的自动埋点，就是为了让本模块能安全地引用它——
+检查器只看本文件的 import 行，看不出「引了一个引了 fastapi 的模块」。
+FastAPI 埋点因此留在 `app/main.py` 里单独调用。
+
+本文件只做三件事：装配依赖、注册任务函数、注册定时任务。
+投递/领取/心跳/回收的逻辑全在 `services/task_runner.py`，
+这样 Phase 7 把任务体换成 LangGraph 时，改动面只有那个函数。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import os
+import socket
+from dataclasses import asdict
 from typing import Any, ClassVar
 
+import redis.asyncio as aioredis
+from arq import cron
 from arq.connections import RedisSettings
+from arq.worker import Worker
 
-from app.core.config import get_settings
-from app.infrastructure.logging import bind_context, clear_context, setup_logging
+from app.core.config import Settings, get_settings
+from app.infrastructure.logging import (
+    SERVICE_WORKER,
+    bind_context,
+    clear_context,
+    setup_logging,
+)
+from app.infrastructure.observability import (
+    business_trace_id_from_context,
+    restore_trace_context,
+    setup_error_tracking,
+    setup_observability,
+)
+from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
+from app.infrastructure.redis import RedisKey, create_client
+from app.repositories.task_repo import RedisTaskRepository
+from app.services.event_bus import RedisStreamEventBus
+from app.services.task_runner import TaskRunner
 
 logger = logging.getLogger(__name__)
 
 
-async def ping(ctx: dict[str, Any], payload: str = "") -> str:
-    """连通性自检任务：验证「入队 -> 领取 -> 执行 -> 写回」链路可用。
+async def run_agent_task(
+    ctx: dict[str, Any],
+    task_id: str,
+    trace_id: str = "",
+    trace_context: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """执行一个分析任务。**任务体本身在 `TaskRunner.execute` 里**。
 
-    Phase 1.5 的「空任务闭环」验收即基于此任务。
+    `trace_context` 是 API 侧在投递时序列化的 OTel 上下文（含 traceparent）。
+    恢复它，API 的 HTTP span 与这里的 span 才属于同一条 trace（详细设计 19.4.1）。
     """
-    bind_context(task_id=str(ctx.get("job_id", "")), tool="ping", status="running")
-    try:
-        logger.info("worker ping 收到载荷", extra={"payload_len": len(payload)})
-        return f"pong:{payload}"
-    finally:
-        clear_context()
+    runner: TaskRunner = ctx["runner"]
+    worker_id: str = ctx["worker_id"]
+
+    # baggage 里的业务 trace_id 优先：它来自 API 侧那个请求，
+    # 比队列参数更可靠——参数可能是重投时补的，baggage 一定跟着原始请求走。
+    effective_trace_id = business_trace_id_from_context() or trace_id
+    with restore_trace_context(trace_context or {}):
+        bind_context(trace_id=effective_trace_id or None)
+        try:
+            task = await runner.execute(task_id, worker_id=worker_id)
+        finally:
+            clear_context()
+
+    if task is None:
+        # 没执行不代表出错：已被领取、已取消都是正常结果（见 TaskRunner.claim）
+        return {"task_id": task_id, "executed": False}
+    return {"task_id": task_id, "executed": True, "status": task.status.value}
+
+
+async def reclaim_orphans(ctx: dict[str, Any]) -> dict[str, Any]:
+    """定时任务：回收心跳过期的 RUNNING 任务。"""
+    runner: TaskRunner = ctx["runner"]
+    report = await runner.reclaim_orphans()
+    return asdict(report)
+
+
+async def reconcile_queue(ctx: dict[str, Any]) -> dict[str, Any]:
+    """定时任务：重新投递「写库成功但没进队列」的任务（详细设计 17.1）。"""
+    runner: TaskRunner = ctx["runner"]
+    report = await runner.reconcile_queue()
+    return asdict(report)
+
+
+def _worker_id() -> str:
+    """Worker 标识。带主机名与 pid：排查孤儿任务时要能定位到**哪个**进程死了。"""
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _build_runner(settings: Settings, redis: aioredis.Redis, queue: ArqJobQueue) -> TaskRunner:
+    return TaskRunner(
+        tasks=RedisTaskRepository(redis, settings),
+        queue=queue,
+        events=RedisStreamEventBus(redis, settings),
+        settings=settings,
+        redis=redis,
+    )
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
-    setup_logging(settings.otel_service_name, settings.log_level)
-    logger.info("worker 启动完成")
+    setup_logging(SERVICE_WORKER, settings.log_level)
+    setup_observability(settings, service_name=SERVICE_WORKER)
+    setup_error_tracking(settings)
+
+    # 用自建连接而不是复用 arq 的 ctx["redis"]：arq 的连接池是否
+    # decode_responses 由它的内部实现决定，而本项目的仓储与事件总线
+    # 都按「取出来就是 str」写。多几条连接换掉这个隐含耦合是划算的。
+    redis = create_client(settings)
+    queue = await ArqJobQueue.create(settings)
+
+    ctx["redis"] = redis
+    ctx["queue"] = queue
+    ctx["worker_id"] = _worker_id()
+    ctx["runner"] = _build_runner(settings, redis, queue)
+    logger.info("worker 启动完成", extra={"status": ctx["worker_id"]})
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    logger.info("worker 正在退出")
+    """优雅停机。
+
+    arq 在收到停机信号后会停止领取新任务并等待**在跑的任务**结束，
+    因此这里只负责释放连接。注意：强制停机（SIGKILL / 容器被 kill -9）
+    走到不了这里，那种情况下的 RUNNING 任务由孤儿回收接手——
+    两条路径都必须存在，少一条就会留下永远停在 RUNNING 的任务。
+    """
+    logger.info("worker 正在退出，等待在跑任务结束", extra={"status": ctx.get("worker_id")})
+    queue: ArqJobQueue | None = ctx.get("queue")
+    if queue is not None:
+        await queue.aclose()
+    redis: aioredis.Redis | None = ctx.get("redis")
+    if redis is not None:
+        await redis.aclose()
+    clear_context()
 
 
-def _redis_settings() -> RedisSettings:
-    """从 REDIS_URL 解析 arq 连接参数，避免维护第二份配置。"""
-    return RedisSettings.from_dsn(get_settings().redis_url)
+def _schedule(coro: Any, *, name: str, seconds: int) -> Any:
+    """按周期生成一个定时任务。
+
+    arq 的 cron 用「在第几秒 / 第几分钟触发」表达周期，因此要把间隔展开成集合。
+    分两种写法而不是拼一个 dict 再展开：间隔一旦大于等于 60 秒，
+    `set(range(0, 60, seconds))` 就是**空集**，定时任务会静默地永不触发——
+    这种错在运行时不报任何警，只表现为「回收从来没跑过」。
+    """
+    if seconds < 60:
+        return cron(coro, name=name, second=set(range(0, 60, seconds)), max_tries=1, timeout=30)
+    return cron(
+        coro, name=name, minute=set(range(0, 60, max(1, seconds // 60))), max_tries=1, timeout=30
+    )
+
+
+def _cron_jobs(settings: Settings) -> list[Any]:
+    return [
+        # 孤儿回收要在心跳过期之后尽快跑，因此与心跳 TTL 同量级
+        _schedule(
+            reclaim_orphans,
+            name="reclaim_orphans",
+            seconds=settings.worker.orphan_scan_interval_seconds,
+        ),
+        _schedule(
+            reconcile_queue,
+            name="reconcile_queue",
+            seconds=settings.worker.queue_reconcile_seconds,
+        ),
+    ]
+
+
+#: 模块级单例：`arq` 在导入本模块时就读取 `WorkerSettings` 的类属性，
+#: 而 `get_settings()` 是 lru_cache 的，这里读一次与运行时读到的是同一份。
+_settings = get_settings()
 
 
 class WorkerSettings:
     """`arq app.worker.WorkerSettings` 的入口。"""
 
-    functions: ClassVar[list[Any]] = [ping]
+    functions: ClassVar[list[Any]] = [run_agent_task]
+    cron_jobs: ClassVar[list[Any]] = _cron_jobs(_settings)
+    #: 必须与投递端指定的队列名一致（详细设计 4.4 的 `q:agent`）。
+    #: arq 的默认名是 `arq:queue`，两边不一致的话任务会投进一个没人监听的队列。
+    queue_name: ClassVar[str] = RedisKey.queue()
     on_startup = on_startup
     on_shutdown = on_shutdown
-    redis_settings: ClassVar[RedisSettings] = _redis_settings()
+    redis_settings: ClassVar[RedisSettings] = RedisSettings.from_dsn(_settings.redis_url)
     #: 任务超时与 loop.max_expansions 联动（开发流程 5.4）
-    job_timeout: ClassVar[int] = get_settings().task_timeout_seconds
-    max_jobs: ClassVar[int] = 4
+    job_timeout: ClassVar[int] = _settings.task_timeout_seconds
+    max_jobs: ClassVar[int] = _settings.worker.concurrency
     keep_result: ClassVar[int] = 3600
+    #: arq 默认（0）意味着收到停机信号立刻取消在跑的任务。给一小段收尾时间，
+    #: 但**不取 task_timeout**：那会让 `Ctrl-C` 之后开发机要等十分钟才退出。
+    #: 超过这段时间仍未结束的任务被中断，由孤儿回收接手——两条路径都在。
+    job_completion_wait: ClassVar[int] = _settings.worker.shutdown_grace_seconds
+
+
+#: arq 按 `functions` 里的函数名查找任务，投递端用的 `TASK_JOB_NAME` 必须
+#: 与函数名一致。不一致时不会有任何报错，只会表现为「任务入队了但永远没人执行」，
+#: 因此这里在导入期就把它变成一次显式失败。
+assert run_agent_task.__name__ == TASK_JOB_NAME, (
+    f"任务函数名 {run_agent_task.__name__} 与投递端常量 {TASK_JOB_NAME} 不一致"
+)
+
+#: 重启退避的上限。Redis 长时间不可用时持续以最大间隔重试，
+#: 既不会放弃，也不会把日志刷爆。
+_MAX_RESTART_BACKOFF_SECONDS = 30.0
+
+
+async def run_forever() -> None:
+    """Worker 主循环：**依赖抖动时重启自己，而不是让进程死掉**。
+
+    为什么需要这一层：arq 的轮询循环（`_poll_iteration`）没有任何异常保护，
+    Redis 一断，`zrangebyscore` 抛出的 `ConnectionError` 会一路冒到主循环外，
+    进程直接退出。之后即使 Redis 恢复，也**没有任何人来消费队列**——
+    任务全部堆在 `q:agent` 里，而健康检查、日志、监控都看不出异常
+    （进程没了，不是进程坏了）。这正是「Redis 不可用时降级而非不可用」
+    要挡住的那类失败。
+
+    停机信号（SIGTERM/SIGINT）走 `CancelledError`，**原样上抛**：
+    那是正常退出，不该被当成故障重启。
+    """
+    backoff = 1.0
+    while True:
+        ctx: dict[str, Any] = {}
+        worker = Worker(
+            functions=WorkerSettings.functions,
+            cron_jobs=WorkerSettings.cron_jobs,
+            queue_name=WorkerSettings.queue_name,
+            redis_settings=WorkerSettings.redis_settings,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            ctx=ctx,
+            max_jobs=WorkerSettings.max_jobs,
+            job_timeout=WorkerSettings.job_timeout,
+            keep_result=WorkerSettings.keep_result,
+            job_completion_wait=WorkerSettings.job_completion_wait,
+        )
+        try:
+            await worker.async_run()
+            return
+        except asyncio.CancelledError:
+            raise
+        except (aioredis.RedisError, OSError) as exc:
+            logger.warning(
+                "Worker 因依赖不可用而中断，%.0f 秒后重启：%s",
+                backoff,
+                type(exc).__name__,
+                extra={"status": "RESTARTING"},
+            )
+            # 尽力释放上一轮的连接。Redis 已经不可用时 aclose 也会失败，
+            # 那没关系——进程要重建连接池，旧连接会被操作系统回收。
+            with contextlib.suppress(Exception):
+                await on_shutdown(ctx)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_RESTART_BACKOFF_SECONDS)
+
+
+if __name__ == "__main__":
+    # `make worker` 走这里而不是 arq 的命令行入口：命令行入口没有重启外壳，
+    # Redis 一断 Worker 就永久消失（见 run_forever 的说明）。
+    asyncio.run(run_forever())

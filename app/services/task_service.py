@@ -1,14 +1,18 @@
-"""任务创建与查询。
+"""任务创建、查询与取消。
 
-Phase 1 只负责「把任务登记下来」，**不启动 LangGraph**（开发流程 6.2 施工项 5）。
-入队与执行在 Phase 1.5 接入：按详细设计 17.1 的事务边界，
-必须先写库成功、再投递队列，否则 Worker 可能在记录可见前就领到任务；
-写库成功而入队失败的补偿由 Worker 侧的队列扫描负责
-（【后续扩展】登记于 CLAUDE.md，Phase 1.5 实现）。
+**事务边界的顺序不能反**（详细设计 17.1）：先写库成功，再投递队列。
+反过来先入队的话，Worker 可能在记录可见之前就领到任务，然后什么也查不到。
+写库成功而入队失败是允许的中间状态——任务停在 QUEUED，
+由 Worker 侧的补偿扫描重新投递（`TaskRunner.reconcile_queue`），
+因此**投递失败不改变接口的返回**：任务确实创建成功了。
+
+LangGraph 的执行体在 Phase 7 接入，Phase 1.5 起的任务体是空实现，
+任务会以 SUCCEEDED 且 answer 为 null 结束，见 `TaskRunner._run_body`。
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -16,13 +20,21 @@ from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
 from app.core.ids import new_conversation_id, new_task_id
 from app.domain.conversation import Conversation
-from app.domain.task import Task
+from app.domain.task import Task, TaskStatus
 from app.domain.user import User, UserRole
 from app.repositories.conversation_repo import ConversationRepository
-from app.repositories.task_repo import DuplicateTaskError, TaskRepository
+from app.repositories.task_repo import DuplicateTaskError, TaskPatch, TaskRepository
+from app.services.task_runner import TaskRunner
+
+logger = logging.getLogger(__name__)
 
 #: 会话标题取问题开头，够列表页展示即可
 _TITLE_MAX_LENGTH = 60
+
+#: 落到这些状态说明取消意图已经记下了，重复取消直接返回现状（17.5 幂等）
+_CANCEL_IDEMPOTENT: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,10 +51,12 @@ class TaskService:
         tasks: TaskRepository,
         conversations: ConversationRepository,
         settings: Settings,
+        runner: TaskRunner,
     ) -> None:
         self._tasks = tasks
         self._conversations = conversations
         self._settings = settings
+        self._runner = runner
 
     async def create_task(
         self,
@@ -99,7 +113,24 @@ class TaskService:
             return self._replay(existing, message=message, conversation_id=conversation_id)
 
         await self._conversations.touch(conversation.id, now)
+        await self._dispatch(task)
         return CreateTaskResult(task=task, created=True)
+
+    async def _dispatch(self, task: Task) -> None:
+        """把刚登记的任务投进队列。**失败不抛异常**。
+
+        任务已经在库里、状态是 QUEUED，投递失败并不改变「任务创建成功」这个事实。
+        把投递失败报成 500 会让客户端以为任务没建，于是重试——而重试若带了
+        幂等键会命中同一个任务，看起来「成功」了却仍然没入队，反而更难排查。
+        正确做法是让补偿扫描去修（详细设计 17.1）。
+        """
+        if not await self._runner.enqueue(task):
+            logger.warning("任务投递失败，等待补偿扫描", extra={"task_id": task.id})
+            return
+        logger.info(
+            "任务已投递",
+            extra={"task_id": task.id, "status": task.status.value, "node": "enqueue"},
+        )
 
     async def get_task(self, *, user: User, task_id: str) -> Task:
         """按 task_id 取任务，并做归属校验。
@@ -114,6 +145,50 @@ class TaskService:
         if task.user_id != user.id and user.role is not UserRole.ADMIN:
             raise AgentError(ErrorCode.ACCESS_DENIED, "无权访问该任务")
         return task
+
+    async def cancel_task(self, *, user: User, task_id: str) -> Task:
+        """请求取消（详细设计 17.5）。
+
+        **顺序是「先写库、再写 Redis」，与投递同一条纪律的镜像**：
+        数据库里的 `CANCEL_REQUESTED` 是权威状态，Redis 键只是给可能跑在
+        另一个实例上的 Worker 的信号。反过来的话，Worker 可能看到一个
+        自己无从校验的取消信号，而任务记录里却还是 RUNNING。
+        """
+        task = await self.get_task(user=user, task_id=task_id)
+        if task.status in _CANCEL_IDEMPOTENT:
+            # 17.5 要求取消幂等：重复取消返回相同结果，不报错
+            return task
+        if task.is_terminal:
+            raise AgentError(
+                ErrorCode.TASK_CONFLICT, f"任务已结束（{task.status.value}），无法取消"
+            )
+
+        updated = await self._tasks.update(
+            task_id,
+            TaskPatch(status=TaskStatus.CANCEL_REQUESTED),
+            at=datetime.now(UTC),
+            # CAS：读到这里之间任务可能刚好被 Worker 领走或跑完，
+            # 那种情况下我们不能把已结束的任务改回 CANCEL_REQUESTED
+            only_if_status=task.status,
+        )
+        if updated is None:
+            return await self._resolve_cancel_race(user=user, task_id=task_id)
+
+        await self._runner.signal_cancel(task_id)
+        logger.info("已登记取消请求", extra={"task_id": task_id, "status": updated.status.value})
+        return updated
+
+    async def _resolve_cancel_race(self, *, user: User, task_id: str) -> Task:
+        """CAS 失败后的重读。**只重读一次，不递归**——
+        状态在毫秒内反复变化说明有它自己的问题，把重试做成循环只会掩盖它。"""
+        latest = await self.get_task(user=user, task_id=task_id)
+        if latest.status in _CANCEL_IDEMPOTENT:
+            return latest
+        if latest.is_terminal:
+            raise AgentError(
+                ErrorCode.TASK_CONFLICT, f"任务已结束（{latest.status.value}），无法取消"
+            )
+        raise AgentError(ErrorCode.TASK_CONFLICT, "任务状态正在变化，请稍后重试")
 
     async def _ensure_quota(self, user: User) -> None:
         limit = self._settings.max_running_tasks_per_user
