@@ -1,0 +1,45 @@
+"""仓储层。
+
+`Repositories` 是仓储依赖的**单一入口**，由 `app/main.py` 的 `wire_dependencies`
+接收：生产装配塞 MySQL 实现，单元测试注入内存实现。
+
+做成一个整体而不是三个独立参数，是因为三者必须**同源**——
+「用户来自 MySQL、任务来自内存」这种组合在测试里不会有任何报错，
+却会让「登录后查自己的任务」这类链路出现无法解释的空结果。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.repositories.conversation_repo import (
+    ConversationRepository,
+    SqlConversationRepository,
+)
+from app.repositories.task_repo import SqlTaskRepository, TaskRepository
+from app.repositories.user_repo import SqlUserRepository, UserRepository
+
+
+@dataclass(frozen=True, slots=True)
+class Repositories:
+    users: UserRepository
+    conversations: ConversationRepository
+    tasks: TaskRepository
+
+
+def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Repositories:
+    """生产装配：三个仓储全部走 MySQL（详细设计 16 章）。
+
+    **放在这里而不是 `app/main.py`**：`app/worker.py` 也要用它，而 worker
+    一旦 import `app.main` 就会把 FastAPI 加载进 Worker 进程——
+    正是 L2「Worker 不得依赖 Web 框架」要防的事，但分层检查器只匹配
+    `fastapi` / `starlette` 前缀，**查不出这种间接依赖**。
+    放在仓储层这个「双方都向下依赖」的位置是唯一不会踩线的选择。
+    """
+    return Repositories(
+        users=SqlUserRepository(sessions),
+        conversations=SqlConversationRepository(sessions),
+        tasks=SqlTaskRepository(sessions),
+    )

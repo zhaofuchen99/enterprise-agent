@@ -20,27 +20,42 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 0 项目初始化 | ✅ 完成 | 骨架、配置、错误码、结构化日志、健康探针、分层约束检查、CI、pre-commit 密钥防护 |
 | 1 基础 API | ✅ 完成 | 统一响应外壳、全局异常映射（400/401/403/404/409/429/500）、`trc_` trace 中间件、本地 JWT 登录、`/api/agent/chat` 与 `/api/agent/tasks/{id}` 占位、OpenAPI 定制 |
 | 1.5 基础设施接入 | ✅ 完成 | Redis 键与 Lua 脚本、Redis 限流 + 降级 + 熔断、Redis 任务仓储（临时）、arq 队列与 Worker 骨架（含自愈重启）、事件流、取消链路、对象存储抽象、OTel 与跨进程 trace。`make check` 全绿（267 测试）+ 7 条 integration 用例；验收记录见开发流程 11.1 |
-| 2 数据库 | ⬜ 未开始 | 下一步 |
+| 2 数据库 | 🔶 进行中 | **已完成**：Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。**未完成**：`agent_task_step`/`tool_call`/`evidence`/`trace` 仓储、`make cleanup` 的保留期实现 |
+| 3–9 冲刺切片 | ⬜ 未开始 | 秋招冲刺路线见下方，分两批交付 |
+
+> ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
+> 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
+>
+> - **第 1 批**：Phase 2 精简版（10 表）→ Phase 3 → Phase 4 SQL Tool
+> - **第 2 批**：Phase 5 RAG 裁剪版 → 最小 Graph（6 节点）→ Evidence → Reviewer-lite
+>
+> **Search / SSE / Reranker / 完整 Conflict / 评测扩集 / 生产部署后置**，切片内不要顺手做。
+> 每次开工前先读冲刺方案的第 8 节（冻结范围与分批）和第 11 节（面试口径纪律——
+> 第 1 批做完时 RAG 还没做，简历与口述不得提前声称）。
 
 **开工前**：先 `make ps` 看有状态组件是否在跑，没起来就 `make up`。
 
-**Phase 1.5 之后仍然存在的临时约定**（Phase 2 拆掉）：
+**当前仍然存在的临时约定**：
 
-1. **用户与会话**仓储仍是进程内占位，重启即丢、多实例互不可见。
-   （任务仓储已改为 Redis，跨实例可见——但它是临时的，Phase 2 换成 MySQL。）
-2. **任务体是空实现**：任务会以 `SUCCEEDED` 且 `answer` 为 `null` 结束。
+1. **任务体是空实现**：任务会以 `SUCCEEDED` 且 `answer` 为 `null` 结束。
    这是预期行为，不是 bug——本阶段验证的是执行链路，分析能力在 Phase 7。
-3. **Redis 此刻是创建任务的硬依赖**：任务仓储还是 Redis 实现，Redis 挂掉时
-   `POST /api/agent/chat` 返回 503 `REDIS_UNAVAILABLE`。Phase 2 换成 MySQL 后，
-   Redis 不可用只会影响限流与队列（限流有降级路径，任务由补偿扫描补投）。
-4. 演示账号（`analyst`/`admin`）的 ID 由用户名确定性派生，**多实例之间是同一个用户**；
+2. **演示账号要跑 `make seed` 才会写进 `app_user`**：登录依赖它。
+   从零启动的完整流程是 `make up && make migrate && make seed && make run`。
+   （Phase 1 是进程内自动播种，Phase 2 起改为显式命令——构造函数里写库
+   会让「测试为什么改了数据库」变得难以解释。）
+3. 演示账号（`analyst`/`admin`）的 ID 由用户名确定性派生，**多实例之间是同一个用户**；
    真实用户仍走随机 ULID。这样多实例的限流与并发配额才能被端到端验收。
+4. **单元测试注入内存仓储，不连 MySQL**（`app/tests/fakes.py` 的
+   `build_memory_repositories`）。仓储的 MySQL 实现由 `make test-integration`
+   下的**同一批契约断言**覆盖——两条路径各有各的验证，不重叠也不留空。
 
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
 |---|---|
-| 任务仓储换 MySQL（**并删除 `RedisTaskRepository` 与它的 5 个临时索引键**） | Phase 2 |
+| ~~任务仓储换 MySQL~~ **已完成**（`RedisTaskRepository` 与 5 个索引键已删） | ✅ Phase 2 |
+| `agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_trace_event` 的仓储实现（表已建，仓储待写；调用方在 Phase 6/7 才出现） | Phase 6 / 7 |
+| `make cleanup` 的保留期策略与实现（详细设计 16.12） | Phase 2 收尾 |
 | 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |
 | `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
 | 用户消息落库（FR-CHAT-001 处理流程的「保存用户消息」，`agent_message` 表） | Phase 2 |
@@ -52,16 +67,36 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 登录接口限流（当前配额按已认证用户计，登录不受保护，可被口令爆破） | Phase 12 |
 | 未注册路径复用 `TASK_NOT_FOUND` 的语义含混（错误码表封闭所致） | 待定 |
 
+**冲刺期后置**（由 `docs/秋招冲刺方案.md` §10 冻结，切片内不要顺手做）：
+
+| 项 | 备注 |
+|---|---|
+| **Reranker**（选型 + 阈值校准） | 切片内用 RRF 融合后的 Top K 直接出证据 |
+| **语料扩到 80+ 篇 + 缺陷注入全套（10 类）** | 切片内先 15–25 篇、2 类缺陷。**扩集后必须重校准 RAG 阈值**——当前阈值基于小语料，结论不具代表性 |
+| 文档版本发布流程（staging → smoke test → publish）、知识管理接口 FR-ADM-001、扫描件 OCR、跨页表格还原 | 切片内直接入库 + 脚本 |
+| 词表扩容机制（`token_id` 只增不改的运维面） | **表结构与固定 IDF 方案已在切片内保留** |
+| `agent_conflict` / `agent_review` 表与完整 5 类 Conflict 检测 | 切片内只做「报告数字 vs DB 数字」一类，且先不建表 |
+| `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
+| SSE 订阅端点与订阅令牌（Phase 1.5 已完成事件流，剩余是暴露端点） | |
+| `/trace` 接口与节点埋点（OTel 已接入，只差业务侧） | |
+| 评测集扩到 115 条（先 40 题；**SQL 安全类 100% 阻断率的判定标准不缩**） | |
+| `schema_catalog` / `agent_config` 建表（切片内暂用 YAML / 配置） | |
+| 生产部署（Nginx / HTTPS / 备份 / 告警 / 回滚演练） | |
+
 ## 设计文档
 
-`docs/` 下四份文档是**设计意图的记录，不是验收契约**：
+`docs/` 下文档是**设计意图的记录，不是验收契约**：
 
 | 文件 | 用途 |
 |---|---|
 | `企业智能数据分析与决策Agent-需求规格说明书.md` | 功能与非功能需求（FR 条目） |
 | `企业智能数据分析与决策Agent-详细设计说明书.md` | 架构、Schema、接口、错误码表（19.1） |
 | `企业智能数据分析与决策Agent-开发流程.md` | Phase 划分、验收命令、门禁、工作量估算 |
+| **`秋招冲刺方案.md`** | **冲刺期当前的施工依据**——逐节裁决了简化方案，冻结切片范围与后置项。**效力优先于开发流程第 6 章** |
 | `Agent项目需求.md` | 原始需求 |
+
+> **需求条目（FR-*）不是"可以砍的生产工程化设计"。** 冲刺方案里推迟的 FR（如 FR-SSE-001、FR-CHAT-003 的多轮上下文）
+> 是**推迟实现**，不是**取消需求**——对应实现补齐前，简历与面试中不得声称已具备该能力（见冲刺方案 §11）。
 
 **偏离文档时**：先在回复里说明是哪一节、为什么、建议怎么改，得到确认后改代码，**并回写文档**保持两者一致。
 不允许默默偏离，也不允许为了"忠于文档"硬做明显不合理的实现。
@@ -110,7 +145,11 @@ make bootstrap   # 首次：生成 .env + 装依赖
 make up          # 起 redis / agent-mysql / business-mysql / minio
 make run         # 同时起 api + worker  ← 本地开发必须用这个，不要只跑 make api
 make check       # 提交前必跑：ruff + mypy + 分层约束 + pytest
-make test-integration  # 需要真实 Redis（前置 make up）
+make migrate     # 迁移 agent 运行库到最新（前置 make up）
+make seed        # 灌入演示数据：agent 库的演示账号 + 业务库 49.9 万行（幂等）
+make verify-business  # 只跑业务库的四条约束断言与 EXPLAIN 检查
+make seed-business ROWS=20000  # 快速试跑业务库（改规模）
+make test-integration  # 需要真实 Redis / MySQL（前置 make up；会自动建 agent_test 库）
 make redis-cli   # 排查队列与 Stream
 ```
 
@@ -161,15 +200,41 @@ make redis-cli
 | 内存 | 7.6GB（物理机 16GB） | **Milvus Standalone 需 8GB 起，本机跑不起来** |
 | Redis | 宿主端口 **6381** | 6379 被本机原生 redis 占用（存有另一个项目的数据，不可动）；6380 被 redis-stack 占用。容器内仍是 6379 |
 | MinIO | 镜像用 `quay.io/minio/minio` | 本机 daemon 的 `docker.m.daocloud.io` 镜像源对 `minio/minio` 返回 403 |
-| MySQL | agent `3306` / business `3307` | business 用只读账号，写操作必须被数据库拒绝 |
+| MySQL | agent **`3308`** / business `3307` | business 用只读账号，写操作必须被数据库拒绝。agent 用 3308 而非 3306：**Windows 侧另有一个独立安装的 MySQL 占着 `0.0.0.0:3306`**，wslrelay 因此无法为 3306 建立 localhost 转发（实测 3307/6379/6380/6381/9000 都转发，唯独没有 3306）。用 Windows 的图形客户端连 `localhost:3306` 会连到**那个** MySQL，看不到 `agent_task` 等表 |
 | Milvus | 在 `rag` profile 下，默认不启动 | 见下方未决项 |
+
+### 从 Windows 侧的图形客户端连库（Navicat 等）
+
+容器跑在 **WSL 内的原生 Docker** 里（`unix:///var/run/docker.sock`，非 Docker Desktop），
+Windows 通过 `wslrelay` 转发 `127.0.0.1:<宿主端口>` 访问。**主机一律填 `localhost`**：
+
+| 用途 | 端口 | 用户名 | 口令 | 库 |
+|---|---:|---|---|---|
+| Agent 运行库（读写） | **3308** | `agent` | `agent_pw` | `agent`（另有 `agent_test`） |
+| 业务演示库（**只读**） | 3307 | `readonly` | `readonly_pw` | `business` |
+| 业务演示库（要改数据时） | 3307 | `root` | `root_pw` | `business` |
+
+三个口令是**本地开发占位值，不是密钥**——它们已经明文写在 `docker-compose.dev.yml` 与
+`.env.example` 里（否则 `make bootstrap` 无法开箱可用）。生产部署必须换成密钥服务注入。
+
+三条容易踩的：
+
+1. **端口填 3306 会连到 Windows 上那个独立安装的 MySQL**，不是本项目的容器。
+   能连上、但里面没有 `agent_task`，极易误判成"迁移没跑"。
+2. **业务库用 `readonly` 连上只能 SELECT**（`GRANT SELECT, SHOW VIEW ON business.*`），
+   在 Navicat 里改数据会报 `1142`。这是**设计如此**——SQL 安全由数据库权限保证，
+   不依赖模型（详细设计 19.2）。要编辑就用上表的 `root`。
+3. 连不上时先 `make up`：容器**没配 restart policy**，WSL 重启后不会自动起。
+   `localhost` 转发也依赖 WSL 处于运行状态。
+
+`Navicat for MySQL` 看不了 Redis，排查队列与事件流用 `make redis-cli`。
 
 ## 未决项
 
 | 编号 | 内容 | 何时需要定 |
 |---|---|---|
 | TBC-04 | **模型选型**：主聊天模型、embedding、reranker。本机已装 Ollama，本地模型可省 API 成本 | Phase 3 开工前 |
-| TBC-05 | **向量库**：Milvus Standalone 本机内存不足。候选为 Milvus Lite（嵌入式，`pymilvus` 同一客户端，只改 URI）、Qdrant、Chroma | Phase 5 开工前，**先跑最小用例实测再定** |
+| TBC-05 | **向量库**：Milvus Standalone 本机内存不足。候选为 Milvus Lite（嵌入式，`pymilvus` 同一客户端，只改 URI）、Qdrant、Chroma。**勘察性实测已有数据**（`scripts/spike_milvus_lite.py`：嵌入式方案支持 `SPARSE_FLOAT_VECTOR` + RRF 混合检索，2000 条 768 维下峰值 RSS 317MB），**但选型仍不结案** | Phase 5 开工前，三候选同口径对比后再定 |
 
 **处理未决项的原则**：先做最小验证拿到数据再决策，不要靠读文档空猜。
 `infrastructure/` 层必须把外部组件隔离干净，使换实现的成本控制在一个文件内。

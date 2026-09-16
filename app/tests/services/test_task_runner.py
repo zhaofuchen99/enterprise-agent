@@ -23,7 +23,7 @@ from app.core.config import Settings
 from app.core.errors import ErrorCode
 from app.domain.task import Task, TaskStatus
 from app.infrastructure.redis import RedisKey
-from app.repositories.task_repo import RedisTaskRepository, TaskPatch, TaskRepository
+from app.repositories.task_repo import InMemoryTaskRepository, TaskPatch, TaskRepository
 from app.services.event_bus import RedisStreamEventBus, TaskEventType
 from app.services.task_runner import TaskRunner
 from app.tests.fakes import FakeJobQueue
@@ -113,7 +113,11 @@ def build_runner(
     **worker: object,
 ) -> tuple[TaskRunner, TaskRepository, FakeJobQueue, RedisStreamEventBus]:
     settings = _settings(**worker)
-    repo = RedisTaskRepository(redis, settings)
+    # 用内存仓储而不是 SQL：TaskRunner 的用例验证的是**编排逻辑**
+    # （投递/领取/心跳/取消/回收），不是仓储实现——仓储行为由
+    # `app/tests/repositories/test_task_repo.py` 的契约测试单独覆盖。
+    # 这里换成 SQL 会要求每个用例都连库，把单元测试变成集成测试。
+    repo = InMemoryTaskRepository()
     events = RedisStreamEventBus(redis, settings)
     job_queue = queue or FakeJobQueue()
     runner = runner_cls(

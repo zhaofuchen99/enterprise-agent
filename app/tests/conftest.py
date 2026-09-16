@@ -25,8 +25,11 @@ _TEST_ENV: dict[str, str] = {
     "MODEL_API_KEY": "test-key",
     "EMBEDDING_MODEL": "test-embedding",
     "EMBEDDING_API_KEY": "test-key",
-    "DATABASE_URL_AGENT": "mysql+asyncmy://agent:agent@localhost:3306/agent_test",
-    "DATABASE_URL_BUSINESS_RO": "mysql+asyncmy://ro:ro@localhost:3307/business_test",
+    # 指向**独立的测试库** agent_test，不是开发库 agent：
+    # 契约测试会反复建表与清数据，指向开发库等于把本地数据当消耗品。
+    # 凭据与 docker-compose.dev.yml 里的 agent-mysql 一致。
+    "DATABASE_URL_AGENT": "mysql+asyncmy://agent:agent_pw@127.0.0.1:3308/agent_test",
+    "DATABASE_URL_BUSINESS_RO": "mysql+asyncmy://readonly:readonly_pw@127.0.0.1:3307/business",
     "MILVUS_URI": "http://localhost:19530",
     "REDIS_URL": "redis://localhost:6381/15",
     # 长度 >= 32 字节：HS256 的密钥短于摘要长度会被 PyJWT 警告（RFC 7518 3.2）
@@ -85,20 +88,34 @@ async def fake_redis() -> AsyncIterator[fakeredis.aioredis.FakeRedis]:
 def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None = None) -> FastAPI:
     """绕开 lifespan 构造应用。
 
-    lifespan 会去连真实 Redis 与 arq，单元测试里不能跑；改为直接注入 fakeredis
-    与队列替身，并显式调用 `wire_dependencies`——**与生产走的是同一个装配函数**，
-    这样测试覆盖到的依赖图不会和实际运行的那份分家。
+    lifespan 会去连真实 Redis、MySQL 与 arq，单元测试里不能跑；改为直接注入
+    fakeredis、内存仓储与队列替身，并显式调用 `wire_dependencies`——
+    **与生产走的是同一个装配函数**，这样测试覆盖到的依赖图不会和实际运行的那份分家。
 
     队列默认用 `FakeJobQueue`（arq 需要真实连接）。需要断言投递行为的用例
     可以自己传一个进来，之后从 `app.state.job_queue` 取回。
+
+    **仓储注入内存实现，不连 MySQL**（Phase 2）：`make test` 的契约是
+    「不依赖任何外部组件」。仓储的 MySQL 实现由 `make test-integration`
+    下的契约测试覆盖——**同一批断言跑两个实现**，因此这里换成内存实现
+    不会让 SQL 实现失去验证。
     """
     from app.core.config import get_settings
     from app.main import create_app, wire_dependencies
-    from app.tests.fakes import FakeJobQueue
+    from app.tests.fakes import FakeJobQueue, FakeSessionFactory, build_memory_repositories
 
+    settings = get_settings()
     application = create_app()
     application.state.redis = fake_redis
-    wire_dependencies(application, get_settings(), queue=queue or FakeJobQueue())
+    # 就绪探针会拿 sessions 执行 SELECT 1；注入替身而不是真实工厂，
+    # 使探针的调用形状仍然被覆盖（503 分支见 integration 用例）。
+    application.state.sessions = FakeSessionFactory()
+    wire_dependencies(
+        application,
+        settings,
+        queue=queue or FakeJobQueue(),
+        repositories=build_memory_repositories(settings),
+    )
     return application
 
 

@@ -20,12 +20,13 @@ async def _count_tasks(app: FastAPI) -> int:
     这里刻意白盒，换来的是一条真正断言了不变量、而不是「两次返回的 task_id
     一样」这种可能被巧合满足的用例。
 
-    Phase 1.5 起任务记录存在 Redis（`task:{id}:record`），因此这里扫键。
-    用 KEYS 而不是维护一个计数器：测试要看到的是**存储的真实状态**，
-    再维护一份计数就变成「用一个可能同样写错的实现去验证另一个实现」。
+    Phase 2 起任务记录存在 MySQL（`agent_task`），但**接口测试注入的是内存仓储**
+    （见 `app/tests/conftest.py` 的说明），因此这里读内存实现的实际状态。
+    不改成「再发一个不同幂等键的请求来推断」：那就变成用一个可能同样写错的
+    实现去验证另一个实现，而这条用例的价值恰恰在于它是白盒的。
     """
-    redis = app.state.redis
-    return len(await redis.keys("task:tsk_*:record"))
+    repo = app.state.task_repo
+    return len(repo._by_id)
 
 
 async def test_create_task_returns_202_with_accepted(

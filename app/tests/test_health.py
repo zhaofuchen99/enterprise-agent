@@ -14,10 +14,11 @@ async def test_live_returns_ok(client: AsyncClient) -> None:
     assert response.json()["status"] == "ok"
 
 
-async def test_ready_reports_redis(client: AsyncClient) -> None:
+async def test_ready_reports_mysql_and_redis(client: AsyncClient) -> None:
+    """两个依赖都要报出来。Phase 2 起 MySQL 是权威存储，它的状态同样是就绪信息。"""
     response = await client.get("/health/ready")
     assert response.status_code == 200
-    assert response.json()["checked"] == ["redis"]
+    assert response.json()["checked"] == ["mysql", "redis"]
 
 
 async def test_ready_reports_degraded_when_redis_down(app: FastAPI) -> None:
@@ -42,4 +43,4 @@ async def test_ready_reports_degraded_when_redis_down(app: FastAPI) -> None:
     body = response.json()
     assert body["status"] == "degraded"
     assert body["degraded"] == ["redis(ConnectionError)"]
-    assert body["checked"] == ["redis"]
+    assert body["checked"] == ["mysql", "redis"]

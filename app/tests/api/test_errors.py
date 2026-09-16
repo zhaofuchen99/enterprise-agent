@@ -174,11 +174,18 @@ async def test_trace_id_on_every_response(client: AsyncClient, path: str) -> Non
     assert response.headers["X-Trace-Id"].startswith("trc_")
 
 
-async def test_redis_down_returns_503_redis_unavailable(app: FastAPI) -> None:
-    """Redis 不可达必须是 503 `REDIS_UNAVAILABLE`，不是笼统的 500。
+async def test_redis_down_does_not_block_task_creation(app: FastAPI) -> None:
+    """Redis 掉线**不再**让创建任务失败——这是 Phase 2 相对 Phase 1.5 的改进。
 
-    两者的处置方式不同：前者等一会儿重试就行，后者重试没有意义。
-    错误码表 19.1 里本来就有这个码，在 Phase 1.5 之前它没有任何产生点。
+    Phase 1.5 的任务仓储还是 Redis 实现，因此 Redis 一挂
+    `POST /api/agent/chat` 就返回 503 `REDIS_UNAVAILABLE`
+    （当时在 CLAUDE.md 里明确登记为**临时状态**，Phase 2 换成 MySQL 后消失）。
+    Phase 2 把权威存储换成 `agent_task` 之后，Redis 不可用只剩两处影响：
+
+    1. 限流退回本地收紧配额，并带上 `x-ratelimit-degraded` 头；
+    2. 入队失败——但任务已经落库，由补偿扫描重新投递（详细设计 17.1）。
+
+    因此这里断言的是**更严的契约**：Redis 全挂，接口照样 202，任务照样建了出来。
     """
     import json
 
@@ -188,15 +195,17 @@ async def test_redis_down_returns_503_redis_unavailable(app: FastAPI) -> None:
         headers = await login_headers(client)
         for key in await app.state.redis.keys("rl:*"):
             await app.state.redis.delete(key)
-        # 让仓储在写入时抛 RedisError，模拟 Redis 掉线
+        # 让所有 Redis 命令都抛异常，模拟 Redis 整条挂掉
         app.state.redis.execute_command = _raise
 
         response = await client.post("/api/agent/chat", json={"message": "问题"}, headers=headers)
 
-    assert response.status_code == 503
+    assert response.status_code == 202
     body = json.loads(response.content)
-    assert body["code"] == "REDIS_UNAVAILABLE"
-    assert body["retryable"] is True
+    assert body["code"] == "ACCEPTED"
+    # 降级必须**对调用方可见**：限流配额被收紧到配置值的一半（19.3）。
+    # 少了这个头，调用方会把「被降级地拒绝了」当成「配额本来就这么小」。
+    assert response.headers.get("x-ratelimit-degraded") == "true"
 
 
 async def _raise(*args: object, **kwargs: object) -> None:

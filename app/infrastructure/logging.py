@@ -24,6 +24,9 @@ from typing import Any, Final
 #: 角色是入口模块的属性，不是部署环境的属性。
 SERVICE_API: Final[str] = "api"
 SERVICE_WORKER: Final[str] = "worker"
+#: `app/cli.py` 的运维命令（seed / cleanup）。分开是为了让「谁改的数据」
+#: 在日志里可辨——运维命令造成的数据变化不该混进 API 的日志流。
+SERVICE_CLI: Final[str] = "cli"
 
 #: 允许出现在日志记录上的上下文字段（其余 extra 一律丢弃，防止误写敏感数据）
 CONTEXT_FIELDS: tuple[str, ...] = (

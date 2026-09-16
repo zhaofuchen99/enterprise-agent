@@ -5,6 +5,7 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
         test test-integration layering check clean
+.PHONY: migrate revision seed seed-business verify-business cleanup
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -62,8 +63,16 @@ typecheck:  ## 类型检查
 test:  ## 单元测试（不含 integration，默认依赖都已用替身）
 	uv run pytest
 
-test-integration:  ## 需要真实 Redis 的用例（前置：make up）
-	uv run pytest -m integration app/tests/integration -v
+test-db:  ## 建测试库 agent_test（幂等；前置：make up）
+	@$(COMPOSE) exec -T agent-mysql mysql -uroot -proot_pw -e "\
+		CREATE DATABASE IF NOT EXISTS agent_test \
+			CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci; \
+		GRANT ALL PRIVILEGES ON agent_test.* TO 'agent'@'%'; \
+		FLUSH PRIVILEGES;" 2>/dev/null
+	@echo "agent_test 就绪（表结构由用例内的 create_all 建立）"
+
+test-integration: test-db  ## 需要真实 Redis / MySQL 的用例（前置：make up）
+	uv run pytest -m integration -v
 
 layering:  ## 分层约束检查
 	uv run python scripts/check_layering.py
@@ -73,3 +82,24 @@ check: lint typecheck layering test  ## 提交前必跑：lint + 类型 + 分层
 clean:  ## 清理缓存与虚拟环境
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf .pytest_cache .mypy_cache .ruff_cache
+
+# ------------------------------------------------------------ 数据库（Phase 2）
+migrate:  ## 迁移 agent 运行库到最新版本（前置：make up）
+	uv run alembic upgrade head
+
+revision:  ## 按模型与库的差异自动生成迁移，需带 m="说明"
+	@test -n "$(m)" || (echo "用法：make revision m=\"说明\"" && exit 1)
+	uv run alembic revision --autogenerate -m "$(m)"
+
+seed:  ## 灌入演示数据（Agent 库的演示账号 + 业务库的反向构造数据，均幂等）
+	uv run python -m app.cli seed
+	uv run python scripts/business_seed.py
+
+seed-business:  ## 只灌业务库，带规模参数：make seed-business ROWS=20000
+	uv run python scripts/business_seed.py --rows $${ROWS:-500000}
+
+verify-business:  ## 只跑业务库的四条约束断言与 EXPLAIN 检查（不重新生成数据）
+	uv run python scripts/business_seed.py --verify-only
+
+cleanup:  ## 按保留期清理过期数据（幂等，供 cron 调用，见详细设计 16.12）
+	uv run python -m app.cli cleanup

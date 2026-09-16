@@ -42,6 +42,17 @@ class IdPrefix(StrEnum):
     TASK = "tsk"
     TRACE = "trc"
 
+    # 业务演示库的维度表（Phase 2 的 `scripts/business_seed.py`）。
+    # 它们属于「企业已有数据」，本可以自定编号方案；沿用同一套前缀 + 26 位
+    # 约束，是为了 SQL Tool 在做 JOIN 时两边的键长得一样，
+    # 排查时不必在脑子里切换两种 ID 形态。
+    REGION = "rgn"
+    CHANNEL = "chn"
+    PRODUCT_LINE = "pln"
+    PRODUCT = "prd"
+    CUSTOMER = "cst"
+    ORDER = "ord"
+
 
 def _encode(value: int, length: int) -> str:
     """把整数编码成定长 Base32（高位在前，不足左侧补 0）。"""

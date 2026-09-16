@@ -142,7 +142,12 @@ SCRIPTS: Final[dict[str, str]] = {
 
 
 class RedisKey:
-    """键命名。详细设计 4.4 的表格 + 本阶段的三个临时索引。
+    """键命名。对应详细设计 4.4 的键表。
+
+    Phase 1.5 的 5 个临时任务索引键（`task:{id}:record` / `idx:task:idem:*` /
+    `idx:task:active:*` / `idx:task:queued` / `idx:task:running`）已于 Phase 2
+    随任务仓储迁到 MySQL 一并删除——它们的职责现在由 `agent_task` 的
+    唯一索引与 `(status, queued_at)` / `(status, heartbeat_at)` 索引承担。
 
     全部写成 `@staticmethod` 而不是模块级函数，是为了让调用处一眼看出
     「这是个键」而不是某个业务函数：`RedisKey.task_cancel(task_id)`。
@@ -177,48 +182,16 @@ class RedisKey:
     def lock(purpose: str) -> str:
         return f"lock:{purpose}"
 
-    # ------------------------------------ 【Phase 1.5 临时】Phase 2 接入 MySQL 后删除
-    @staticmethod
-    def task_record(task_id: str) -> str:
-        """任务记录。**权威存储在 Phase 2 移到 `agent_task` 表**，此处只是过渡。"""
-        return f"task:{task_id}:record"
-
+    # --------------------------- Phase 2 保留的跨进程信号（不属于任务存储）
     @staticmethod
     def task_requeue_count(task_id: str) -> str:
-        """队列补偿扫描的重投次数（详细设计 17.1：最多重投 2 次）。"""
+        """队列补偿扫描的重投次数（详细设计 17.1：最多重投 2 次）。
+
+        Phase 2 把任务存储换成 MySQL 后它**仍然留在 Redis**：这是一个计数器，
+        不是任务状态。放进 `agent_task` 意味着每次补偿扫描都要写一行，
+        还得额外定义它的清理策略，而它天然是「带 TTL 的临时计数」。
+        """
         return f"task:{task_id}:requeue"
-
-    @staticmethod
-    def idempotency_index(user_id: str, idempotency_key: str) -> str:
-        """幂等键索引。对应 Phase 2 的 `uk_task_user_idempotency` 唯一索引。"""
-        return f"idx:task:idem:{user_id}:{idempotency_key}"
-
-    @staticmethod
-    def active_tasks(user_id: str) -> str:
-        """占用并发配额的任务 id 集合（ZSET，score 为 updated_at 时间戳）。
-
-        用 ZSET 而不是 SET：并发配额泄漏时（任务进入终态却没有被移除），
-        可以按 score 从旧到新清理，而不必把整集合读出来再判断。
-        """
-        return f"idx:task:active:{user_id}"
-
-    @staticmethod
-    def queued_tasks() -> str:
-        """待领取任务的索引（ZSET，score 为 `queued_at` 时间戳）。
-
-        补偿扫描要找出「写库成功但没进队列」的任务（详细设计 17.1），
-        这类任务恰恰**不在** arq 队列里，只能靠任务侧的索引枚举。
-        """
-        return "idx:task:queued"
-
-    @staticmethod
-    def running_tasks() -> str:
-        """运行中任务的索引（ZSET，score 为 `heartbeat_at` 时间戳）。
-
-        对应 Phase 2 `agent_task` 上 `(status, heartbeat_at)` 的索引：
-        孤儿回收要按心跳时间做范围查询，全表扫 RUNNING 任务在多实例下不可行。
-        """
-        return "idx:task:running"
 
 
 # ------------------------------------------------------------------ 序列化约定

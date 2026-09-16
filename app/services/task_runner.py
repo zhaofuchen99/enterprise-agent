@@ -135,7 +135,24 @@ class TaskRunner:
 
     # ------------------------------------------------------------------ 心跳
     async def heartbeat(self, task_id: str) -> None:
-        await self._tasks.touch_heartbeat(task_id, self._clock())
+        """续心跳。**两处都写，各有分工**：
+
+        - `agent_task.heartbeat_at` 是**权威**（原则 9）。孤儿回收按它判死，
+          因为它是唯一能被 MySQL 重建的判断依据。
+        - Redis 的 `task:{id}:heartbeat` 是跨进程快通道，带 TTL，
+          「键还在」即「Worker 还活着」，比查库便宜得多。
+
+        Phase 2 之前这两处都写在任务仓储里；仓储换成 MySQL 之后 Redis 那一半
+        上移到本方法——**心跳的所有者是 Worker 而不是存储层**，
+        让 SQL 仓储去写 Redis 只会把两个基础设施耦在一起。
+        """
+        now = self._clock()
+        await self._tasks.touch_heartbeat(task_id, now)
+        await self._redis.set(
+            RedisKey.task_heartbeat(task_id),
+            now.isoformat(),
+            ex=self._worker_tuning.heartbeat_ttl_seconds,
+        )
 
     @asynccontextmanager
     async def heartbeat_while(self, task_id: str) -> AsyncIterator[None]:
@@ -165,9 +182,15 @@ class TaskRunner:
                 pass
             try:
                 await self.heartbeat(task_id)
-            except (aioredis.RedisError, OSError) as exc:
-                # 心跳写不进去不该让任务失败：真正判死的是回收扫描，
-                # 而它读的是记录里的 heartbeat_at。这里只记日志。
+            except Exception as exc:
+                # **刻意捕获所有异常**：心跳写不进去不该让任务失败。
+                # 真正判死的是回收扫描，而它读的是库里的 heartbeat_at——
+                # 心跳漏几拍的最坏后果是被误判成孤儿，那也比
+                # 「数据库抖了一下，一个正在正常执行的任务直接失败」轻。
+                #
+                # 捕获范围从 RedisError 放宽到 Exception 是 Phase 2 的连带影响：
+                # 心跳写入从纯 Redis 变成「MySQL 权威 + Redis 快通道」，
+                # 数据库异常（SQLAlchemyError）原先不在这条路径上。
                 logger.warning("心跳写入失败：%s", type(exc).__name__, extra={"task_id": task_id})
 
     # ------------------------------------------------------------------ 取消
@@ -317,6 +340,17 @@ class TaskRunner:
         )
         # 任务结束后给事件流设保留期（详细设计 4.4：保留 1 小时）
         await self._events.finish(task.id)
+        # 4.4：心跳键在任务结束时删除。它带 TTL，留着不会永久泄漏，
+        # 但会在 TTL 内让一个**已经结束**的任务继续「证明自己活着」——
+        # 任何以「心跳键存在」为判据的逻辑（Phase 7 的节点内检查）都会误判。
+        # 一并删掉重投计数，理由相同：它的生命周期就是这一轮任务。
+        #
+        # 这三处清理原先在 `RedisTaskRepository._apply_index_moves` 里，
+        # 随该实现一起删除；现在放在这里，因为**终态的唯一出口是本方法**
+        # （成功/失败/取消三条路径都经过它）。
+        await self._redis.delete(
+            RedisKey.task_heartbeat(task.id), RedisKey.task_requeue_count(task.id)
+        )
 
     # ------------------------------------------------------------------ 回收
     async def reclaim_orphans(self) -> ReclaimReport:

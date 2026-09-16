@@ -1,9 +1,13 @@
-"""任务仓储契约（开发流程 6.3 施工项 3 的配套）。
+"""任务仓储契约（开发流程 6.4 施工项 4 的配套）。
 
-**同一份断言跑两个实现**：`InMemoryTaskRepository` 与 `RedisTaskRepository`
-共用一个参数化的夹具。只测 Redis 实现的话，内存实现会悄悄烂掉；
+**同一份断言跑两个实现**：`InMemoryTaskRepository` 与 `SqlTaskRepository`
+共用一个参数化的夹具。只测 SQL 实现的话，内存实现会悄悄烂掉；
 只测内存实现的话，真正上线的那份没有被验证过。两者行为一致本身也是要求——
-Phase 2 换成 MySQL 时，这个文件就是新实现的验收清单。
+下面的参数化就是这条契约的执行方式。
+
+MySQL 那个变体打 `@pytest.mark.integration`（需要 `make up`），
+因此 `make test`（默认排除 integration）跑的是内存实现，
+`make test-integration` 才连真实库跑全两遍。
 
 仓储里最容易出错的是 `update` 的**字段级语义**：Worker 心跳与用户取消
 是两个进程对同一条记录的并发写。用「整份读出来、改、整份写回」的话，
@@ -16,35 +20,18 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 
-import fakeredis.aioredis
 import pytest
 
-from app.core.config import Settings
 from app.domain.task import Task, TaskStatus
 from app.repositories.task_repo import (
     DuplicateTaskError,
     InMemoryTaskRepository,
-    RedisTaskRepository,
+    SqlTaskRepository,
     TaskPatch,
     TaskRepository,
 )
 
 _NOW = datetime(2026, 9, 16, 12, 0, 0, tzinfo=UTC)
-
-
-def _settings() -> Settings:
-    return Settings(
-        model_provider="p",
-        model_name="m",
-        model_api_key="k",
-        embedding_model="e",
-        embedding_api_key="k",
-        database_url_agent="mysql+asyncmy://a@localhost/a",
-        database_url_business_ro="mysql+asyncmy://a@localhost/b",
-        redis_url="redis://localhost:6379/0",
-        milvus_uri="http://localhost:19530",
-        jwt_secret="x" * 32,
-    )
 
 
 def _task(
@@ -55,11 +42,18 @@ def _task(
     idempotency_key: str | None = None,
     queued_at: datetime = _NOW,
 ) -> Task:
+    """造一个任务。
+
+    **`trace_id` 由 `task_id` 派生**，不写成常量：`agent_task` 上有
+    `uk_task_trace` 唯一索引（详细设计 16.5），常量会让「一个用例里建多个任务」
+    直接撞唯一键。派生而不是改成随机值，是为了让失败信息里的 ID 仍然可读、
+    可复现——随机 ID 只会让「哪一条撞了」变得难查。
+    """
     return Task(
         id=task_id,
         user_id=user_id,
         conversation_id="cnv_0000000001AAAAAAAAAAAA",
-        trace_id="trc_0000000001AAAAAAAAAAAA",
+        trace_id=f"trc_{task_id[4:]}",
         query_text="华东销售额为什么下降",
         status=status,
         idempotency_key=idempotency_key,
@@ -69,21 +63,31 @@ def _task(
     )
 
 
-@pytest.fixture
-async def redis() -> AsyncIterator[fakeredis.aioredis.FakeRedis]:
-    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    yield client
-    await client.aclose()
+@pytest.fixture(
+    params=[
+        pytest.param("memory", id="memory"),
+        # 连真实 MySQL 的变体。标记写在 param 上而不是用例上——
+        # 否则内存变体会被一起排除掉，`make test` 就什么都测不到了。
+        pytest.param("sql", id="sql", marks=pytest.mark.integration),
+    ]
+)
+async def make_repo(
+    request: pytest.FixtureRequest,
+) -> AsyncIterator[Callable[[], TaskRepository]]:
+    """参数化的仓储构造器。两个实现跑完全相同的用例集。
 
-
-@pytest.fixture(params=["memory", "redis"])
-def make_repo(
-    request: pytest.FixtureRequest, redis: fakeredis.aioredis.FakeRedis
-) -> Callable[[], TaskRepository]:
-    """参数化的仓储构造器。两个实现跑完全相同的用例集。"""
+    SQL 变体的建表与清理放在**这个夹具内部**而不是另一个夹具里：
+    若拆成独立夹具，内存变体也会去请求它，于是 `make test` 在没有 MySQL 的
+    机器上会因为连不上库而失败——恰好破坏了「单元测试不依赖外部组件」。
+    """
     if request.param == "memory":
-        return InMemoryTaskRepository
-    return lambda: RedisTaskRepository(redis, _settings())
+        yield InMemoryTaskRepository
+        return
+
+    from app.tests.db import sql_sessions
+
+    async with sql_sessions() as sessions:
+        yield lambda: SqlTaskRepository(sessions)
 
 
 # ------------------------------------------------------------------ 建档

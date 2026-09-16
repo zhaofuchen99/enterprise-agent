@@ -24,8 +24,9 @@ from app.core.config import get_settings
 from app.domain.task import Task, TaskStatus
 from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
 from app.infrastructure.redis import RedisKey, create_client
-from app.repositories.task_repo import RedisTaskRepository, TaskPatch
+from app.repositories.task_repo import SqlTaskRepository, TaskPatch
 from app.services.event_bus import RedisStreamEventBus, TaskEventType
+from app.tests.db import sql_sessions
 from app.worker import WorkerSettings, on_shutdown, on_startup
 
 pytestmark = pytest.mark.integration
@@ -41,15 +42,36 @@ async def redis() -> AsyncIterator[aioredis.Redis]:
     await client.aclose()
 
 
-def _task(task_id: str = "tsk_integration_00000000001") -> Task:
+@pytest.fixture
+async def repo() -> AsyncIterator[SqlTaskRepository]:
+    """连真实 MySQL（`agent_test` 库）并清空数据。
+
+    与 Worker 内部那份仓储连的是**同一个库**——两边都从
+    `get_settings().database_url_agent` 取连接串，这正是要验证的事：
+    测试里写的任务，真 Worker 得能领到。
+    """
+    async with sql_sessions() as sessions:
+        yield SqlTaskRepository(sessions)
+
+
+def _task(task_id: str = "tsk_0000000000000000000001") -> Task:
+    """造一个任务。
+
+    **ID 必须严格是 26 字符**（`前缀(4) + 22`，详细设计 16.1）。
+    这里原先写的是 `tsk_integration_00000000001`（27 字符），在 Redis 实现下
+    跑得好好的——Redis 不校验长度；换成 `CHAR(26)` 之后数据库直接拒绝
+    （1406 Data too long）。这不是测试的噪音，而是**数据库替我们抓住了
+    一个一直违反 ID 规范的测试夹具**。
+    """
     from datetime import UTC, datetime
 
     now = datetime.now(UTC)
+    suffix = task_id.removeprefix("tsk_")
     return Task(
         id=task_id,
-        user_id="usr_int",
-        conversation_id="cnv_int",
-        trace_id="trc_int",
+        user_id="usr_0000000000000000000001",
+        conversation_id="cnv_0000000000000000000001",
+        trace_id=f"trc_{suffix}",
         query_text="华东销售额为什么下降",
         queued_at=now,
         created_at=now,
@@ -88,13 +110,14 @@ async def test_enqueue_is_idempotent_per_task(redis: aioredis.Redis) -> None:
         await queue.aclose()
 
 
-async def test_full_loop_through_a_real_worker(redis: aioredis.Redis) -> None:
+async def test_full_loop_through_a_real_worker(
+    redis: aioredis.Redis, repo: SqlTaskRepository
+) -> None:
     """门禁：任务被投递 -> Worker 领取 -> 执行 -> 写回状态 -> 发布事件。
 
     这是开发流程 6.3 验收命令 3 的可执行版本。
     """
     settings = get_settings()
-    repo = RedisTaskRepository(redis, settings)
     task = _task()
     await repo.add(task)
 
@@ -136,11 +159,12 @@ async def test_full_loop_through_a_real_worker(redis: aioredis.Redis) -> None:
         await queue.aclose()
 
 
-async def test_worker_leaves_no_running_task_behind(redis: aioredis.Redis) -> None:
+async def test_worker_leaves_no_running_task_behind(
+    redis: aioredis.Redis, repo: SqlTaskRepository
+) -> None:
     """门禁：Worker 独立启停后不留下停在 RUNNING 的任务。"""
     settings = get_settings()
-    repo = RedisTaskRepository(redis, settings)
-    task = _task("tsk_integration_00000000002")
+    task = _task("tsk_0000000000000000000002")
     await repo.add(task)
 
     queue = await ArqJobQueue.create(settings)
@@ -196,7 +220,9 @@ async def test_two_api_instances_share_one_rate_limit_quota(redis: aioredis.Redi
     assert allowed == 3
 
 
-async def test_orphan_reclamation_picks_up_a_dead_worker_task(redis: aioredis.Redis) -> None:
+async def test_orphan_reclamation_picks_up_a_dead_worker_task(
+    redis: aioredis.Redis, repo: SqlTaskRepository
+) -> None:
     """模拟「Worker 被 kill -9」：任务停在 RUNNING，心跳过期后必须被回收。
 
     这一条补的是优雅停机覆盖不到的那一半——SIGKILL 走不到 on_shutdown，
@@ -205,11 +231,21 @@ async def test_orphan_reclamation_picks_up_a_dead_worker_task(redis: aioredis.Re
     from datetime import UTC, datetime, timedelta
 
     settings = get_settings()
-    repo = RedisTaskRepository(redis, settings)
-    task = _task("tsk_integration_00000000003")
+    task = _task("tsk_0000000000000000000003")
     await repo.add(task)
+
+    # **必须连 heartbeat_at 一起回拨**，只改 status 不足以模拟「Worker 被 kill」：
+    # 真实路径上 `claim` 会把 heartbeat_at 与 started_at 一起写上，
+    # 判死依据（16.5 的 `idx_task_status_heartbeat`）读的正是 heartbeat_at。
+    # 只设 status 的话，SQL 实现的
+    # `COALESCE(heartbeat_at, started_at, queued_at)` 会退回到刚落库的
+    # queued_at，于是任务「看起来很新」，回收扫描自然扫不到——
+    # 这就是这条用例在 Redis 实现下能过、换 MySQL 后失败的原因。
+    dead_at = datetime.now(UTC) - timedelta(hours=1)
     await repo.update(
-        task.id, TaskPatch(status=TaskStatus.RUNNING), at=datetime.now(UTC) - timedelta(hours=1)
+        task.id,
+        TaskPatch(status=TaskStatus.RUNNING, heartbeat_at=dead_at, started_at=dead_at),
+        at=dead_at,
     )
 
     from app.services.task_runner import TaskRunner

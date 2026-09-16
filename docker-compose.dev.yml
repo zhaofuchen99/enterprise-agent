@@ -39,7 +39,15 @@ services:
       MYSQL_USER: agent
       MYSQL_PASSWORD: agent_pw
     ports:
-      - "3306:3306"
+      # 宿主端口用 3308 而非 3306：**Windows 侧另有一个独立安装的 MySQL 8**
+      # （C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqld.exe）占着 0.0.0.0:3306，
+      # 导致 WSL2 的 wslrelay 无法为 3306 建立 127.0.0.1 转发
+      # （实测：3307/6379/6380/6381/9000 都被转发，唯独没有 3306）。
+      # 后果是从 Windows 用图形客户端连 localhost:3306 会连到**那个** MySQL，
+      # 而不是本容器——能连上但看不到 agent_task 等表，很容易误判成迁移没跑。
+      # 换到 3308 后两侧都能连（Windows 经 wslrelay，WSL 直接连）。
+      # 容器内仍是 3306，只有宿主映射与 DATABASE_URL_AGENT 不同。
+      - "3308:3306"
     volumes:
       - agent-mysql-data:/var/lib/mysql
     healthcheck:

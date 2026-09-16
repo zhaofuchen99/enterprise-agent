@@ -14,18 +14,19 @@ from contextlib import asynccontextmanager
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api import auth, chat, tasks
 from app.api.errors import register_exception_handlers
 from app.api.middleware import TraceContextMiddleware
 from app.core.config import Settings, get_settings
+from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_API, clear_context, setup_logging
 from app.infrastructure.observability import setup_error_tracking, setup_observability
 from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
-from app.repositories.conversation_repo import InMemoryConversationRepository
-from app.repositories.task_repo import RedisTaskRepository
-from app.repositories.user_repo import InMemoryUserRepository, seed_demo_users
+from app.repositories import Repositories, build_sql_repositories
 from app.services.auth_service import AuthService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.rate_limit import RedisFixedWindowLimiter
@@ -51,45 +52,53 @@ OPENAPI_DESCRIPTION = """\
 """
 
 
-def wire_dependencies(app: FastAPI, settings: Settings, *, queue: JobQueue) -> None:
+def wire_dependencies(
+    app: FastAPI,
+    settings: Settings,
+    *,
+    queue: JobQueue,
+    repositories: Repositories | None = None,
+) -> None:
     """装配服务依赖。
 
     **所有替换点都收敛在这一个函数里**，这是那些 `Protocol` 存在的唯一理由。
-    Phase 1.5 的状态：
+    Phase 2 的状态：
 
-    - 任务仓储 → Redis（临时实现，Phase 2 换 MySQL）
+    - 用户 / 会话 / 任务仓储 → **MySQL**（`agent_task` 是任务状态的唯一权威）
     - 限流器 → Redis + Lua，带本地降级
     - 队列 / 事件总线 → arq / Redis Stream
+    - 取消信号 / 重投计数 / 心跳快通道 → 仍在 Redis（是跨进程信号，不是任务存储）
 
-    - 用户与会话仓储 → **仍是进程内占位**，Phase 2 换 MySQL。
+    **`queue` 与 `repositories` 都从外部传入**，理由相同：它们的生命周期
+    不属于本函数。`queue` 在 API 进程里是 arq 连接池、在测试里是替身；
+    仓储在进程里连 MySQL、在单元测试里是内存实现。在这里 new 死一个，
+    测试要么连不上库，要么观察不到投递行为。
 
-    `queue` 从外部传入而不是在这里构造：API 进程用 arq 连接池，
-    测试用替身，两者的生命周期归属不同（前者属于 lifespan，后者属于夹具），
-    在这里 new 一个会让测试无法观察到投递行为。
+    默认值 `repositories=None` 时才构造 MySQL 实现——**单元测试必须显式
+    注入内存实现**，因为「测试跑不跑得起来」取决于开发机上有没有起 MySQL，
+    是不能接受的：`make test` 的契约是「不依赖任何外部组件」。
     """
     redis: aioredis.Redis = app.state.redis
-
-    user_repo = InMemoryUserRepository(seed_demo_users(settings))
-    conversation_repo = InMemoryConversationRepository()
-    task_repo = RedisTaskRepository(redis, settings)
+    repos = repositories if repositories is not None else build_sql_repositories(app.state.sessions)
 
     runner = TaskRunner(
-        tasks=task_repo,
+        tasks=repos.tasks,
         queue=queue,
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
     )
 
-    app.state.user_repo = user_repo
-    app.state.conversation_repo = conversation_repo
-    app.state.task_repo = task_repo
+    app.state.repositories = repos
+    app.state.user_repo = repos.users
+    app.state.conversation_repo = repos.conversations
+    app.state.task_repo = repos.tasks
     app.state.task_runner = runner
     app.state.job_queue = queue
     app.state.rate_limiter = RedisFixedWindowLimiter(redis=redis, settings=settings)
-    app.state.auth_service = AuthService(user_repo, settings)
+    app.state.auth_service = AuthService(repos.users, settings)
     app.state.task_service = TaskService(
-        tasks=task_repo, conversations=conversation_repo, settings=settings, runner=runner
+        tasks=repos.tasks, conversations=repos.conversations, settings=settings, runner=runner
     )
 
 
@@ -102,6 +111,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     redis = create_client(settings)
     app.state.redis = redis
+
+    # 连接池在 lifespan 内建、在退出时释放。不放进 wire_dependencies：
+    # 那里是**同步**装配函数，而建 engine 会解析驱动并可能触发连接，
+    # 把它塞进去会让「装配」这一步变得可能失败，测试也无法只替换仓储。
+    db_engine = create_engine(settings)
+    app.state.db_engine = db_engine
+    app.state.sessions = create_session_factory(db_engine)
+
     queue = await ArqJobQueue.create(settings)
     wire_dependencies(app, settings, queue=queue)
     try:
@@ -110,6 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         clear_context()
         await queue.aclose()
         await redis.aclose()
+        await db_engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -150,28 +168,53 @@ def create_app() -> FastAPI:
     async def health_ready(request: Request) -> Response:
         """关键外部依赖是否可用。
 
-        **Redis 不可用返回 200 + `degraded`，不是 503。** 这不是放松要求：
-        Phase 1.5 已经实现了降级路径（限流退回本地令牌桶、投递失败由补偿扫描
-        兜底），API 在 Redis 挂掉时仍能对外服务。此时报 not_ready 会让编排层
-        摘掉这个实例，而摘掉它恰恰是最不该做的事——降级路径本来就是为了
-        「Redis 挂了也要撑住」而存在的。真正不可恢复的依赖（Phase 2 的 MySQL）
-        届时按 critical 处理，返回 503。
+        **两个依赖的处理刻意不同**：
 
-        MySQL / Milvus 的就绪检查随 Phase 2 / Phase 5 一并接入。
+        - **Redis 不可用返回 200 + `degraded`，不是 503。** 这不是放松要求：
+          Phase 1.5 已经实现了降级路径（限流退回本地令牌桶、投递失败由补偿扫描
+          兜底），API 在 Redis 挂掉时仍能对外服务。此时报 not_ready 会让编排层
+          摘掉这个实例，而摘掉它恰恰是最不该做的事——降级路径本来就是为了
+          「Redis 挂了也要撑住」而存在的。
+        - **MySQL 不可用返回 503。** Phase 2 起它是任务、会话、用户的**唯一权威**，
+          没有任何降级路径：库连不上时登录、建任务、查状态全部失败，
+          此时如实报 not_ready 让编排层摘掉实例才是对的。
+
+        Milvus 的就绪检查随 Phase 5 一并接入。
         """
         redis_client: aioredis.Redis = request.app.state.redis
-        failures: list[str] = []
+        sessions: async_sessionmaker[AsyncSession] = request.app.state.sessions
+
+        try:
+            async with sessions() as session:
+                await session.execute(text("SELECT 1"))
+        except Exception as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "failed": [f"mysql({type(exc).__name__})"],
+                    "checked": ["mysql"],
+                },
+            )
+
+        degraded: list[str] = []
         try:
             await redis_client.ping()
         except Exception as exc:
-            failures.append(f"redis({type(exc).__name__})")
+            degraded.append(f"redis({type(exc).__name__})")
 
-        if failures:
+        if degraded:
             return JSONResponse(
                 status_code=200,
-                content={"status": "degraded", "degraded": failures, "checked": ["redis"]},
+                content={
+                    "status": "degraded",
+                    "degraded": degraded,
+                    "checked": ["mysql", "redis"],
+                },
             )
-        return JSONResponse(status_code=200, content={"status": "ready", "checked": ["redis"]})
+        return JSONResponse(
+            status_code=200, content={"status": "ready", "checked": ["mysql", "redis"]}
+        )
 
     return app
 

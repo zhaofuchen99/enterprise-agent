@@ -70,7 +70,11 @@ packages = ["app"]
 line-length = 100
 target-version = "py312"
 src = ["app"]
-extend-exclude = ["docs", ".venv"]
+# `migrations/versions/` 是 alembic autogenerate 的产物，不是手写代码：
+# 它的换行由生成器决定（例如 create_index 一行就 100+ 列），改它没有意义——
+# 下次 autogenerate 会覆盖回去。排除掉而不是加一堆 noqa。
+# 注意 `make lint` 只扫 `app scripts`，这里是让 pre-commit 的范围与之一致。
+extend-exclude = ["docs", ".venv", "migrations"]
 
 [tool.ruff.lint]
 select = [
@@ -97,7 +101,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "app/tests/**" = ["S105", "S106", "S311"]
-"scripts/**" = ["S101", "S603", "S607"]
+# S311：`scripts/business_seed.py` 用 `random.Random(种子)` 生成**确定性演示数据**，
+# 不是安全用途——随机性在这里恰恰是必须可复现的（同一台机器重灌一次必须得到
+# 同样的结论）。密码学随机源反而是错的选择。
+"scripts/**" = ["S101", "S603", "S607", "S311"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "scripts"]
@@ -114,7 +121,7 @@ show_error_codes = true
 
 [[tool.mypy.overrides]]
 # 无类型标注的第三方库
-module = ["jieba.*", "arq.*", "aioboto3.*", "asyncmy.*", "fakeredis.*"]
+module = ["jieba.*", "arq.*", "aioboto3.*", "asyncmy.*", "fakeredis.*", "pymilvus.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

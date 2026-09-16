@@ -28,8 +28,10 @@ import redis.asyncio as aioredis
 from arq import cron
 from arq.connections import RedisSettings
 from arq.worker import Worker
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings, get_settings
+from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import (
     SERVICE_WORKER,
     bind_context,
@@ -44,7 +46,7 @@ from app.infrastructure.observability import (
 )
 from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
 from app.infrastructure.redis import RedisKey, create_client
-from app.repositories.task_repo import RedisTaskRepository
+from app.repositories import build_sql_repositories
 from app.services.event_bus import RedisStreamEventBus
 from app.services.task_runner import TaskRunner
 
@@ -100,9 +102,18 @@ def _worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
-def _build_runner(settings: Settings, redis: aioredis.Redis, queue: ArqJobQueue) -> TaskRunner:
+def _build_runner(
+    settings: Settings, redis: aioredis.Redis, queue: ArqJobQueue, engine: AsyncEngine
+) -> TaskRunner:
+    """装配 Worker 侧的任务仓储。
+
+    与 `app/main.py` 走**同一份** SQL 装配（`build_sql_repositories`），
+    只取其中的任务仓储——不共用一个函数的话，API 与 Worker 的仓储实现
+    可能在某次改动中分家，而症状是「任务建得出来但 Worker 领不到」。
+    """
+    repos = build_sql_repositories(create_session_factory(engine))
     return TaskRunner(
-        tasks=RedisTaskRepository(redis, settings),
+        tasks=repos.tasks,
         queue=queue,
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
@@ -122,10 +133,15 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     redis = create_client(settings)
     queue = await ArqJobQueue.create(settings)
 
+    # 数据库连接池归本进程所有，退出时在 on_shutdown 里释放。
+    # 与 API 进程各持一个池：两者是不同的进程，共用一个池在语言层面就不成立。
+    engine = create_engine(settings)
+
     ctx["redis"] = redis
     ctx["queue"] = queue
+    ctx["db_engine"] = engine
     ctx["worker_id"] = _worker_id()
-    ctx["runner"] = _build_runner(settings, redis, queue)
+    ctx["runner"] = _build_runner(settings, redis, queue, engine)
     logger.info("worker 启动完成", extra={"status": ctx["worker_id"]})
 
 
@@ -144,6 +160,9 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
     redis: aioredis.Redis | None = ctx.get("redis")
     if redis is not None:
         await redis.aclose()
+    engine: AsyncEngine | None = ctx.get("db_engine")
+    if engine is not None:
+        await engine.dispose()
     clear_context()
 
 

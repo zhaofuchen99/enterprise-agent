@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ 数据库
     database_url_agent: str = Field(min_length=1)
     database_url_business_ro: str = Field(min_length=1)
+    #: 业务库的**写**连接。**只有 `scripts/business_seed.py` 会用它**——
+    #: API / Worker 连业务库一律走 `DATABASE_URL_BUSINESS_RO`，这是
+    #: 「SQL 安全不依赖模型」的底座（详细设计 19.2 第 5 条）。
+    #:
+    #: 可选且无默认值：种子脚本在 `make up` 之后按需运行，
+    #: 而 `make test` / API 启动都不该因为它缺失而失败。缺失时脚本会
+    #: 给出明确提示并退出（见 `_rw_url`），不会退化成静默跳过。
+    database_url_business_rw: str | None = None
     db_pool_size: int = Field(default=10, ge=1, le=100)
 
     # ------------------------------------------------------------------ Redis

@@ -12,9 +12,16 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
+from app.core.config import Settings
 from app.infrastructure.queue import JobQueue
+from app.repositories import Repositories
+from app.repositories.conversation_repo import InMemoryConversationRepository
+from app.repositories.task_repo import InMemoryTaskRepository
+from app.repositories.user_repo import InMemoryUserRepository, seed_demo_users
 
 
 @dataclass
@@ -63,3 +70,38 @@ class FakeJobQueue:
 def build_job_queue() -> JobQueue:
     """类型标注成协议，让用例里的替身与生产实现受同一份契约约束。"""
     return FakeJobQueue()
+
+
+class _FakeSession:
+    """就绪探针只用到 `execute`。"""
+
+    async def execute(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+class FakeSessionFactory:
+    """`app.state.sessions` 的替身，供不连 MySQL 的单元测试使用。
+
+    就绪探针会拿它执行一次 `SELECT 1` 来判断 MySQL 是否可用。单元测试没有
+    真实库，这里给出一个「执行成功」的替身；**探针本身的行为**（含 503 分支）
+    由 `make test-integration` 下的用例对着真实 MySQL 验证——
+    替身只保证「有这个对象、调用形状对」，不保证探针真的能判活。
+    """
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[_FakeSession]:
+        yield _FakeSession()
+
+
+def build_memory_repositories(settings: Settings) -> Repositories:
+    """三个仓储的内存实现（Pydantic 版）。
+
+    与 MySQL 实现受同一份 `Protocol` 约束——仓储契约测试
+    （`app/tests/repositories/`）会把同一批断言同时跑在两个实现上，
+    因此「内存实现和 SQL 实现行为不一致」不会拖到线上才暴露。
+    """
+    return Repositories(
+        users=InMemoryUserRepository(seed_demo_users(settings)),
+        conversations=InMemoryConversationRepository(),
+        tasks=InMemoryTaskRepository(),
+    )
