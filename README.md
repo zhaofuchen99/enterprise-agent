@@ -82,7 +82,10 @@ curl -s localhost:8000/api/agent/tasks/<task_id> -H "Authorization: Bearer $TOKE
 所有响应（含错误）都是统一外壳 `{code, message, data, trace_id, retryable}`；
 `trace_id` 与响应头 `X-Trace-Id` 一致，可直接拿去日志里检索。
 
-> **Phase 1 的任务会停在 `QUEUED`**——本阶段只登记不入队，入队与执行在 Phase 1.5 接入。
+> **Phase 1.5 起任务会真的被执行**：`make run` 之后建的任务由 Worker 领取，
+> 任务体目前是空实现，因此会以 `SUCCEEDED` 且 `answer` 为 `null` 结束——
+> 本阶段验证的是执行链路（投递/领取/心跳/写回/事件），分析能力在 Phase 7。
+> 只起 API 不起 Worker 的话，任务会停在 `QUEUED`。
 
 ---
 
@@ -94,19 +97,26 @@ make rag-up     额外启动 Milvus         make lint       仅静态检查
 make down       停止全部                make typecheck  仅类型检查
 make redis-cli  进入 Redis 排查         make layering   仅分层约束检查
 make api        只起 API 进程           make test       仅单元测试
-make worker     只起 Worker 进程        make fmt        格式化并自动修复
-make run        同时起两个进程
+make worker     只起 Worker 进程        make test-integration  需要真实 Redis 的用例
+make run        同时起两个进程          make fmt        格式化并自动修复
 ```
+
+多实例验收用 `make api PORT=8001`。
 
 排查任务卡住时：
 
 ```bash
 make redis-cli
-> KEYS q:agent                      # 队列积压
-> XLEN task:tsk_xxx:events          # 某任务的事件流
-> GET  task:tsk_xxx:heartbeat       # Worker 心跳是否新鲜
-> LLEN q:agent                      # 队列深度
+> ZCARD q:agent                         # 队列里还有多少没被领走
+> HGETALL task:tsk_xxx:record           # 任务状态、worker_id、心跳时间
+> XRANGE task:tsk_xxx:events - +        # 事件流（这个任务发布过什么）
+> TTL task:tsk_xxx:events               # 事件流保留期（结束后 1 小时）
+> ZCARD idx:task:active:usr_xxx         # 该用户占用的并发配额
 ```
+
+`HGET task:tsk_xxx:record status` 停在 `RUNNING` 而 `heartbeat_at` 很旧，
+说明执行它的 Worker 挂了——孤儿回收（每 30 秒一次）会把它置为 `FAILED` + `WORKER_INTERRUPTED`
+并释放并发配额。
 
 ---
 
@@ -183,9 +193,11 @@ LOOP__MAX_TOTAL_STEPS=30
 | 本机 WSL 内存 7.6GB | Milvus 需 4–8GB，与 MySQL/Redis/MinIO 并存会很紧张 | Milvus 置于 `rag` profile，Phase 0–4 不受影响；Phase 5 前需决定是否上调 WSL 内存或更换向量库 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
 | `MODEL_*` / `EMBEDDING_*` 未选型（TBC-04） | Phase 3 起才真正需要 | 见开发流程 12.2 |
-| 仓储与限流是进程内实现 | 重启丢数据、多实例互不可见 | Phase 1.5 / 2 替换；替换面收敛在 `app/main.py` 的 `wire_dependencies()` |
-| `POST /api/agent/chat` 不入队 | 任务停在 `QUEUED`，无 Worker 执行 | 预期行为，Phase 1.5 接入队列 |
+| **用户与会话**仓储仍是进程内实现 | 重启丢数据、多实例互不可见 | Phase 2 换 MySQL；替换面收敛在 `app/main.py` 的 `wire_dependencies()` |
+| **任务仓储是 Redis 临时实现** | Redis 挂掉时创建任务返回 503；Redis 里存着任务状态（与「MySQL 唯一权威」冲突） | Phase 2 换 MySQL，并删除 4.4.1 的 6 个临时键 |
+| **任务体是空实现** | 任务 `SUCCEEDED` 但 `answer` 为 `null` | 预期行为，Phase 7 接入 LangGraph |
 | 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |
+| 跨进程 trace 用内存 exporter 断言 | 未接真实追踪后端，线上看不到链路 | 本机无 Jaeger/Grafana；OTLP 开关已就绪，Phase 11 接后端 |
 
 ---
 

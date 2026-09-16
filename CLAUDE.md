@@ -18,28 +18,37 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | Phase | 状态 | 备注 |
 |---|---|---|
 | 0 项目初始化 | ✅ 完成 | 骨架、配置、错误码、结构化日志、健康探针、分层约束检查、CI、pre-commit 密钥防护 |
-| 1 基础 API | ✅ 完成 | 统一响应外壳、全局异常映射（400/401/403/404/409/429/500）、`trc_` trace 中间件、本地 JWT 登录、`/api/agent/chat` 与 `/api/agent/tasks/{id}` 占位、OpenAPI 定制。`make check` 全绿（133 测试）；验收记录见开发流程 11.1 |
-| 1.5 基础设施接入 | ⬜ 未开始 | 下一步 |
+| 1 基础 API | ✅ 完成 | 统一响应外壳、全局异常映射（400/401/403/404/409/429/500）、`trc_` trace 中间件、本地 JWT 登录、`/api/agent/chat` 与 `/api/agent/tasks/{id}` 占位、OpenAPI 定制 |
+| 1.5 基础设施接入 | ✅ 完成 | Redis 键与 Lua 脚本、Redis 限流 + 降级 + 熔断、Redis 任务仓储（临时）、arq 队列与 Worker 骨架（含自愈重启）、事件流、取消链路、对象存储抽象、OTel 与跨进程 trace。`make check` 全绿（267 测试）+ 7 条 integration 用例；验收记录见开发流程 11.1 |
+| 2 数据库 | ⬜ 未开始 | 下一步 |
 
 **开工前**：先 `make ps` 看有状态组件是否在跑，没起来就 `make up`。
 
-**Phase 1 的两个临时约定**（Phase 1.5 / 2 会拆掉）：
+**Phase 1.5 之后仍然存在的临时约定**（Phase 2 拆掉）：
 
-1. 用户、会话、任务三份仓储与限流器都是**进程内占位实现**，重启即丢、多实例互不可见。
-   替换面收敛在 `app/main.py` 的 `wire_dependencies()` 一个函数里。
-2. `POST /api/agent/chat` **只登记不入队**，任务停在 `QUEUED` 是预期行为——
-   Phase 1 阶段不要用「只跑 `make api`」去解释它，那是 Phase 1.5 之后才会出现的坑。
+1. **用户与会话**仓储仍是进程内占位，重启即丢、多实例互不可见。
+   （任务仓储已改为 Redis，跨实例可见——但它是临时的，Phase 2 换成 MySQL。）
+2. **任务体是空实现**：任务会以 `SUCCEEDED` 且 `answer` 为 `null` 结束。
+   这是预期行为，不是 bug——本阶段验证的是执行链路，分析能力在 Phase 7。
+3. **Redis 此刻是创建任务的硬依赖**：任务仓储还是 Redis 实现，Redis 挂掉时
+   `POST /api/agent/chat` 返回 503 `REDIS_UNAVAILABLE`。Phase 2 换成 MySQL 后，
+   Redis 不可用只会影响限流与队列（限流有降级路径，任务由补偿扫描补投）。
+4. 演示账号（`analyst`/`admin`）的 ID 由用户名确定性派生，**多实例之间是同一个用户**；
+   真实用户仍走随机 ULID。这样多实例的限流与并发配额才能被端到端验收。
 
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
 |---|---|
-| 任务入队与队列补偿扫描（详细设计 17.1 的事务边界：先写库、提交后再投递） | Phase 1.5 |
-| `stream_url` 指向的 SSE 订阅端点（契约已固定） | Phase 10 |
-| Redis 限流 + 降级路径（替换进程内令牌桶） | Phase 1.5 |
+| 任务仓储换 MySQL（**并删除 `RedisTaskRepository` 与它的 5 个临时索引键**） | Phase 2 |
+| 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |
+| `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
 | 用户消息落库（FR-CHAT-001 处理流程的「保存用户消息」，`agent_message` 表） | Phase 2 |
+| 任务体换成 LangGraph（`TaskRunner._run_body` 一个函数） | Phase 7 |
+| 节点内检查取消标记（`TaskRunner.is_cancel_requested` 目前只在领取与收尾时检查） | Phase 7 |
 | `WAITING_CLARIFICATION` 的 `clarification_question` 字段 | Phase 6 |
 | 任务详情的步骤进度、证据、冲突、限制（等各自 Schema 产出后增补） | Phase 6 / 9 |
+| 对象存储 `s3` 实现（契约测试已就绪，加进参数表即被覆盖） | Phase 5 |
 | 登录接口限流（当前配额按已认证用户计，登录不受保护，可被口令爆破） | Phase 12 |
 | 未注册路径复用 `TASK_NOT_FOUND` 的语义含混（错误码表封闭所致） | 待定 |
 
@@ -101,12 +110,25 @@ make bootstrap   # 首次：生成 .env + 装依赖
 make up          # 起 redis / agent-mysql / business-mysql / minio
 make run         # 同时起 api + worker  ← 本地开发必须用这个，不要只跑 make api
 make check       # 提交前必跑：ruff + mypy + 分层约束 + pytest
+make test-integration  # 需要真实 Redis（前置 make up）
 make redis-cli   # 排查队列与 Stream
 ```
 
 单独跑：`make lint` / `make typecheck` / `make layering` / `make test` / `make fmt`
 
 **只跑 `make api` 会导致任务永远停在 `QUEUED`**，且从 API 日志几乎看不出原因。这是本项目最常见的自伤方式。
+
+多实例验收用 `make api PORT=8001`（`PORT` 会覆盖 `API_PORT`）。
+
+**排查一个任务**（Phase 1.5 起可用）：
+
+```bash
+make redis-cli
+> ZCARD q:agent                       # 队列里还有多少没被领走
+> HGETALL task:tsk_xxx:record         # 任务状态、worker_id、心跳时间
+> XRANGE task:tsk_xxx:events - +      # 事件流（发布过什么）
+> ZCARD idx:task:active:usr_xxx       # 该用户占用的并发配额
+```
 
 ---
 
@@ -120,7 +142,11 @@ make redis-cli   # 排查队列与 Stream
   用 `bind_context()` 绑定上下文字段，不要自己往 `extra` 塞任意键（会被 `ValueError` 拒绝）
 - **配置**：新增配置项写入 `app/core/config.py`，必须有**默认值、上下限、环境覆盖规则**。
   嵌套配置用双下划线：`LOOP__MAX_TOTAL_STEPS=30`
-- **测试**：单元测试不依赖真实外部组件；需要真实 Redis/MySQL/Milvus 的用例打 `@pytest.mark.integration`
+- **测试**：单元测试不依赖真实外部组件；需要真实 Redis/MySQL/Milvus 的用例打 `@pytest.mark.integration`。
+  `make test` 默认**排除** integration，`make test-integration` 单独跑（前置 `make up`）。
+  Redis 的替身是 `fakeredis`（它能跑真实 Lua 脚本，因此限流与仓储的原子性是被真实执行验证的）
+- **服务角色**：`service` 字段（api / worker）由入口模块的常量决定，**不是配置项**——
+  `make run` 下两个进程共用一份 `.env`，用环境变量区分必然失效
 - **提交**：Conventional Commits，如 `feat(sql): 增加 AST 表字段白名单校验`
 
 ---
