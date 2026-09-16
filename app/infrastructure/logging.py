@@ -53,6 +53,16 @@ def clear_context() -> None:
     _log_context.set(None)
 
 
+def current_context() -> dict[str, Any]:
+    """返回当前上下文的一份只读副本。
+
+    给「需要拿到 trace_id 但拿不到 Request 对象」的地方用——
+    目前是全局异常处理器与 worker 内的节点。返回副本而非原 dict，
+    避免调用方无意间改到正在被日志读取的上下文。
+    """
+    return _current_context()
+
+
 class JsonFormatter(logging.Formatter):
     """输出单行 JSON，便于被日志后端按字段检索。"""
 

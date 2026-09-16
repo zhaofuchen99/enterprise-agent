@@ -51,6 +51,18 @@ class Settings(BaseSettings):
     #: 任务超时必须与 loop.max_expansions 联动（开发流程 5.4），见下方校验
     task_timeout_seconds: int = Field(default=600, ge=30, le=7200)
 
+    # -------------------------------------------------------- 任务配额与限流
+    #: 单次问题最大长度。FR-CHAT-001 业务规则：默认 4,000 字，**可配置**。
+    #: 改这里就够了，接口层不重复写死上限（见 app/api/schemas.py 的说明）。
+    chat_message_max_length: int = Field(default=4000, ge=1, le=100_000)
+    #: 同时运行任务数上限（详细设计 19.5 的 app.max_running_tasks_per_user）。
+    #: 计数必须跨实例一致，Phase 1.5 起改由 Redis 承载。
+    max_running_tasks_per_user: int = Field(default=3, ge=1, le=100)
+    #: 固定窗口限流配额（详细设计 19.3）
+    rate_limit_create_per_minute: int = Field(default=10, ge=1, le=1000)
+    rate_limit_status_per_minute: int = Field(default=120, ge=1, le=10_000)
+    rate_limit_upload_per_hour: int = Field(default=10, ge=1, le=1000)
+
     # ------------------------------------------------------ 模型（TBC-04 未决）
     model_provider: str = Field(min_length=1)
     model_name: str = Field(min_length=1)
@@ -92,7 +104,9 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------ 认证
     jwt_secret: str = Field(min_length=16)
-    jwt_algorithm: str = "HS256"
+    #: 限定为 HMAC 系列：`none` 会让任何人手写空签名通过校验，
+    #: 用 Literal 把算法钉死，比在 decode 处逐个排除更不容易漏。
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     jwt_expire_minutes: int = Field(default=60, ge=1, le=10080)
 
     # ------------------------------------------------------------------ 可观测
