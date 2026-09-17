@@ -121,6 +121,9 @@ vocab:  ## 构建稀疏检索词表并导出快照（幂等，前置：make corp
 	uv run python -m app.cli vocab $(if $(P),$(P),)
 ingest:  ## 逐篇入库并发布：make ingest [P=data/corpus] [ONLY=SP-001] [FORCE=1]（前置：make corpus + make vocab + Ollama）
 	uv run python -m app.cli ingest $(if $(P),$(P),) $(if $(ONLY),--only $(ONLY),) $(if $(FORCE),--force,)
+retrieve:  ## 混合检索并产出文档证据：make retrieve Q="华东渠道折扣怎么规定" [AS_OF=2025-09-01]（前置：make ingest + Ollama）
+	@test -n "$(Q)" || (echo '用法：make retrieve Q="问题" [AS_OF=YYYY-MM-DD]' && exit 1)
+	uv run python -m app.cli retrieve "$(Q)" $(if $(AS_OF),--as-of $(AS_OF),) $(foreach t,$(TYPE),--doc-type $(t),) $(foreach d,$(DEPT),--department $(d),)
 
 chunk:  ## 解析 + 分块，逐条核对：make chunk P=data/corpus/SP-015.pdf [SUMMARY=1] [LIMIT=5]
 	@test -n "$(P)" || (echo '用法：make chunk P=data/corpus/SP-015.pdf' && exit 1)

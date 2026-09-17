@@ -36,6 +36,7 @@ from app.infrastructure.vector_store import build_vector_store
 from app.repositories.knowledge_repo import SqlKnowledgeDocumentRepository
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
 from app.repositories.vocab_repo import SqlVocabRepository
+from app.tools.base import ToolResult
 from app.tools.rag.chunker import Chunk, chunk_document
 from app.tools.rag.ingestion import (
     DocumentMetadata,
@@ -43,7 +44,9 @@ from app.tools.rag.ingestion import (
     ingest_document,
 )
 from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
+from app.tools.rag.schemas import RagQueryArgs
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
+from app.tools.rag.tool import build_rag_retrieve_tool
 from app.tools.rag.vocabulary import build_vocabulary, export_snapshot, load_vocabulary
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
@@ -713,6 +716,110 @@ def _print_ingest_summary(reports: list[IngestionReport], failures: list[tuple[s
             print(f"  - {name}：{reason}")
 
 
+async def _retrieve(settings: Settings, args: argparse.Namespace) -> int:
+    """跑一次完整的自然语言 → 混合检索 → 文档证据（开发流程 6.7 的验证命令）。
+
+    **这条命令是 Phase 5 检索侧的门禁本身**：它走的是与将来 Worker 完全相同的
+    `RagRetrieveTool`，而不是一份为演示写的简化逻辑——那种写法只能证明
+    "演示脚本能跑"，证明不了"工具能跑"。
+
+    `--as-of` 与 `--doc-type` 模拟 Intent 提取出来的过滤条件。
+    不传 `--as-of` 就是"不限时点"，那时同名制度的两个版本会同时进候选——
+    这正是 16.11.2 的 VERSION_PAIR 缺陷要暴露的场景，所以默认值留给调用方定。
+    """
+    engine = create_engine(settings)
+    redis = create_client(settings)
+    storage = build_object_storage(settings)
+    vector_store = build_vector_store(settings)
+    gateway = build_model_gateway(settings)
+    try:
+        sessions = create_session_factory(engine)
+        tool = await build_rag_retrieve_tool(
+            settings,
+            gateway,
+            vector_store=vector_store,
+            storage=storage,
+            vocab=SqlVocabRepository(sessions),
+            cache=VersionedCache(redis, default_ttl_seconds=settings.rag.vocab_cache_ttl_seconds),
+        )
+        ctx = build_cli_context(region_ids=(), timeout_seconds=settings.task_timeout_seconds)
+        result = await tool.execute(
+            RagQueryArgs(
+                question=args.question,
+                document_types=tuple(args.doc_type or ()),
+                departments=tuple(args.department or ()),
+                as_of=_parse_date_arg(args.as_of),
+            ),
+            ctx,
+        )
+    finally:
+        await gateway.aclose()
+        await vector_store.aclose()
+        await redis.aclose()
+        await engine.dispose()
+
+    _print_retrieval(settings, args, result)
+    return 0 if result.status != "FAILED" else 1
+
+
+def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolResult) -> None:
+    payload = result.payload or {}
+    print(f"问题：{args.question}")
+    queries = payload.get("queries") or []
+    degraded = payload.get("rewrite_degraded")
+    print(f"实际查询（{len(queries)} 条{'，**改写已降级**' if degraded else ''}）：")
+    for query in queries:
+        print(f"  - {query}")
+    if args.as_of:
+        print(f"生效时点：{args.as_of}")
+    print(
+        f"相关性：最高余弦 {payload.get('best_dense_score', 0):.4f}"
+        f"｜阈值 {payload.get('relevance_threshold')}"
+        f"｜候选 {payload.get('candidate_count')} 条"
+        f"｜耗时 {result.duration_ms}ms"
+    )
+    print()
+
+    if result.status == "FAILED":
+        error = result.error
+        assert error is not None
+        print(f"✗ {error.code}：{error.message}")
+        print(f"  类别 {error.error_class}｜可重试 {error.retryable}")
+        if error.safe_detail:
+            print(f"  详情（仅诊断）：{error.safe_detail}")
+        return
+
+    # **逐条打印定位信息与分数**：检索质量变差时，第一件要看的是
+    # "召回的是哪几块、为什么是它们"。只打正文的话，两份制度的相似段落
+    # 长得几乎一样，光看正文分不出召回错了哪一份。
+    for chunk in payload.get("chunks") or []:
+        dense = chunk.get("dense_score")
+        print(
+            f"[{chunk['rank']}] {chunk['chunk_id']}"
+            f"｜融合 {chunk['fusion_score']:.4f}"
+            f"｜余弦 {'—' if dense is None else f'{dense:.4f}'}"
+        )
+        meta = chunk.get("metadata") or {}
+        path = " > ".join(meta.get("section_path") or [])
+        page = f"p{meta['page_no']}" if meta.get("page_no") else "—"
+        print(
+            f"    {path}｜{page}｜{meta.get('source_kind')}/{meta.get('classification')}"
+            f"｜生效 {meta.get('effective_from') or '—'} ~ {meta.get('effective_to') or '—'}"
+        )
+        for line in str(chunk.get("text", "")).splitlines()[:4]:
+            print(f"    {line}")
+        print()
+    print(f"证据 {len(result.evidence)} 条（source_type={_evidence_sources(result)}）")
+
+
+def _evidence_sources(result: ToolResult) -> str:
+    return "、".join(sorted({item.source_type for item in result.evidence})) or "—"
+
+
+def _parse_date_arg(value: str) -> date | None:
+    return date.fromisoformat(value) if value else None
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -796,6 +903,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "改内容必须升版本号，否则引用过该版 chunk_id 的证据会指向另一段文字",
     )
     ingest.set_defaults(only="", force=False)
+    retrieve = sub.add_parser("retrieve", help="混合检索并产出文档证据（详细设计 11.7）")
+    retrieve.add_argument(
+        "question", nargs="?", default="", help="业务问题，如「华东区域渠道折扣政策怎么规定」"
+    )
+    retrieve.add_argument(
+        "--as-of",
+        default="",
+        metavar="YYYY-MM-DD",
+        help="问题所问的时点，用于生效区间过滤。不传即不限时点——"
+        "那时同名制度的两个版本会同时进候选（VERSION_PAIR 的场景）",
+    )
+    retrieve.add_argument(
+        "--doc-type", action="append", default=[], metavar="类型", help="文档类型过滤（可重复）"
+    )
+    retrieve.add_argument(
+        "--department", action="append", default=[], metavar="部门", help="部门过滤（可重复）"
+    )
+    retrieve.set_defaults(as_of="", doc_type=[], department=[])
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
@@ -803,6 +928,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "chunk" and not args.path:
         parser.error("chunk 需要一个文件或目录，例如：chunk data/corpus/SP-015.pdf")
+
+    if args.command == "retrieve" and not args.question:
+        parser.error('retrieve 需要一个问题，例如：retrieve "华东区域渠道折扣政策怎么规定"')
 
     if args.command == "sql" and not args.question and not args.sql:
         # 两个入口都没有时**必须报错**，不能让 `make sql` 空跑一次模型。
@@ -823,6 +951,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chunk": _chunk,
         "vocab": _vocab,
         "ingest": _ingest,
+        "retrieve": _retrieve,
     }
     # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。
