@@ -32,6 +32,17 @@ dependencies = [
     "qdrant-client>=1.12",
     # --- 中文分词 ---
     "jieba>=0.42.1",
+    # --- 文档解析（详细设计 11.2：PDF / DOCX / Markdown / TXT 四种格式的入库链路）---
+    # `pdfplumber` 而不是 `pypdf`：11.2 要求 PDF 保留 `page_no`，11.3 要求表格以
+    # 「表头 + 当前行」序列化，而 16.11.2 明写要注入「跨页表格 ≥3 份」这条缺陷——
+    # `pypdf` 只吐纯文本流、不还原表格结构，接它等于让表格序列化沦为空测。
+    # `pdfplumber` 基于 pdfminer.six（MIT/BSD，无系统依赖），代价是解析速度中等；
+    # 本项目语料规模（80+ 篇）下不构成瓶颈。
+    # 未选 PyMuPDF：解析能力最强，但它是 AGPL-3.0，本仓库公开且用于求职展示，
+    # AGPL 的传染性是不可接受的许可风险。
+    "pdfplumber>=0.11",
+    # `python-docx` 同时承担解析与生成：DOCX 在 16.11.1 里是「次之」的格式占比。
+    "python-docx>=1.1",
     # --- 可观测 ---
     "opentelemetry-sdk>=1.29",
     "opentelemetry-exporter-otlp-proto-http>=1.29",
@@ -59,6 +70,11 @@ dev = [
     "pre-commit>=4.0",
     "lupa>=2.8",
     "types-pyyaml>=6.0",
+    # 语料**生成**侧专用：`scripts/gen_corpus.py` 要造出真实的 PDF——
+    # 跨页表格、页眉页脚、图片型扫描件这几条缺陷（16.11.2）只有能控制版面
+    # 才造得出来，纯文本库做不到。它不参与运行时入库链路（那条走 pdfplumber 解析），
+    # 因此放 dev 组而不是 dependencies。`uv sync` 默认含 dev 组，`make corpus` 可用。
+    "reportlab>=4.2",
 ]
 # 不引入 types-redis：它是为 redis 4.x 编写的第三方 stub，而 redis>=5 自带 py.typed，
 # 两者同时存在会让 mypy 用过期签名覆盖真实类型（aclose 等新 API 会被误报为不存在）。
@@ -140,6 +156,14 @@ module = [
     "fakeredis.*",
     "chromadb.*",
     "pymilvus.*",
+    # 文档工具链（详细设计 11.2）：三者都不带 py.typed，也没有可用的第三方 stub。
+    # `pdfplumber` 是例外——它能被 mypy 正常分析，因此**不在**这个名单里；
+    # 不加区分地全列进来会让 pdfplumber 的类型检查静默失效，
+    # 而它恰好是入库解析链路上唯一有真实类型信息的那个。
+    "reportlab.*",
+    # 语料生成侧：reportlab 出 PDF，pypdfium2 把 PDF 栅格化成图片型扫描件。
+    "pypdfium2.*",
+    "docx.*",
 ]
 ignore_missing_imports = true
 

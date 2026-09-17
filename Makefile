@@ -5,7 +5,8 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
         test test-integration layering check clean
-.PHONY: migrate revision seed seed-business verify-business cleanup model-smoke sql eval-sql
+.PHONY: migrate revision seed seed-business verify-business cleanup corpus corpus-list
+.PHONY: model-smoke sql eval-sql vector-spike
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -100,6 +101,12 @@ seed-business:  ## 只灌业务库，带规模参数：make seed-business ROWS=2
 
 verify-business:  ## 只跑业务库的四条约束断言与 EXPLAIN 检查（不重新生成数据）
 	uv run python scripts/business_seed.py --verify-only
+
+corpus:  ## 生成演示语料（88 篇，含 10 类缺陷注入，前置：make up + 业务库已灌数）
+	uv run python scripts/gen_corpus.py $(if $(SUBSET),--subset $(SUBSET),) $(if $(ONLY),--only $(ONLY),) --clean
+
+corpus-list:  ## 只看语料清单与缺陷标注，不生成文件
+	uv run python scripts/gen_corpus.py --list
 
 cleanup:  ## 按保留期清理过期数据（幂等，供 cron 调用，见详细设计 16.12）
 	uv run python -m app.cli cleanup

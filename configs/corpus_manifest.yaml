@@ -1,0 +1,825 @@
+# 演示语料清单（详细设计 16.11.1 / 16.11.2）
+#
+# ## 这个文件是什么
+#
+# 它是**语料的规格**，不是语料本身。`scripts/gen_corpus.py` 读它，按 `type` 分派到
+# 对应体裁的模板，用业务库（business MySQL）的真实取值填数，生成 PDF / DOCX / MD / TXT。
+# 正文不进版本库（`data/` 已 gitignore），进版本库的是这份清单与生成器——
+# 于是「语料是什么」与「语料怎么来的」都可复审，产物本身可随时重建。
+#
+# ## 为什么语料必须自产，不能找现成的
+#
+# 三条，任一条单独就足以否决「上网找企业文档」这条路：
+#
+# 1. **版权与获取壁垒**：公开可搜到的都是付费/注册下载的范本，且多为各方上传，许可不清。
+#    本仓库公开且用于求职展示，来源不明的文本不能作为项目资产。
+# 2. **与本项目业务库对不上**：语料必须与 `dim_region`（华东/华南/华北/华中/西南）、
+#    `dim_product_line`（智能家居/厨房电器/个护健康/影音娱乐）、20 个具体产品、
+#    2025 年事实表严格对齐。16.11.2 的「报告数字与 DB 差 1–2%」是**定量**缺陷，
+#    拿一份别的公司的文档连基数都没有。
+# 3. **真实文档不自带缺陷**：没有哪份公开制度会埋 Prompt Injection，
+#    也没有哪份报告会故意跟数据库错开 1.5%。
+#
+# 但**体裁要学真的**：制度类的「第一章 总则 → 分章规则 → 附则 + 修订历史表」、
+# 经营报告的「摘要 → 分项业绩 → 问题归因 → 下月计划 → 风险提示」、
+# 达成率的红绿灯阈值（≥100% 绿 / 80–100% 黄 / <80% 红）都不是随便编的，
+# 是按公开范本的真实结构写的。学形式不学内容，既绕开版权，又避免生成腔。
+#
+# ## 冻结纪律
+#
+# 本清单冻结后不再改动（16.11.3）。**改清单 = 换语料 = 所有阈值与评测结论失效**，
+# 因此每次改动必须同时升 `version`，并重跑 Recall@8 校准与 `verify-corpus`。
+# 这与 `schema_catalog.yaml` 的版本语义一致：版本号要能回答「昨天还好好的，今天为什么变了」。
+version: "2026.09.17-1"
+
+# ---------------------------------------------------------------- 应缺席的制度（16.11.2 第 10 项）
+#
+# 「提问涉及但语料中不存在的制度」——这条例外**没有文档可生成**，它靠的是**不生成**。
+# 因此把它显式登记在这里，供两处使用：
+#   - `verify-corpus`：断言全语料中不存在这些词的任何 chunk（含近义表述）；
+#   - 评测集：这三条问题的期望结果是 `NO_RELEVANT_KNOWLEDGE`，不是硬凑一段答案。
+#
+# 未写入本清单一律视为「可以有」——所以这同时是一份**黑名单**。
+absent_policies:
+  - name: 跨境出海业务管理办法
+    note: 演示库没有海外区域，业务上本就不该存在；问它必须拒答
+  - name: 直播带货专项补贴制度
+    note: 渠道只有直营/经销/电商/KA，没有直播；电商制度里用「平台内促销」覆盖
+  - name: 绿色供应链碳积分规则
+    note: 与库存/物流制度形似（CM-006 讲周转），是最容易被模型张冠李戴的一条
+
+# ---------------------------------------------------------------- 手工编写的文档（16.11.2）
+#
+# 「文档内 Prompt Injection ≥3 份」与「无答案提问 ≥3 处」**必须人工设计**，
+# 不能由生成脚本批量产出——生成模型会倾向产出「有答案」的内容，而这两类恰恰要求
+# 构造者知道系统在防什么、评测问题问什么。
+#
+# 它们以 Markdown 源文件存放在 `configs/corpus_handwritten/`，由生成器转成目标格式。
+# **正文不在生成器的模板里**——这是刻意的：模板能被批量复制，手工样本的差异性是它存在的意义。
+handwritten_dir: "configs/corpus_handwritten"
+
+# ---------------------------------------------------------------- 缺陷类型
+#
+# 编号与 16.11.2 的注入项一一对应，`verify-corpus` 按这个编号逐条断言。
+# 断言的是「缺陷注入了且能被检出」，不是「语料里有这么一段话」——
+# 两者差别很大：前者要求下游能力真的工作，后者只要求文件存在。
+defect_kinds:
+  VERSION_PAIR:       # 16.11.2-1  同名制度两个版本，一失效一生效（≥2 组）
+  VALUE_CONFLICT:     # 16.11.2-2  报告数字与 DB 差 1–2%（≥5 处）
+  TIME_CONFLICT:      # 16.11.2-3  报告统计截止日不同（≥3 处）
+  SCOPE_CONFLICT:     # 16.11.2-4  区域范围定义不同（≥2 处）
+  SOURCE_PAIR:        # 16.11.2-5  外部称增长、内部在下降（≥2 组）
+  SCANNED:            # 16.11.2-6  图片型扫描件 PDF（≥2 份）
+  CROSS_PAGE_TABLE:   # 16.11.2-7  跨页表格，表头还原（≥3 份）
+  PROMPT_INJECTION:   # 16.11.2-9  文档内注入指令（≥3 份）
+  # 16.11.2-8（页眉页脚 / 修订历史）不在此列：它是**全部** PDF/DOCX 的通用属性，
+  # 不是少数文档的标记位。写成逐篇缺陷等于把它降级成特例，反而漏测。
+
+# ---------------------------------------------------------------- 文档清单
+documents:
+  # ============================================================ 一、销售政策 / 折扣规则（16 篇）
+  #
+  # 制度类。要点：
+  #   - 同名制度多版本靠 `logical_key` 相同 + `version` 不同共存，
+  #     检索按生效区间过滤——这是 VERSION_PAIR 缺陷的机制基础；
+  #   - 每篇都有修订历史表（16.11.2-8 的落点之一）。
+  - id: SP-001
+    logical_key: policy/east-china-channel-discount
+    title: 华东区域渠道折扣政策
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: 2025-06-30      # 已失效：与 SP-002 构成 VERSION_PAIR
+    defects: [VERSION_PAIR]
+    pair_with: SP-002
+  - id: SP-002
+    logical_key: policy/east-china-channel-discount
+    title: 华东区域渠道折扣政策
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v2.0
+    effective_from: 2025-07-01
+    effective_to: null            # 生效中
+    defects: [VERSION_PAIR]
+    pair_with: SP-001
+  - id: SP-003
+    logical_key: policy/south-china-channel-discount
+    title: 华南区域渠道折扣政策
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-01-01
+    effective_to: null
+  - id: SP-004
+    logical_key: policy/north-china-channel-discount
+    title: 华北区域渠道折扣政策
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-01-01
+    effective_to: null
+  - id: SP-005
+    logical_key: policy/central-china-channel-discount
+    title: 华中区域渠道折扣政策
+    type: POLICY
+    format: docx
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-01-01
+    effective_to: null
+  - id: SP-006
+    logical_key: policy/southwest-china-channel-discount
+    title: 西南区域渠道折扣政策
+    type: POLICY
+    format: docx
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-01-01
+    effective_to: null
+  - id: SP-007
+    logical_key: policy/direct-channel-pricing
+    title: 直营渠道价格管理办法
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2024-07-01
+    effective_to: null
+  - id: SP-008
+    logical_key: policy/partner-rebate
+    title: 经销渠道返利政策
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: 2024-12-31      # 第 2 组 VERSION_PAIR
+    defects: [VERSION_PAIR]
+    pair_with: SP-009
+  - id: SP-009
+    logical_key: policy/partner-rebate
+    title: 经销渠道返利政策
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v2.0
+    effective_from: 2025-01-01
+    effective_to: null
+    defects: [VERSION_PAIR]
+    pair_with: SP-008
+  - id: SP-010
+    logical_key: policy/online-channel-promotion
+    title: 电商渠道促销活动管理规范
+    type: POLICY
+    format: pdf
+    department: 电商运营部
+    version: v1.0
+    effective_from: 2024-09-01
+    effective_to: null
+  - id: SP-011
+    #: PROMPT_INJECTION 第 1 份所在。选它是因为注入文本伪造的是**折扣审批授权**，
+    #: 与本篇主题完全吻合——攻击写在与目标最相关的文档里，命中率最高，也最难被读者察觉。
+    #: 注入正文在 `configs/corpus_handwritten/injection_policy.md`（手工编写）。
+    logical_key: policy/ka-special-discount-approval
+    title: KA客户专项折扣审批流程
+    type: POLICY
+    format: docx
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-03-01
+    effective_to: null
+    defects: [PROMPT_INJECTION]
+    injection: injection_policy.md
+  - id: SP-012
+    logical_key: policy/key-account-framework-discount
+    title: 大客户年度框架协议折扣规则
+    type: POLICY
+    format: docx
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2024-11-01
+    effective_to: null
+  - id: SP-013
+    logical_key: policy/clearance-discount-guideline
+    title: 临期产品清仓折扣指引
+    type: POLICY
+    format: md
+    department: 供应链部
+    version: v1.0
+    effective_from: 2025-05-01
+    effective_to: null
+  - id: SP-014
+    #: DEFINITION 冲突的**内部权威侧**：净销售额 = 含税 − 折扣 − 退货。
+    #: 经营报告里的「销售额」若不特别说明多为含税口径，两边差 1–2%——
+    #: 差异的**制度依据**就在这一篇，冲突检测给出解释时要引它。
+    logical_key: policy/return-and-writeoff
+    title: 退货与冲减管理办法
+    type: POLICY
+    format: pdf
+    department: 财务部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: null
+  - id: SP-015
+    #: SCOPE_CONFLICT 第 1 处：本文写「华东区域含三省」，而 dim_region 里
+    #: 华东 province_count = 4。差异可被确定性比对（比对的另一侧是 MD-008 与数据库）。
+    #: 同时是 CROSS_PAGE_TABLE 第 1 份：授权额度表跨页，表头必须在第二页重复。
+    logical_key: policy/regional-discount-quota
+    title: 区域折扣授权额度表
+    type: POLICY
+    format: pdf
+    department: 销售运营部
+    version: v1.0
+    effective_from: 2025-01-01
+    effective_to: null
+    defects: [SCOPE_CONFLICT, CROSS_PAGE_TABLE]
+    scope_claim:
+      region: 华东
+      province_count_in_doc: 3      # 真实值 4，见 dim_region.province_count
+  - id: SP-016
+    #: SCANNED 第 1 份：整页位图、无可抽取文本层。
+    #: 期望结果是 knowledge_document.status=FAILED 且 error_summary 写明「扫描件不支持 OCR」，
+    #: **不是**硬凑一段乱码文本。切片内不做 OCR（冲刺方案 §10 后置），因此这条测的是
+    #: 「系统知道自己读不了」，这才是降级路径该有的样子。
+    logical_key: policy/discount-compliance-redline
+    title: 折扣合规红线与审计要求
+    type: POLICY
+    format: pdf
+    department: 审计部
+    version: v1.0
+    effective_from: 2025-02-01
+    effective_to: null
+    defects: [SCANNED]
+
+  # ============================================================ 二、渠道管理制度（10 篇）
+  - id: CM-001
+    logical_key: channel/admission-and-grading
+    title: 渠道准入与分级管理办法
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: null
+  - id: CM-002
+    #: CROSS_PAGE_TABLE 第 2 份：考核评分表 12 行，必然跨页。
+    logical_key: channel/dealer-annual-assessment
+    title: 经销商年度考核办法
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: null
+    defects: [CROSS_PAGE_TABLE]
+  - id: CM-003
+    logical_key: channel/conflict-resolution
+    title: 渠道冲突处理规范
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-03-01
+    effective_to: null
+  - id: CM-004
+    logical_key: channel/direct-store-operations
+    title: 直营门店运营管理手册
+    type: POLICY
+    format: docx
+    department: 零售运营部
+    version: v1.0
+    effective_from: 2024-06-01
+    effective_to: null
+  - id: CM-005
+    logical_key: channel/online-store-management
+    title: 电商平台店铺管理规范
+    type: POLICY
+    format: docx
+    department: 电商运营部
+    version: v1.0
+    effective_from: 2024-08-01
+    effective_to: null
+  - id: CM-006
+    #: 与 inventory_snapshot 表对齐：可用库存 / 安全库存的口径说明在 MD-007，
+    #: 本篇给的是**管理要求**（低于安全线的处置流程）。两者都提到安全线，
+    #: 但一个讲定义、一个讲动作——检索时容易混淆，正好测排序区分度。
+    logical_key: channel/inventory-turnover
+    title: 渠道库存与周转管理要求
+    type: POLICY
+    format: pdf
+    department: 供应链部
+    version: v1.0
+    effective_from: 2024-05-01
+    effective_to: null
+  - id: CM-007
+    logical_key: channel/price-protection
+    title: 渠道价格保护政策
+    type: POLICY
+    format: docx
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-10-01
+    effective_to: null
+  - id: CM-008
+    #: TIME_CONFLICT 的**制度侧锚点**：本文规定月度数据报送截止为次月 3 日、
+    #: 关账时点为月末最后一日 24:00。经营报告若写别的截止日，冲突的制度依据在此。
+    logical_key: channel/data-reporting
+    title: 渠道数据报送规范
+    type: POLICY
+    format: pdf
+    department: 数据管理部
+    version: v1.0
+    effective_from: 2024-01-01
+    effective_to: null
+  - id: CM-009
+    logical_key: channel/expense-reimbursement
+    title: 渠道费用核销管理办法
+    type: POLICY
+    format: docx
+    department: 财务部
+    version: v1.0
+    effective_from: 2024-04-01
+    effective_to: null
+  - id: CM-010
+    logical_key: channel/exit-and-settlement
+    title: 渠道退出与结算管理办法
+    type: POLICY
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    effective_from: 2024-12-01
+    effective_to: null
+    defects: [SCANNED]
+
+  # ============================================================ 三、产品资料（20 篇）
+  #
+  # 与 `dim_product` 一一对应（20 行）。产品名、标价、上市日期、产品线
+  # **全部由生成器从业务库读取**，清单里只留 `product_code` 做锚点——
+  # 手抄进清单会与库漂移，而语料与库不一致恰恰是本项目最不能出的错。
+  - { id: PD-001, product_code: P0001, format: docx }
+  - { id: PD-002, product_code: P0002, format: docx }
+  - id: PD-003
+    #: PROMPT_INJECTION 第 2 份所在（正文由手工样本注入，见 handwritten_dir）。
+    #: 选智能音箱是因为它是异常产品线「智能家居」下的产品，检索命中率高——
+    #: 注入样本若永远检索不到，等于没测。
+    product_code: P0003
+    format: docx
+    defects: [PROMPT_INJECTION]
+    injection: injection_product.md
+  - { id: PD-004, product_code: P0004, format: docx }
+  - { id: PD-005, product_code: P0005, format: docx }
+  - { id: PD-006, product_code: P0006, format: docx }
+  - { id: PD-007, product_code: P0007, format: docx }
+  - { id: PD-008, product_code: P0008, format: pdf }
+  - { id: PD-009, product_code: P0009, format: docx }
+  - { id: PD-010, product_code: P0010, format: docx }
+  - { id: PD-011, product_code: P0011, format: docx }
+  - { id: PD-012, product_code: P0012, format: docx }
+  - { id: PD-013, product_code: P0013, format: pdf }
+  - { id: PD-014, product_code: P0014, format: docx }
+  - { id: PD-015, product_code: P0015, format: docx }
+  - { id: PD-016, product_code: P0016, format: pdf }
+  - { id: PD-017, product_code: P0017, format: docx }
+  - { id: PD-018, product_code: P0018, format: pdf }
+  - { id: PD-019, product_code: P0019, format: pdf }
+  - { id: PD-020, product_code: P0020, format: md }
+
+  # ============================================================ 四、经营报告（21 篇）
+  #
+  # 16.11.1 强调「与事实表口径**不完全一致**」——这是刻意设计的，不是数据错误。
+  # 三类不一致分别对应三种冲突：
+  #   - 用含税口径报「销售额」      → DEFINITION（差异 1–2%，见经管报告口径说明）
+  #   - 统计截止日不是月末          → TIME
+  #   - 区域/渠道的归并方式与事实表不同 → SCOPE
+  #
+  # `report` 段落里写的是**生成参数**，不是硬编码数字：`basis` 决定取哪个口径，
+  # `value_shift` 决定与真值错开多少。真值在生成时从业务库现查，
+  # 这样重灌业务库后语料仍然自洽（16.11.3 的冻结指的是不再改，不是不能重建）。
+  - id: MR-2025-01
+    logical_key: report/monthly-2025-01
+    title: 2025年1月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-02-08
+    report: { period: "2025-01", basis: gross, cutoff: month_end }
+  - id: MR-2025-02
+    logical_key: report/monthly-2025-02
+    title: 2025年2月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-03-08
+    report: { period: "2025-02", basis: gross, cutoff: month_end }
+  - id: MR-2025-03
+    logical_key: report/monthly-2025-03
+    title: 2025年3月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-04-08
+    report: { period: "2025-03", basis: gross, cutoff: month_end }
+  - id: MR-2025-04
+    logical_key: report/monthly-2025-04
+    title: 2025年4月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-05-08
+    report: { period: "2025-04", basis: gross, cutoff: month_end }
+  - id: MR-2025-05
+    logical_key: report/monthly-2025-05
+    title: 2025年5月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-06-08
+    report: { period: "2025-05", basis: gross, cutoff: month_end }
+  - id: MR-2025-06
+    logical_key: report/monthly-2025-06
+    title: 2025年6月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-07-08
+    report: { period: "2025-06", basis: gross, cutoff: month_end }
+  - id: MR-2025-07
+    logical_key: report/monthly-2025-07
+    title: 2025年7月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-08-08
+    report: { period: "2025-07", basis: gross, cutoff: month_end }
+    defects: [VALUE_CONFLICT]     # VALUE 第 1 处
+  - id: MR-2025-08
+    logical_key: report/monthly-2025-08
+    title: 2025年8月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-09-08
+    report: { period: "2025-08", basis: gross, cutoff: month_end }
+    defects: [VALUE_CONFLICT]     # VALUE 第 2 处
+  - id: MR-2025-09
+    logical_key: report/monthly-2025-09
+    title: 2025年9月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-10-08
+    #: VALUE 第 3 处 + TIME 第 1 处：截止日提前到 9/28，
+    #: 因此数字偏低的**原因不是口径而是少统计了两天**——这正是 TIME 与 VALUE
+    #: 两类冲突需要分开判定的理由：都表现为「对不上」，但解释完全不同。
+    report: { period: "2025-09", basis: gross, cutoff: "2025-09-28" }
+    defects: [VALUE_CONFLICT, TIME_CONFLICT]
+  - id: MR-2025-10
+    logical_key: report/monthly-2025-10
+    title: 2025年10月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-11-08
+    report: { period: "2025-10", basis: gross, cutoff: month_end }
+  - id: MR-2025-11
+    logical_key: report/monthly-2025-11
+    title: 2025年11月经营月报
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-12-08
+    report: { period: "2025-11", basis: gross, cutoff: month_end }
+  - id: MR-2025-12
+    logical_key: report/monthly-2025-12
+    title: 2025年12月经营月报
+    type: REPORT
+    format: docx
+    department: 经营管理部
+    version: v1.0
+    published_at: 2026-01-08
+    report: { period: "2025-12", basis: gross, cutoff: month_end }
+  - id: QR-2025-Q1
+    logical_key: report/quarterly-2025-Q1
+    title: 2025年第一季度经营分析
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-04-15
+    report: { period: "2025-Q1", basis: gross, cutoff: month_end }
+  - id: QR-2025-Q2
+    #: SOURCE_PAIR 第 1 组的**内部侧**：本报告写智能家居品类增速放缓，
+    #: 与 EXT-001（行业协会称需求增长）相悖。
+    logical_key: report/quarterly-2025-Q2
+    title: 2025年第二季度经营分析
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-07-15
+    report: { period: "2025-Q2", basis: gross, cutoff: month_end }
+    defects: [SOURCE_PAIR]
+    pair_with: EXT-001
+  - id: QR-2025-Q3
+    #: 三重缺陷叠加，是单篇信息量最大的一份：
+    #:   VALUE 第 4 处 —— 含税口径，与净销售额差约 1.5%
+    #:   TIME  第 2 处 —— 截止 9/28
+    #:   CROSS_PAGE_TABLE 第 3 份 —— 区域明细表 7 列跨页
+    logical_key: report/quarterly-2025-Q3
+    title: 2025年第三季度经营分析
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-10-15
+    report: { period: "2025-Q3", basis: gross, cutoff: "2025-09-28" }
+    defects: [VALUE_CONFLICT, TIME_CONFLICT, CROSS_PAGE_TABLE, SOURCE_PAIR]
+    pair_with: EXT-002
+  - id: QR-2025-Q4
+    logical_key: report/quarterly-2025-Q4
+    title: 2025年第四季度经营分析
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2026-01-15
+    report: { period: "2025-Q4", basis: gross, cutoff: month_end }
+  - id: AR-2025
+    logical_key: report/annual-2025
+    title: 2025年度经营分析报告
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2026-01-25
+    report: { period: "2025", basis: gross, cutoff: month_end }
+  - id: AR-2025-H1
+    logical_key: report/half-year-2025-H1
+    title: 2025年上半年经营回顾
+    type: REPORT
+    format: docx
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-07-20
+    report: { period: "2025-H1", basis: gross, cutoff: month_end }
+  - id: AR-2025-H2
+    logical_key: report/half-year-2025-H2
+    title: 2025年下半年经营展望
+    type: REPORT
+    format: docx
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-08-05
+    report: { period: "2025-H2", basis: gross, cutoff: month_end, outlook: true }
+  - id: SR-EC-2025Q3
+    #: VALUE 第 5 处 + TIME 第 3 处。截止日 9/25 比 QR-2025-Q3 还早，
+    #: 于是同一季度的两份内部报告彼此也不一致——这是有意的：
+    #: 冲突检测不能假设「内部来源之间一定自洽」。
+    logical_key: report/special-east-china-2025Q3
+    title: 华东区域2025年第三季度专项分析
+    type: REPORT
+    format: pdf
+    department: 经营管理部
+    version: v1.0
+    published_at: 2025-10-20
+    report: { period: "2025-Q3", basis: gross, cutoff: "2025-09-25", region: 华东 }
+    defects: [VALUE_CONFLICT, TIME_CONFLICT]
+  - id: SR-CH-2025
+    logical_key: report/special-partner-channel-2025
+    title: 经销渠道2025年度经营分析
+    type: REPORT
+    format: pdf
+    department: 渠道管理部
+    version: v1.0
+    published_at: 2026-01-28
+    report: { period: "2025", basis: gross, cutoff: month_end, channel: 经销 }
+
+  # ============================================================ 五、指标口径说明（11 篇）
+  #
+  # 这批是 SQL 侧与 RAG 侧**口径的唯一权威出处**，与 `configs/schema_catalog.yaml`
+  # 的 `metrics` 段一一对应。版本号必须与目录里的 `version` 字段一致——
+  # 不一致就意味着「SQL 用一版口径、文档讲另一版」，是比缺文档更糟的状态。
+  - id: MD-001
+    logical_key: metric/net-sales-definition
+    title: 净销售额指标口径说明
+    type: METRIC
+    format: md
+    department: 财务部
+    version: v1.2
+    metric_code: net_sales
+  - id: MD-002
+    logical_key: metric/gross-sales-definition
+    title: 含税销售额口径说明
+    type: METRIC
+    format: md
+    department: 财务部
+    version: v1.2
+    metric_code: gross_sales
+  - id: MD-003
+    logical_key: metric/discount-amount-definition
+    title: 折扣金额口径说明
+    type: METRIC
+    format: md
+    department: 财务部
+    version: v1.1
+    metric_code: discount_amount
+  - id: MD-004
+    logical_key: metric/return-amount-definition
+    title: 退货金额口径说明
+    type: METRIC
+    format: md
+    department: 财务部
+    version: v1.1
+    metric_code: return_amount
+  - id: MD-005
+    logical_key: metric/order-count-definition
+    title: 订单行数口径说明
+    type: METRIC
+    format: md
+    department: 销售运营部
+    version: v1.0
+    metric_code: order_count
+  - id: MD-006
+    #: PROMPT_INJECTION 第 3 份所在。选「目标达成率」这篇是因为它解释了
+    #: 红绿灯阈值（≥100% 绿 / 80–100% 黄 / <80% 红）——一个带明确判定规则的文档，
+    #: 被注入指令篡改后的危害最容易讲清楚（篡改阈值 = 静默改变结论）。
+    logical_key: metric/target-achievement-definition
+    title: 目标净销售额与达成率口径说明
+    type: METRIC
+    format: txt
+    department: 财务部
+    version: v1.0
+    metric_code: sales_target_amount
+    defects: [PROMPT_INJECTION]
+    injection: injection_metric.md
+  - id: MD-007
+    logical_key: metric/inventory-definition
+    title: 可用库存与安全库存口径说明
+    type: METRIC
+    format: md
+    department: 供应链部
+    version: v1.0
+    metric_code: available_qty
+  - id: MD-008
+    #: SCOPE_CONFLICT 第 2 处：本文写「华东含三省（沪、苏、浙）」，
+    #: 而 `dim_region` 记 `province_count = 4`。选「区域划分说明」这篇承载它，
+    #: 是因为口径类文档本来就在定义范围，冲突读起来最自然，也最难被当成笔误糊弄过去。
+    logical_key: metric/region-division-definition
+    title: 区域划分与省份归属说明
+    type: METRIC
+    format: pdf
+    department: 数据管理部
+    version: v1.0
+    defects: [SCOPE_CONFLICT]
+    scope_claim:
+      region: 华东
+      province_count_in_doc: 3      # 真实值 4
+  - id: MD-009
+    logical_key: metric/yoy-mom-definition
+    title: 同比环比计算口径说明
+    type: METRIC
+    format: md
+    department: 数据管理部
+    version: v1.0
+  - id: MD-010
+    #: TIME_CONFLICT 的**口径侧锚点**，与 CM-008（制度侧）互为印证：
+    #: 两处都写月末最后一日 24:00 关账。经营报告写 9/28 就同时与两者冲突，
+    #: 这使「是报告错了」而不是「口径本身有歧义」成为可判定的结论。
+    logical_key: metric/data-cutoff-definition
+    title: 数据统计截止时点与关账说明
+    type: METRIC
+    format: pdf
+    department: 数据管理部
+    version: v1.0
+  - id: MD-011
+    logical_key: metric/version-change-log
+    title: 指标版本变更记录
+    type: METRIC
+    format: md
+    department: 数据管理部
+    version: v1.0
+
+  # ============================================================ 六、外部材料（4 篇）
+  #
+  # `source_kind: EXTERNAL` 是本批文档的**唯一标记**，也是 11.4 新增该字段的直接原因。
+  # 它们与内部报告的相悖必须被识别为 SOURCE 冲突而非 VALUE 冲突——
+  # 差异的根源不是口径或时点，而是**立场与取样范围的根本不同**，
+  # 因此正确处理是「并列展示 + 外部不覆盖内部」，不是「算差值找谁对」。
+  - id: EXT-001
+    logical_key: external/industry-association-2025H1
+    title: 2025年上半年消费电子行业市场报告
+    type: OTHER
+    source_kind: EXTERNAL
+    publisher: 中国消费电子行业协会
+    format: pdf
+    department: null
+    version: v1.0
+    published_at: 2025-07-30
+    defects: [SOURCE_PAIR]
+    pair_with: QR-2025-Q2
+  - id: EXT-002
+    logical_key: external/broker-quarterly-observation
+    title: 消费电子行业季度观察（2025年第三季度）
+    type: OTHER
+    source_kind: EXTERNAL
+    publisher: 华泰联合证券研究所
+    format: pdf
+    department: null
+    version: v1.0
+    published_at: 2025-10-12
+    defects: [SOURCE_PAIR]
+    pair_with: QR-2025-Q3
+  - id: EXT-003
+    logical_key: external/smart-home-online-trend
+    title: 智能家居品类线上渠道趋势简报
+    type: OTHER
+    source_kind: EXTERNAL
+    publisher: 艾瑞咨询
+    format: docx
+    department: null
+    version: v1.0
+    published_at: 2025-11-05
+  - id: EXT-004
+    logical_key: external/appliance-outlook-2025
+    title: 家电行业2025年展望
+    type: OTHER
+    source_kind: EXTERNAL
+    publisher: 财经媒体转载
+    format: md
+    department: null
+    version: v1.0
+    published_at: 2025-03-18
+
+  # ============================================================ 七、其他噪声（6 篇）
+  #
+  # 16.11.1 明写这批的作用是「噪声文档，测检索区分度」。
+  # OT-005 / OT-006 是**强噪声**：话题与销售毫无关系，
+  # 若它们出现在「华东 Q3 净销售额」的召回结果里，说明检索在乱撒网。
+  - id: OT-001
+    logical_key: other/ops-meeting-minutes-2025-08
+    title: 2025年8月销售运营月度例会纪要
+    type: OTHER
+    format: docx
+    department: 销售运营部
+    version: v1.0
+    published_at: 2025-08-06
+  - id: OT-002
+    #: PROMPT_INJECTION 第 1 份所在。选「活动通知」是因为它短、语气像内部通知，
+    #: 是注入攻击最自然的藏身处——真实攻击不会写在一份 40 页制度里。
+    logical_key: other/national-day-promotion-notice
+    title: 关于开展国庆促销活动的通知
+    type: OTHER
+    format: pdf
+    department: 电商运营部
+    version: v1.0
+    published_at: 2025-09-20
+    defects: [PROMPT_INJECTION]
+    injection: injection_other.md
+  - id: OT-003
+    logical_key: other/q4-sales-kickoff-minutes
+    title: 2025年第四季度销售动员会纪要
+    type: OTHER
+    format: md
+    department: 销售运营部
+    version: v1.0
+    published_at: 2025-10-09
+  - id: OT-004
+    logical_key: other/platform-upgrade-notice
+    title: 关于数据平台升级暂停查询的通知
+    type: OTHER
+    format: txt
+    department: 信息技术部
+    version: v1.0
+    published_at: 2025-11-14
+  - id: OT-005
+    logical_key: other/travel-reimbursement-supplement
+    title: 员工差旅报销制度补充说明
+    type: OTHER
+    format: docx
+    department: 人力资源部
+    version: v1.0
+    published_at: 2025-04-22
+  - id: OT-006
+    logical_key: other/office-access-hours-notice
+    title: 关于调整办公区门禁时间的通知
+    type: OTHER
+    format: md
+    department: 行政部
+    version: v1.0
+    published_at: 2025-06-11

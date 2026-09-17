@@ -535,6 +535,18 @@ def generate_targets(
 
     目标是**回望**的：华东 Q3 的达成率因此会明显偏低，
     这正是「目标达成率」这个指标在下钻案例里的用处。
+
+    **2026-09-17 修复**：原实现的条件是 `when == month`，而 `when` 是订单的**具体日期**
+    （如 2025-01-15）、`month` 是当月 **1 日**——只有恰好下在 1 号的订单能匹配上，
+    因此目标只等于「当月第一天的销售额 × 1.05」，约当月实际的 4%，
+    达成率算出 2477%。同一行的第二个错误是它取的是**当年**（2025）的数，
+    而 docstring 写的是「2024 同期」——两处一起错，正好都指向同一个 sum。
+
+    这个 bug 躲过了两道门禁：`verify()` 的四条断言不覆盖 `sales_target`，
+    `eval_sql_golden.yaml` 的 10 道金标题也没有一道涉及达成率，
+    于是「数据自洽但无意义」一路静默到 Phase 5 造语料时才暴露——
+    因为经营报告必须列达成率，才有人第一次真正去读这张表的数量级。
+    修复同时补了 `verify()` 的断言 5，把它钉住。
     """
     product_line_of = {p["product_id"]: p["product_line_id"] for p in dims.products}
     actual: dict[tuple[str, str, date], Decimal] = defaultdict(Decimal)
@@ -554,7 +566,11 @@ def generate_targets(
                     for (rid, lid, when), amount in actual.items()
                     if rid == region["region_id"]
                     and lid == line["product_line_id"]
-                    and when == month
+                    # 上一年同月：按 (年, 月) 匹配，不是按「同一天」。
+                    # `actual` 的键精确到日，所以这里必须同时比年和月，
+                    # 少比任何一个都会退回原来那个「只统计 1 号」的错误。
+                    and when.year == TARGET_YEAR - 1
+                    and when.month == month.month
                 )
                 targets.append(
                     {
@@ -837,6 +853,73 @@ async def verify(conn: AsyncConnection) -> list[Check]:
             "约束4c 其他区域/产品线库存均不低于安全线",
             other_low == 0,
             f"越线快照 {int(other_low)} 条",
+        )
+    )
+
+    # ---- 约束 5：目标表量级正确，且华东 Q3 达成率明显偏低
+    #
+    # 这两条是**事后补的**（2026-09-17）。原来的三条约束都不碰 `sales_target`，
+    # 于是「目标只统计了当月 1 号一天」这个 bug 一路静默到 Phase 5 造语料时才暴露。
+    # 教训不是「断言写少了」，而是**门禁只覆盖它被要求覆盖的那几条约束**：
+    # 16.10 的四条约束描述的是下钻案例成立与否，没有一条说「目标表数量级要对」。
+    # 补断言的同时把这条缺口记在这里，避免下次再靠运气发现。
+    scale = await scalar(
+        """
+        SELECT (SELECT SUM(target_amount) FROM sales_target WHERE YEAR(period_month) = 2025)
+             / NULLIF((SELECT SUM(net_amount) FROM fact_sales_order_item
+                       WHERE YEAR(order_date) = 2025), 0)
+        """
+    )
+    scale_ok = Decimal("0.95") <= scale <= Decimal("1.15")
+    checks.append(
+        Check(
+            "约束5a 年度目标与年度实际同一量级",
+            scale_ok,
+            f"目标/实际 = {scale:.4f}（目标按上年同期 ×1.05 编制，应略大于 1）",
+        )
+    )
+
+    #: 达成率 = 本年实际 / 本年目标。目标 = 上年同期 × 1.05，
+    #: 因此达成率 ≈ 同比因子 / 1.05：华东 Q3 同比 0.88 → 约 0.84（黄灯），
+    #: 其余区域同比约 1.02–1.04 → 约 0.97–0.99。**这个落差就是演示意图本身**：
+    #: 「华东达成率明显偏低」必须能在数据上站住，否则下钻案例少了最直观的那一问。
+    achievement = await scalar(
+        """
+        SELECT
+          (SELECT SUM(f.net_amount) FROM fact_sales_order_item f
+             JOIN dim_region r ON r.region_id = f.region_id
+            WHERE r.region_name = :region
+              AND YEAR(f.order_date) = 2025 AND QUARTER(f.order_date) = 3)
+          / NULLIF(
+          (SELECT SUM(t.target_amount) FROM sales_target t
+             JOIN dim_region r ON r.region_id = t.region_id
+            WHERE r.region_name = :region
+              AND YEAR(t.period_month) = 2025 AND QUARTER(t.period_month) = 3), 0)
+        """,
+        region=ANOMALY_REGION,
+    )
+    others_achievement = await scalar(
+        """
+        SELECT
+          (SELECT SUM(f.net_amount) FROM fact_sales_order_item f
+             JOIN dim_region r ON r.region_id = f.region_id
+            WHERE r.region_name <> :region
+              AND YEAR(f.order_date) = 2025 AND QUARTER(f.order_date) = 3)
+          / NULLIF(
+          (SELECT SUM(t.target_amount) FROM sales_target t
+             JOIN dim_region r ON r.region_id = t.region_id
+            WHERE r.region_name <> :region
+              AND YEAR(t.period_month) = 2025 AND QUARTER(t.period_month) = 3), 0)
+        """,
+        region=ANOMALY_REGION,
+    )
+    gap = others_achievement - achievement
+    checks.append(
+        Check(
+            "约束5b 华东 Q3 达成率明显低于其他区域",
+            gap >= Decimal("0.08"),
+            f"{ANOMALY_REGION} {achievement:.4f} vs 其他区域 {others_achievement:.4f}"
+            f"（落差 {gap:.4f}，要求 ≥ 0.08）",
         )
     )
 

@@ -40,6 +40,17 @@ class KnowledgeDocument(Base):
     effective_to: Mapped[date | None] = mapped_column(Date)
     #: INTERNAL / CONFIDENTIAL
     classification: Mapped[str] = mapped_column(String(16))
+    #: INTERNAL / EXTERNAL —— 文档来自内部制度体系，还是外部材料（行业协会、券商、媒体）。
+    #:
+    #: **为什么必须单独成列**：FR-SEARCH-001 要求「外部信息与内部制度冲突时不得覆盖
+    #: 内部事实」，22.6 的 SOURCE 冲突用例、16.11.2 的「外部称增长、内部在下降」
+    #: 缺陷注入都依赖这个判定。它会与两种已有字段混淆：
+    #:   - `classification` 是**密级**轴（INTERNAL/CONFIDENTIAL），与来源内外正交；
+    #:   - `type` 是封闭 5 值枚举，外部行业报告与内部经营报告会同落 `REPORT`，
+    #:     区分不出来。靠 `department` 自由文本约定编码，则会把一个语义轴
+    #:     藏在字符串里，日后改动取值会静默破掉门禁。
+    #: 检索侧也要按它过滤（「只召回内部来源」），故它是可断言的独立字段。
+    source_kind: Mapped[str] = mapped_column(String(16), server_default="INTERNAL")
     allowed_roles_json: Mapped[json_list_opt]
     #: PROCESSING / ACTIVE / FAILED / ARCHIVED，**只有 ACTIVE 进入检索**
     status: Mapped[str] = mapped_column(String(16))
