@@ -41,6 +41,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 > 第 1 批做完时 RAG 还没做，简历与口述不得提前声称）。
 
 **开工前**：先 `make ps` 看有状态组件是否在跑，没起来就 `make up`。
+⚠️ **`make ps` 看不到 Ollama**（它是裸容器，不归本项目 compose 管）——
+做 RAG 入库/检索前额外确认一次：`curl -s http://127.0.0.1:11434/api/tags`。
 
 **当前仍然存在的临时约定**：
 
@@ -257,6 +259,9 @@ make chunk P=data/corpus/SP-015.pdf TABLES_ONLY=1  # 只看表格块
 make vocab       # 构建稀疏检索词表并导出快照（幂等，前置：make corpus）
 ```
 
+> 与向量相关的命令（`make ingest` 起）**还需要 Ollama 在跑**，而它不在 compose 里。
+> 详见下方「本机环境事实」里的 Ollama 一段。
+
 `make chunk` 会打印**解析阶段清洗掉了什么**（页眉页脚、修订记录）。
 清洗是唯一一类"正确时无声、错误时也无声"的操作——多丢一行不会有任何症状，
 直到某天有人问"制度里明明写了"。
@@ -313,6 +318,33 @@ make redis-cli
 | MinIO | 镜像用 `quay.io/minio/minio` | 本机 daemon 的 `docker.m.daocloud.io` 镜像源对 `minio/minio` 返回 403 |
 | MySQL | agent **`3308`** / business `3307` | business 用只读账号，写操作必须被数据库拒绝。agent 用 3308 而非 3306：**Windows 侧另有一个独立安装的 MySQL 占着 `0.0.0.0:3306`**，wslrelay 因此无法为 3306 建立 localhost 转发（实测 3307/6379/6380/6381/9000 都转发，唯独没有 3306）。用 Windows 的图形客户端连 `localhost:3306` 会连到**那个** MySQL，看不到 `agent_task` 等表 |
 | Qdrant | 宿主端口 **6333**（HTTP）/ 6334（gRPC） | 服务端形态，**不要用 SDK 的本地模式**——它单进程独占（见 TBC-05） |
+| Ollama（向量模型） | 宿主端口 **11434**，**是一个名叫 `ollama` 的独立 Docker 容器** | ⚠️ **不在 `docker-compose.dev.yml` 里，`make up` 不会拉起它**，`make ps` 也看不到它。模型实体在 docker 卷 `ollama-data`（宿主机 `/var/lib/docker/volumes/ollama-data/_data`，容器内 `/root/.ollama`），**库里只有 `bge-m3`**（1.1GB，2026-08-19 建）。见下方专段 |
+
+### Ollama：一条未声明的依赖
+
+本机有**两个** Ollama，别搞混：
+
+| | 位置 | 模型库 |
+|---|---|---|
+| Windows 侧 | `D:\ollama`（含 `ollama app.exe`） | `C:\Users\DELL\.ollama\models` —— **空的，从没 pull 过** |
+| WSL 侧（**项目用的是这个**） | Docker 容器 `ollama` | 卷 `ollama-data` 里只有 `bge-m3` |
+
+那个容器**不是本项目建的**（创建于 2026-08-19，比本仓库第一次提交还早一个月），
+是用 `docker run` 起的裸容器，没有 compose 标签，因此不受本项目编排：
+
+- **`make up` 不会启动它**，`make ps` 也列不出它。RAG 入库前要另行确认它在跑；
+  不在时 `make ingest` 会以"连不上 11434"失败，而报错**不指向 ollama**。
+  自查一条命令：`curl -s http://127.0.0.1:11434/api/tags`
+- 它带 `restart=unless-stopped`，能扛 Docker 守护进程重启；而本项目自己的容器
+  **没有 restart policy**（WSL 重启后不会自动起）。两者行为相反，排查时容易判反。
+- 卷 `ollama-data` 一旦被 `docker system prune --volumes` 之类删掉，模型就没了；
+  而按详设 11.5 的硬规定**换 embedding 模型必须新建 collection 全量重建**——
+  卷丢了，已入库的向量跟着作废。
+- **收进 compose 之前先确认没有别的项目在用这个容器**（它是裸容器，可能被共享）。
+
+> 排查提示：容器里的进程**会出现在 WSL 的 `ps` 里**（PID 命名空间分层，宿主可见子命名空间）。
+> 所以 `ps` 里看到 `/bin/ollama serve` 不代表 WSL 装了原生 ollama——
+> 那个路径是**容器内**的文件系统，`which ollama` 在 WSL 里是找不到的。
 
 ### 从 Windows 侧的图形客户端连库（Navicat 等）
 
