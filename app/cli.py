@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.agent.prompts import SMOKE_PROMPT
 from app.agent.schemas import SmokeAnswer
@@ -26,6 +27,8 @@ from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_CLI, setup_logging
 from app.infrastructure.model_gateway import EmbeddingDimensionError, build_model_gateway
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
+from app.tools.rag.chunker import Chunk, chunk_document
+from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
@@ -33,6 +36,9 @@ from app.tools.sql.tool import build_cli_context, build_sql_query_tool
 #: 子命令处理器的返回值：同步的直接给退出码，异步的给协程（分发处统一 await）。
 #: 两者都是合法的，见 `main` 的分发说明。
 HandlerResult = int | Coroutine[Any, Any, int]
+
+#: 语料目录。`chunk` 用它定位生成报告（取标题与文档键），找不到就退化成文件名。
+_CORPUS_ROOT = Path("data/corpus")
 
 
 async def _seed(settings: Settings, args: argparse.Namespace) -> int:
@@ -266,6 +272,144 @@ def _tokenize(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _chunk(settings: Settings, args: argparse.Namespace) -> int:
+    """解析 + 分块，把结果逐条打出来（详细设计 11.3 的现场验证命令）。
+
+    **为什么需要它**：11.3 的分块参数是一组目标值，而分块是那种"参数错了
+    要到检索评测才看得出来"的环节——那时你面对的是 Recall@8 掉了几个点，
+    完全不知道是切大了、切小了，还是标题路径没挂上。这条命令把中间产物摊开：
+    每块的标题路径、页码、字符数、正文，以及**解析阶段清洗掉了什么**。
+
+    入库元数据（标题 / 文档键）优先取语料生成报告，取不到就退化成文件名。
+    标题不是装饰：它是标题路径的根，没有它，
+    「这段话出自哪份文件」这个问题在检索侧就没有答案。
+    """
+    root = Path(args.path)
+    targets = _collect_documents(root, args)
+    if not targets:
+        print(f"没有可解析的文件：{root}")
+        return 1
+
+    failures = 0
+    for file in targets:
+        meta = _document_meta(file)
+        parsed = parse_document(file)
+        chunks = chunk_document(
+            parsed,
+            document_key=meta.key,
+            settings=settings,
+            title=meta.title,
+        )
+        if args.summary:
+            _print_chunk_summary(meta, parsed, chunks)
+            continue
+        failures += _print_chunks(meta, parsed, chunks, args)
+    return 1 if failures else 0
+
+
+def _collect_documents(root: Path, args: argparse.Namespace) -> list[Path]:
+    """收集待处理文件。目录按扩展名过滤并排序——**同一批文件必须每次同序**，
+    否则 `chunk_id` 依赖的文档顺序变了，两次运行的输出对不上。"""
+    if root.is_file():
+        return [root]
+    if not root.is_dir():
+        return []
+    return sorted(
+        (p for p in root.rglob("*") if p.suffix.lower() in SUFFIX_TO_FORMAT and p.is_file()),
+        key=lambda p: p.name,
+    )
+
+
+class _DocMeta(NamedTuple):
+    id: str
+    title: str
+    key: str
+
+
+def _document_meta(file: Path) -> _DocMeta:
+    """取文档元数据：语料生成报告 → 文件名。
+
+    **不硬编码"标题就是文件名"**：语料里的标题与文件名本来就不同
+    （`SP-015.pdf` 的标题是「区域折扣授权额度表」），
+    用文件名当标题会让标题路径悄悄变成一串编号。
+    """
+    report = _CORPUS_ROOT / "corpus_report.json"
+    if report.exists():
+        try:
+            payload = json.loads(report.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+        for item in payload.get("documents") or []:
+            if Path(item["path"]).resolve() == file.resolve():
+                return _DocMeta(
+                    id=item["id"],
+                    title=item["title"],
+                    key=f"{item['logical_key']}@{item['version']}",
+                )
+    return _DocMeta(id=file.stem, title=file.stem, key=f"{file.stem}@v1.0")
+
+
+def _print_chunk_summary(meta: _DocMeta, parsed: ParsedDocument, chunks: list[Chunk]) -> None:
+    status = "有文本层" if parsed.has_text_layer else "**无文本层（扫描件，标记 FAILED）**"
+    print(
+        f"{meta.id:14} {len(chunks):4d} 块｜{parsed.page_count} 页｜{status}"
+        f"｜清洗 {len(parsed.dropped)} 项"
+    )
+    if chunks:
+        sizes = sorted(len(c.text) for c in chunks)
+        print(
+            f"{'':14} 长度 min/中位/max = {sizes[0]}/{sizes[len(sizes) // 2]}/{sizes[-1]}"
+            f"｜表格块 {sum(1 for c in chunks if c.is_table)}"
+        )
+
+
+def _print_chunks(
+    meta: _DocMeta, parsed: ParsedDocument, chunks: list[Chunk], args: argparse.Namespace
+) -> int:
+    """打印单篇的分块明细。返回失败计数（供退出码）。"""
+    kinds: dict[str, int] = {}
+    for block in parsed.blocks:
+        kinds[block.kind] = kinds.get(block.kind, 0) + 1
+    print(f"文档：{meta.id}  标题：{meta.title}")
+    print(f"      键 {meta.key}")
+    print(f"解析：{parsed.page_count} 页｜块 " + " / ".join(f"{k} {v}" for k, v in kinds.items()))
+    if not parsed.has_text_layer:
+        print("⚠ 无文本层（图片型扫描件）。切片内不做 OCR，入库应标记 FAILED 并写明原因。")
+        return 0
+    if parsed.dropped:
+        # **清洗结果必须显示**：清洗是"正确时无声、错误时也无声"的操作，
+        # 多丢一行不会有任何症状，直到某天有人问"制度里明明写了"
+        print(f"清洗丢弃 {len(parsed.dropped)} 项：")
+        for item in parsed.dropped:
+            print(f"  - {item}")
+    print()
+
+    shown = [c for c in chunks if _keep_chunk(c, args)]
+    if args.limit:
+        shown = shown[: args.limit]
+    for order, chunk in enumerate(shown, start=1):
+        page = f"p{chunk.page_no}" if chunk.page_no else "—"
+        tag = "表" if chunk.is_table else "文"
+        print(f"[{order}] {chunk.chunk_id} {page} {tag} {len(chunk.text)}字")
+        print(f"    路径 {' > '.join(chunk.section_path)}")
+        for line in chunk.text.splitlines():
+            print(f"    {line}")
+        print()
+    print(
+        f"分块 {len(chunks)} 块" + (f"（显示 {len(shown)}）" if len(shown) != len(chunks) else "")
+    )
+    print()
+    return 0
+
+
+def _keep_chunk(chunk: Chunk, args: argparse.Namespace) -> bool:
+    if args.table_only:
+        return chunk.is_table
+    if args.text_only:
+        return not chunk.is_table
+    return True
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -323,10 +467,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="不加载业务词典：用于判断某个术语是不是靠词典才切对的",
     )
     tokenize.set_defaults(no_dict=False)
+    chunk = sub.add_parser("chunk", help="解析 + 分块，逐条核对结果（详细设计 11.3）")
+    chunk.add_argument("path", nargs="?", default="", help="文件或目录，如 data/corpus/SP-015.pdf")
+    chunk.add_argument("--summary", action="store_true", help="只打每篇的汇总，不打明细")
+    chunk.add_argument(
+        "--limit", type=int, default=0, metavar="N", help="每篇最多显示 N 块，0 为全部"
+    )
+    group = chunk.add_mutually_exclusive_group()
+    group.add_argument("--table-only", action="store_true", help="只看表格块")
+    group.add_argument("--text-only", action="store_true", help="只看正文块")
+    chunk.set_defaults(summary=False, limit=0, table_only=False, text_only=False)
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
         parser.error('tokenize 需要一段文本，例如：tokenize "华东区域渠道折扣政策"')
+
+    if args.command == "chunk" and not args.path:
+        parser.error("chunk 需要一个文件或目录，例如：chunk data/corpus/SP-015.pdf")
 
     if args.command == "sql" and not args.question and not args.sql:
         # 两个入口都没有时**必须报错**，不能让 `make sql` 空跑一次模型。
@@ -344,6 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "model-smoke": _model_smoke,
         "sql": _sql,
         "tokenize": _tokenize,
+        "chunk": _chunk,
     }
     # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。

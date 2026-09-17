@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | 🔄 进行中（6/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链。**未完成**：③后半（`rag_vocab` 的 DB 仓储与词表构建）、⑥`chunker.py`、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
+| 5 RAG | 🔄 进行中（7/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 1887 块，页眉页脚零泄漏、跨页表格表头还原）。**未完成**：③后半（`rag_vocab` 的 DB 仓储与词表构建）、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
 | 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -101,6 +101,18 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     写错不是文档问题，是**模型会照着错**——净销售额那条 note 原先写「含税口径差 1–2%」，
     按字面取含税实测差 18.7%，而真正落在 1–2% 的是「含税 − 折扣、未扣退货」。
     改 `note` 与改白名单一样要升 `version`。
+15. **分块参数（`RAG__CHUNK_*`）在演示语料上当前不构成约束**。语料每篇正文仅 ~830 字、
+    被 5–8 个标题切碎，**分块的实际边界由标题决定**：正文块落在 35–881 字（中位 85），
+    真正影响粒度的是"要不要让块跨标题合并"，而不是那三个数字。
+    11.3 要求这些值经评测集校准，校准排在 ⑫Recall@8——
+    **在那之前不要调它们**：调了不会改变任何结果，只会让配置和口径各说各话。
+16. **`app/tools/rag/parser.py` 是开发流程没点名的模块**。6.7 只列了 `chunker.py`
+    与 `ingestion.py`，但 11.2 要求四种格式各自的解析策略、11.3 的清洗规则
+    又必须跨块/跨页工作（页眉靠"跨页重复"认），都塞进 `ingestion.py` 会让那个文件
+    同时承担文件校验、解析、清洗、分块、向量化、发布六件事。
+    按职责拆开，行为与 11.1 的流程顺序一致（Parse → Normalize → Chunk）。
+    **清洗掉的内容一律进 `ParsedDocument.dropped` 并在 `make chunk` 里显示**——
+    清洗是"正确时无声、错误时也无声"的操作，多丢一行不会有任何症状。
 
 ### 【后续扩展】登记
 
@@ -229,7 +241,14 @@ RAG 分词（Phase 5 进行中，**这是本阶段使用频率最高的调试命
 make tokenize T="华东区域渠道折扣政策"        # → 华东 / 区域 / 渠道折扣 / 政策
 make tokenize T="华东区域渠道折扣政策" NO_DICT=1  # 对照：不加载业务词典会切碎
 make dict        # 生成业务词典（前置 make up + 业务库已灌数；产物入版本库）
+make chunk P=data/corpus/SP-015.pdf          # 解析 + 分块，逐条核对
+make chunk P=data/corpus SUMMARY=1           # 全语料只打汇总
+make chunk P=data/corpus/SP-015.pdf TABLES_ONLY=1  # 只看表格块
 ```
+
+`make chunk` 会打印**解析阶段清洗掉了什么**（页眉页脚、修订记录）。
+清洗是唯一一类"正确时无声、错误时也无声"的操作——多丢一行不会有任何症状，
+直到某天有人问"制度里明明写了"。
 
 `make tokenize` 同时打印**被丢弃的 token**——「分词切错了」与「切对了但被过滤规则
 丢了」是两种故障，只看得见保留结果时它们长得一样。

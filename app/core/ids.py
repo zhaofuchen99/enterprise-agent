@@ -46,6 +46,10 @@ class IdPrefix(StrEnum):
     #: 前缀相同的话一眼看不出谁指谁（详见 `SqlToolResult.evidence`）。
     TOOL_CALL = "tcl"
     EVIDENCE = "evd"
+    #: 知识库分块（Phase 5）。它**不是任何一张表的主键**——chunk 存在向量库里，
+    #: 这个 ID 是 row 与 point 之间唯一的对应关系（11.5 的 `point_id` 由它派生）。
+    #: 沿用同一套 26 位格式，是为了让容器里的 id 在日志里长得一样、对得上。
+    CHUNK = "chk"
 
     # 业务演示库的维度表（Phase 2 的 `scripts/business_seed.py`）。
     # 它们属于「企业已有数据」，本可以自定编号方案；沿用同一套前缀 + 26 位
@@ -80,13 +84,19 @@ def new_id(prefix: IdPrefix) -> str:
 def deterministic_id(prefix: IdPrefix, seed: str) -> str:
     """由种子确定性派生 ID，格式与长度同 `new_id`。
 
-    **只给演示夹具用**。真实实体的 ID 必须随机——可预测的主键意味着
+    **默认只给演示夹具用**。真实实体的 ID 必须随机——可预测的主键意味着
     别人能枚举出你的任务、会话，`new_id` 的 60 位随机部分正是为此存在的。
 
     之所以需要它：开发流程 6.3 的多实例验收要求两个 API 实例看到**同一个用户**，
     而两个进程各自播种演示账号时若拿到不同的随机 ID，令牌互不认、限流计数
     也各算各的，那条验收命令从根上跑不起来。演示账号是夹具不是实体，
     固定下来才是它该有的样子。Phase 2 接入 MySQL 后真实用户走 `new_id`。
+
+    **另一个正当用法是"确定性本身就是需求"**，目前只有 `IdPrefix.CHUNK`：
+    11.5 的入库幂等依赖「同一份 chunk 每次派生同一个 ID」，
+    否则重复入库会造出第二条记录，而不是覆盖第一条（见 `rag/chunker.py`）。
+    判据是**这个 ID 会不会被当成凭据**：chunk_id 只用来寻址内容，不授予任何权限；
+    一旦有哪个确定性 ID 变成了访问入口，它就不再属于这里。
     """
     digest = hashlib.sha256(f"{prefix.value}:{seed}".encode()).digest()
     body = _encode(int.from_bytes(digest[:12], "big"), _TIMESTAMP_CHARS + _RANDOM_CHARS)
