@@ -23,7 +23,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5–9 冲刺切片 | ⬜ 未开始 | 第 2 批：RAG 裁剪版 → 最小 Graph → Evidence → Reviewer-lite |
+| 5 RAG | 🔄 进行中（5/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（jieba 业务词典 + `Vocabulary`）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链。**未完成**：③后半（`rag_vocab` 的 DB 仓储、`make tokenize`）、⑥`chunker.py`、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
+| 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -69,6 +70,29 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 9. **SQL 自修复的预算在 `LOOP__MAX_SQL_REPAIRS`**（不是 `SQL_TOOL__*`）：它属于
    5.4 那四类「相互独立、不可借用」的循环预算，与 `max_replans` 放在一起看。
 
+### Phase 5 期间新立的临时约定
+
+10. **语料由 `make corpus` 现生成，产物不入库**（`data/` 已 gitignore）。进版本库的是
+    清单 `configs/corpus_manifest.yaml`（规格）+ `scripts/gen_corpus.py`（怎么生成）
+    + `configs/corpus_handwritten/`（**手工**的 Prompt Injection 样本）。
+    于是「语料是什么」与「语料怎么来的」都可复审，产物随时可重建。
+    **改清单 = 换语料 = 所有阈值与评测结论失效**，因此改清单必须同时升 `version`，
+    并重跑 Recall@8 校准与 `verify-corpus`。
+    ⚠️ **语料冻结前必须先跑 `make seed-business`**：语料的数字是现查业务库的，
+    业务库重灌后语料必须跟着重生成，否则报告数字与库会对不上。
+11. **清单里的 `defects:` 标注不是证据，产物才是**。生成器在写完后**回读产物自检**
+    （跨页表格的表头是否真的重复、扫描件是否真的无文本层、注入特征串是否真的在正文里），
+    未生效直接非零退出。这条是踩坑换来的：第一版三份「跨页表格」标记齐全、
+    一张都没跨页——`force_split` 只是把表挪到新页开头，**实测本版式下需 ≥35 行**
+    才撑破一页。**新增缺陷注入时必须同步加自检**，否则它会以「已注入」的名义静默失效。
+12. **`source_kind`（INTERNAL / EXTERNAL）必须由入库侧显式指定**，不要依赖列的
+    `server_default='INTERNAL'`——那是给存量行的安全兜底。把外部材料误标成 INTERNAL，
+    会让 SOURCE 冲突判定静默失效（FR-SEARCH-001 的业务规则就是靠它成立的）。
+13. **`schema_catalog.yaml` 里的 `note` 会渲染进 prompt**（`app/tools/sql/schemas.py`）。
+    写错不是文档问题，是**模型会照着错**——净销售额那条 note 原先写「含税口径差 1–2%」，
+    按字面取含税实测差 18.7%，而真正落在 1–2% 的是「含税 − 折扣、未扣退货」。
+    改 `note` 与改白名单一样要升 `version`。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -95,7 +119,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 项 | 备注 |
 |---|---|
 | **Reranker**（选型 + 阈值校准） | 依据详设 TBC-04 后置。实现 `reranker.py` 与 `RERANKER_ENABLED` 接缝，默认关闭走 RRF Top-K |
-| ~~语料扩到 80+ 篇 + 缺陷注入全套（10 类）~~ | **已移回 Phase 5**（§4.2 撤销裁剪）。**阈值必须基于该语料校准**，不得沿用任何小语料取值 |
+| ~~语料扩到 80+ 篇 + 缺陷注入全套（10 类）~~ | **已完成**（2026-09-17）：88 篇、10 类缺陷注入全部回读产物验证。剩余的「阈值必须基于该语料校准」属 ⑧`retriever.py` / ⑫Recall@8，**不得沿用任何小语料取值** |
 | ~~文档版本发布流程（staging → smoke test → publish）~~ | **已移回 Phase 5**。staging 载体是 payload 状态位，不是 partition |
 | 知识管理接口 FR-ADM-001、扫描件 OCR、跨页表格还原 | 入库走脚本不做后台；扫描件 PDF 在语料中保留但**明确标记不支持** |
 | ~~词表扩容机制（`token_id` 只增不改的运维面）~~ | **已移回 Phase 5**。需验证"扩容后历史 chunk 无需重算仍可召回" |
