@@ -12,6 +12,7 @@ from pathlib import Path
 import jieba
 import pytest
 
+from app.core.config import Settings
 from app.tools.rag.tokenizer import (
     SNAPSHOT_FORMAT_VERSION,
     Tokenizer,
@@ -21,6 +22,7 @@ from app.tools.rag.tokenizer import (
     normalize,
     normalize_numbers,
 )
+from scripts.gen_dict import Terms, build_dict_text, load_handwritten_terms
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +174,114 @@ def test_punctuation_and_single_chars_are_dropped() -> None:
 
     assert all(any(ch.isalnum() for ch in t) for t in tokens)
     assert all(len(t) > 1 for t in tokens)
+
+
+def test_cut_explained_separates_dropped_tokens() -> None:
+    """`cut` 把两种故障抹成同一个空结果，`cut_explained` 把它们分开。
+
+    某个词检索不到时，「分词切错了」与「切对了但被过滤规则丢了」
+    排查方向完全不同。`make tokenize` 靠这条区分显示丢弃项。
+    """
+    kept, dropped = Tokenizer().cut_explained("华东、区域（含税）")
+
+    assert "华东" in kept and "含税" in kept
+    # 丢弃项是**归一化之后**的形态：全角「、」「）」先被折成半角，再因不含字母数字被丢。
+    # 断言写成半角，是因为用户看到的调试输出就是这个形态——
+    # 若这里能断言出全角，说明归一化那一步没跑到。
+    assert "," in dropped and ")" in dropped
+
+
+# ------------------------------------------------ 业务词典产物（详设 11.6.2）
+
+#: 设计文档与 `tokenizer.py` 反复引用的那个例子（「渠道折扣」必须是一个 token）。
+_DESIGN_EXAMPLE = "华东区域渠道折扣政策"
+
+
+def test_business_dict_artifact_is_present_and_effective(settings: Settings) -> None:
+    """**断言的对象是仓库里那份产物文件**，不是"生成脚本能跑通"。
+
+    这条用例是一次真实事故的回归：`configs/rag_user_dict.txt` 曾经是 0 字节，
+    而 `Tokenizer` 对缺失的词典**静默退化**——不抛异常、旧版本连日志都没有，
+    表现只是"某些查询召回不到东西"。测试全绿、`make sql` 正常，
+    检索却在悄悄变差。生成脚本当时根本不存在，所以"脚本跑通"这种断言也写不出来。
+    """
+    path = Path(settings.rag.user_dict_path)
+    assert path.exists(), f"业务词典产物缺失：{path}（执行 make dict 生成）"
+    assert path.stat().st_size > 0, f"业务词典产物为空：{path}"
+
+    tokens = Tokenizer(user_dict_path=str(path)).cut(_DESIGN_EXAMPLE)
+    assert "渠道折扣" in tokens, f"设计文档要求的复合术语未生效：{tokens}"
+
+
+def test_default_tokenizer_loads_the_committed_dict(settings: Settings) -> None:
+    """装配点（`from_settings`）读到的就是那份产物。
+
+    上面那条用例手工传了路径；这条走真实配置路径，
+    防的是"产物在、但配置指向别处"——那种情况下文件检查全过，运行时仍然是通用分词。
+    """
+    tokens = Tokenizer.from_settings(settings).cut(_DESIGN_EXAMPLE)
+
+    assert "渠道折扣" in tokens
+
+
+def test_business_dict_has_no_comment_or_blank_lines(settings: Settings) -> None:
+    """产物里不能有注释行与空行——**jieba 会把注释整行当成词条**。
+
+    实测：`jieba.load_userdict` 对不匹配词频/词性后缀的行，
+    会用 `.+?` 把整行吃下来 `add_word`。`# 来源：...` 那一行的
+    `jieba.get_FREQ()` 返回 1，它真的成了一个词。
+    于是"在文件头写清来源"这个看起来完全无害的动作，往词典里塞了垃圾。
+    出处写在 `scripts/gen_dict.py` 与 `configs/rag_terms.txt` 的注释里，不写在产物里。
+    """
+    lines = _dict_lines(settings)
+
+    assert lines, "产物不应为空"
+    assert all(line.strip() for line in lines), "产物不应有空行"
+    assert not [line for line in lines if line.lstrip().startswith("#")], "产物不应有注释行"
+
+
+def test_business_dict_entries_are_in_canonical_form(settings: Settings) -> None:
+    """产物里的每个词条都必须等于它自己的归一化形态。
+
+    查询与入库两侧都是先 `normalize_numbers(normalize(text))` 再分词，
+    所以词典存 `KA` 而文本归一成 `ka` 时，加载成功、日志无异常、**一条也召回不到**。
+    手改产物文件（补一个全角或大写词）就会踩到这个坑，这条用例把它挡住。
+    """
+    non_canonical = [w for w in _dict_lines(settings) if normalize_numbers(normalize(w)) != w]
+
+    assert not non_canonical, f"词条未按归一化形态存储：{non_canonical}"
+
+
+def _dict_lines(settings: Settings) -> list[str]:
+    return Path(settings.rag.user_dict_path).read_text(encoding="utf-8").splitlines()
+
+
+def test_generator_dedupes_sources_and_canonicalizes() -> None:
+    """生成器：跨来源去重，且词条按归一化形态写出。
+
+    「净销售额」同时是指标名（自动来源）与手工表的常见写法，
+    抄重了只会让产物里出现两行同样的词——jieba 不报错，产物也看不出问题。
+    """
+    terms = Terms(
+        regions=["华东", "华东"],
+        metrics=["净销售额"],
+        handwritten=["KA", "净销售额"],
+    )
+    text, duplicates = build_dict_text(terms)
+
+    # 顺序 = 自动来源（区域 → 指标）在前，手工表在后
+    assert text.splitlines() == ["华东", "净销售额", "ka"]
+    # 重复项要被点名（`华东` 在来源里出现两次，`净销售额` 跨来源重复）——
+    # 报告里看不见重复，手工表抄重了就没有任何反馈
+    assert duplicates == ["华东", "净销售额"]
+
+
+def test_handwritten_terms_skip_comments_and_blanks(tmp_path: Path) -> None:
+    """手工术语表是**给人看的输入**，因此可以带注释——注释不得进产物流水线。"""
+    path = tmp_path / "terms.txt"
+    path.write_text("# 分组说明\n\n渠道折扣\n  清仓折扣  \n渠道折扣\n", encoding="utf-8")
+
+    assert load_handwritten_terms(path) == ["渠道折扣", "清仓折扣"]
 
 
 # ------------------------------------------------------------------ 词表

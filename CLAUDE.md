@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | 🔄 进行中（5/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（jieba 业务词典 + `Vocabulary`）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链。**未完成**：③后半（`rag_vocab` 的 DB 仓储、`make tokenize`）、⑥`chunker.py`、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
+| 5 RAG | 🔄 进行中（6/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链。**未完成**：③后半（`rag_vocab` 的 DB 仓储与词表构建）、⑥`chunker.py`、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
 | 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -88,7 +88,16 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 12. **`source_kind`（INTERNAL / EXTERNAL）必须由入库侧显式指定**，不要依赖列的
     `server_default='INTERNAL'`——那是给存量行的安全兜底。把外部材料误标成 INTERNAL，
     会让 SOURCE 冲突判定静默失效（FR-SEARCH-001 的业务规则就是靠它成立的）。
-13. **`schema_catalog.yaml` 里的 `note` 会渲染进 prompt**（`app/tools/sql/schemas.py`）。
+13. **业务词典是"输入 + 产物"两个文件，产物入库**：`configs/rag_terms.txt`（手工复合词，
+    可带注释）→ `make dict` → `configs/rag_user_dict.txt`（产物，**无注释、无词频**）。
+    与语料（`data/` 已 gitignore）的取舍**故意相反**：词典是**检索契约**的一部分，
+    查询侧与入库侧必须切得一样；缺了它 `Tokenizer` 只退化并打一条 warning，
+    而已入库 chunk 是用带词典的分词建的 —— 症状是"某些查询永远召回不到"，
+    且不指向词典。语料可以随时重建，词典不一致则无法从表面察觉。
+    **产物里不能写注释**：jieba 的 `load_userdict` 会把匹配不上词频/词性后缀的
+    整行当成词条加进去（实测 `get_FREQ` 返回 1）。出处写在本文件与 `rag_terms.txt` 里。
+    改词典 = 改切分 = 必须重跑检索回归集（详设 11.6.2）。
+14. **`schema_catalog.yaml` 里的 `note` 会渲染进 prompt**（`app/tools/sql/schemas.py`）。
     写错不是文档问题，是**模型会照着错**——净销售额那条 note 原先写「含税口径差 1–2%」，
     按字面取含税实测差 18.7%，而真正落在 1–2% 的是「含税 − 折扣、未扣退货」。
     改 `note` 与改白名单一样要升 `version`。
@@ -213,6 +222,17 @@ make eval-sql    # 金标评测（10 题），同时打印「内容正确率」�
 > 危险 SQL 的演示**必须走 `--sql`**：模型在正常对话下不会写出 `DROP TABLE`，
 > 这本身是第一层防线在工作。要证明「代码层拦得住」，就得绕过模型直接喂一条
 > 危险 SQL 进同一个校验器——否则演示出来的只是「模型很乖」。
+
+RAG 分词（Phase 5 进行中，**这是本阶段使用频率最高的调试命令**）：
+
+```bash
+make tokenize T="华东区域渠道折扣政策"        # → 华东 / 区域 / 渠道折扣 / 政策
+make tokenize T="华东区域渠道折扣政策" NO_DICT=1  # 对照：不加载业务词典会切碎
+make dict        # 生成业务词典（前置 make up + 业务库已灌数；产物入版本库）
+```
+
+`make tokenize` 同时打印**被丢弃的 token**——「分词切错了」与「切对了但被过滤规则
+丢了」是两种故障，只看得见保留结果时它们长得一样。
 
 单独跑：`make lint` / `make typecheck` / `make layering` / `make test` / `make fmt`
 

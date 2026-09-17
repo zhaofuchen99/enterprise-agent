@@ -14,7 +14,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
+from pathlib import Path
 from typing import Any
 
 from app.agent.prompts import SMOKE_PROMPT
@@ -25,8 +26,13 @@ from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_CLI, setup_logging
 from app.infrastructure.model_gateway import EmbeddingDimensionError, build_model_gateway
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
+from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
+
+#: 子命令处理器的返回值：同步的直接给退出码，异步的给协程（分发处统一 await）。
+#: 两者都是合法的，见 `main` 的分发说明。
+HandlerResult = int | Coroutine[Any, Any, int]
 
 
 async def _seed(settings: Settings, args: argparse.Namespace) -> int:
@@ -203,6 +209,63 @@ async def _sql(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _tokenize(settings: Settings, args: argparse.Namespace) -> int:
+    """逐条核对切分结果（开发流程 6.7 施工项 3）。
+
+    **这是 Phase 5 使用频率最高的调试命令**（见详设 11.6.2）：检索召回不到东西时，
+    第一个要回答的问题是「这句话到底被切成了什么」。
+
+    因此它不只打印保留的 token，还打印两件别的命令看不到的事：
+
+    1. **被丢弃的 token**——「切错了」与「切对了但被过滤规则丢了」是两种故障，
+       只看得见保留结果时它们长得一样；
+    2. **`--no-dict` 的对照**——不加载业务词典再切一遍。词典有没有生效、
+       某条术语是不是词典覆盖不到，只有对照着看才判得出来。
+       这也是词典产物（`configs/rag_user_dict.txt`）唯一的现场验证手段。
+
+    稀疏向量**不在这里打印**：它需要一份已构建的词表（`rag_vocab`），
+    而词表要在语料分块之后才能建。词表就位后这条命令会补上向量输出。
+    """
+    stopwords = load_stopwords(settings.rag.stopword_path)
+    tokenizer = Tokenizer(
+        user_dict_path=None if args.no_dict else settings.rag.user_dict_path,
+        stopwords=stopwords,
+    )
+    text: str = args.text
+    normalized = normalize(text)
+    numbered = normalize_numbers(normalized)
+
+    print(f"原文      ：{text}")
+    if normalized != text:
+        print(f"归一化    ：{normalized}")
+    if numbered != normalized:
+        print(f"数字/日期 ：{numbered}")
+
+    kept, dropped = tokenizer.cut_explained(text)
+    print(f"分词      ：{' / '.join(kept) if kept else '（空）'}")
+    if dropped:
+        # 单字与纯标点也在这里：它们是稀疏维度的主要消耗者，
+        # 出现在这里说明"被主动丢掉了"，而不是"分词切不出来"
+        shown = " ".join(repr(t) for t in dropped)
+        print(f"丢弃      ：{shown}")
+
+    if not args.no_dict:
+        if not Path(settings.rag.user_dict_path).exists():
+            print(
+                f"\n⚠ 业务词典 {settings.rag.user_dict_path} 不存在，以上结果来自通用分词。"
+                "\n  生成：make dict（需 make up + make seed-business 已执行）"
+            )
+        else:
+            baseline = Tokenizer(user_dict_path=None, stopwords=stopwords)
+            base_kept, _ = baseline.cut_explained(text)
+            if base_kept != kept:
+                print(
+                    f"\n对照（不加载业务词典）：{' / '.join(base_kept) if base_kept else '（空）'}"
+                )
+                print("  ↑ 两者不同即说明业务词典在本句上起了作用")
+    return 0
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -247,7 +310,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="模拟数据权限范围（可重复）。不传即全量，对应 admin 账号",
     )
     sql.set_defaults(region=[])
+    tokenize = sub.add_parser("tokenize", help="逐条核对中文分词结果（Phase 5 调试命令）")
+    tokenize.add_argument(
+        "text",
+        nargs="?",
+        default="",
+        help="待切分的文本，如「华东区域渠道折扣政策」",
+    )
+    tokenize.add_argument(
+        "--no-dict",
+        action="store_true",
+        help="不加载业务词典：用于判断某个术语是不是靠词典才切对的",
+    )
+    tokenize.set_defaults(no_dict=False)
     args = parser.parse_args(argv)
+
+    if args.command == "tokenize" and not args.text:
+        parser.error('tokenize 需要一段文本，例如：tokenize "华东区域渠道折扣政策"')
 
     if args.command == "sql" and not args.question and not args.sql:
         # 两个入口都没有时**必须报错**，不能让 `make sql` 空跑一次模型。
@@ -259,15 +338,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = get_settings()
     setup_logging(SERVICE_CLI, settings.log_level)
 
-    handlers = {
+    handlers: dict[str, Callable[[Settings, argparse.Namespace], HandlerResult]] = {
         "seed": _seed,
         "cleanup": _cleanup,
         "model-smoke": _model_smoke,
         "sql": _sql,
+        "tokenize": _tokenize,
     }
-    # 所有子命令都收 (settings, args)：让签名统一，代价只是三个用不到 args 的
+    # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。
-    return asyncio.run(handlers[args.command](settings, args))
+    #
+    # 分发容忍同步实现：`tokenize` 是纯计算，给它套一层 `async def` 只会让读的人
+    # 去找它究竟在等什么。**参数与返回值约定仍然统一**，差别只在要不要 await。
+    outcome = handlers[args.command](settings, args)
+    if isinstance(outcome, Coroutine):
+        # 显式标注而不是直接 return：`asyncio.run` 的返回类型是 Any，
+        # 直接 return 会让 mypy 的这个检查点在整条链路上失效
+        code: int = asyncio.run(outcome)
+        return code
+    return outcome
 
 
 if __name__ == "__main__":

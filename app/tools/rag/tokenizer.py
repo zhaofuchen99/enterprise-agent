@@ -35,6 +35,7 @@ token 从哪来、id 怎么分配、权重怎么算，全是本系统的责任�
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import unicodedata
@@ -46,6 +47,8 @@ from typing import Any, ClassVar
 import jieba
 
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 #: 词表快照的格式版本。**改格式必须升它**：快照是冻结产物，
 #: 老快照配上新代码却按新格式解析，会得到一份"能跑但 id 全错"的词表。
@@ -252,15 +255,39 @@ class Tokenizer:
         # 应该退化成通用分词并继续，而不是让整个 Worker 起不来。
         # 但"没加载到"这件事必须能从日志看出来，否则检索变差没人能定位。
         if not Path(resolved).exists():
+            # 这条 warning 不是装饰。词典缺失的表现是：**查询侧切分与入库侧不一致**
+            # （已入库的 chunk 是用带词典的分词建的），结果是某些词永远召回不到，
+            # 而两边的代码看起来都对、没有任何异常。没有这行日志，
+            # 排查会从向量库一路试到 embedding 模型，最后才想到是少了个文件。
+            logger.warning(
+                "业务词典不存在，退化为通用分词：%s。检索精度会下降且难以察觉，"
+                "请执行 make dict 生成（需业务库已灌数）",
+                resolved,
+            )
             return
         jieba.load_userdict(resolved)
         cls._loaded_paths.add(resolved)
+        logger.info("已加载业务词典：%s", resolved)
 
     def cut(self, text: str) -> list[str]:
         """切分成 token 序列（不含停用词与纯标点）。"""
+        kept, _ = self.cut_explained(text)
+        return kept
+
+    def cut_explained(self, text: str) -> tuple[list[str], list[str]]:
+        """切分并说明**丢弃了什么**，返回 (保留, 丢弃)。
+
+        这条公开路径存在的理由是排查方向：某个词检索不到时，「分词把它切错了」
+        与「分词切对了但被过滤规则丢了」是两种完全不同的故障，
+        而 `cut()` 把两者抹成同一个结果——只看到一个空列表。
+        `make tokenize` 靠它把这两类原因分开显示。
+        """
         normalized = normalize_numbers(normalize(text))
-        tokens = jieba.lcut(normalized)
-        return [t for t in tokens if self._keep(t)]
+        kept: list[str] = []
+        dropped: list[str] = []
+        for token in jieba.lcut(normalized):
+            (kept if self._keep(token) else dropped).append(token)
+        return kept, dropped
 
     def _keep(self, token: str) -> bool:
         token = token.strip()

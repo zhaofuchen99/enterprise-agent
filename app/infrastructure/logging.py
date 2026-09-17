@@ -108,7 +108,14 @@ class JsonFormatter(logging.Formatter):
 MANAGED_LOGGERS: tuple[str, ...] = ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
 
 #: 只降噪，不接管的第三方 logger。注意不含 uvicorn.access——访问日志要保留。
-NOISY_LOGGERS: tuple[str, ...] = ("httpx", "httpcore", "urllib3", "asyncio", "multipart")
+#:
+#: `jieba` 在这里的原因值得单独说：它**把自己的 logger 显式设成 DEBUG 并挂了一个
+#: stderr handler**（`jieba/__init__.py` 的模块级 `default_logger.setLevel(DEBUG)`）。
+#: 后果是进程启动时的三行加载信息会**各打两遍**——一遍裸文本走它的 stderr handler，
+#: 一遍 JSON 走我们的 handler（root 的 level 对传播上来的记录不再生效，
+#: 日志级别的判定发生在产生记录的那个 logger 上）。
+#: 因此这一类 logger 光调 level 不够，**还必须摘掉它自带的 handler**。
+NOISY_LOGGERS: tuple[str, ...] = ("httpx", "httpcore", "urllib3", "asyncio", "multipart", "jieba")
 
 
 def setup_logging(service: str, level: str = "INFO") -> None:
@@ -127,4 +134,6 @@ def setup_logging(service: str, level: str = "INFO") -> None:
         managed.propagate = True
 
     for name in NOISY_LOGGERS:
-        logging.getLogger(name).setLevel(max(logging.WARNING, root.level))
+        noisy = logging.getLogger(name)
+        noisy.handlers.clear()
+        noisy.setLevel(max(logging.WARNING, root.level))

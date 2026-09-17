@@ -6,6 +6,7 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 .PHONY: help bootstrap up down ps logs redis-cli api worker run fmt lint typecheck \
         test test-integration layering check clean
 .PHONY: migrate revision seed seed-business verify-business cleanup corpus corpus-list
+.PHONY: dict tokenize
 .PHONY: model-smoke sql eval-sql vector-spike
 
 help:  ## 显示所有可用目标
@@ -107,6 +108,14 @@ corpus:  ## 生成演示语料（88 篇，含 10 类缺陷注入，前置：make
 
 corpus-list:  ## 只看语料清单与缺陷标注，不生成文件
 	uv run python scripts/gen_corpus.py --list
+
+# ------------------------------------------------------------------ RAG（Phase 5）
+dict:  ## 生成业务分词词典（前置：make up + 业务库已灌数；产物入版本库）
+	uv run python scripts/gen_dict.py
+
+tokenize:  ## 逐条核对中文分词：make tokenize T="华东区域渠道折扣政策" [NO_DICT=1]
+	@test -n "$(T)" || (echo '用法：make tokenize T="华东区域渠道折扣政策"' && exit 1)
+	uv run python -m app.cli tokenize "$(T)" $(if $(NO_DICT),--no-dict,)
 
 cleanup:  ## 按保留期清理过期数据（幂等，供 cron 调用，见详细设计 16.12）
 	uv run python -m app.cli cleanup
