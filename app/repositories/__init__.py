@@ -20,6 +20,7 @@ from app.repositories.conversation_repo import (
 )
 from app.repositories.task_repo import SqlTaskRepository, TaskRepository
 from app.repositories.user_repo import SqlUserRepository, UserRepository
+from app.repositories.vocab_repo import SqlVocabRepository, VocabRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,11 @@ class Repositories:
     users: UserRepository
     conversations: ConversationRepository
     tasks: TaskRepository
+    #: 稀疏检索词表（11.6.3）。它与其他三个的形状不同——**只增不改、没有删除**，
+    #: 且读路径通常走快照而不是这张表（见 `tools/rag/vocabulary.py`）。
+    #: 仍然放在这里，是因为"仓储依赖只有一个入口"这条纪律比形状整齐更重要：
+    #: 另开一条装配路径，就会出现「谁忘了给 worker 装配词表仓储」这类问题。
+    vocab: VocabRepository
 
 
 def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Repositories:
@@ -42,4 +48,5 @@ def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Reposi
         users=SqlUserRepository(sessions),
         conversations=SqlConversationRepository(sessions),
         tasks=SqlTaskRepository(sessions),
+        vocab=SqlVocabRepository(sessions),
     )

@@ -164,6 +164,10 @@ module = [
     # 语料生成侧：reportlab 出 PDF，pypdfium2 把 PDF 栅格化成图片型扫描件。
     "pypdfium2.*",
     "docx.*",
+    # `botocore` 没有 py.typed，而 s3 存储实现要 `except ClientError`
+    # 与读 `exc.response` —— 没有类型信息时 mypy 会直接把这两件事判成错误。
+    # `aioboto3` 本身**不在**名单里：它自带类型，加进来会让它的检查静默失效。
+    "botocore.*",
 ]
 ignore_missing_imports = true
 

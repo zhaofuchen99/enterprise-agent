@@ -26,10 +26,13 @@ from app.core.errors import AgentError
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_CLI, setup_logging
 from app.infrastructure.model_gateway import EmbeddingDimensionError, build_model_gateway
+from app.infrastructure.storage import build_object_storage
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
+from app.repositories.vocab_repo import SqlVocabRepository
 from app.tools.rag.chunker import Chunk, chunk_document
 from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
+from app.tools.rag.vocabulary import build_vocabulary, export_snapshot
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
 
@@ -285,7 +288,7 @@ def _chunk(settings: Settings, args: argparse.Namespace) -> int:
     「这段话出自哪份文件」这个问题在检索侧就没有答案。
     """
     root = Path(args.path)
-    targets = _collect_documents(root, args)
+    targets = _collect_documents(root)
     if not targets:
         print(f"没有可解析的文件：{root}")
         return 1
@@ -307,7 +310,7 @@ def _chunk(settings: Settings, args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
-def _collect_documents(root: Path, args: argparse.Namespace) -> list[Path]:
+def _collect_documents(root: Path) -> list[Path]:
     """收集待处理文件。目录按扩展名过滤并排序——**同一批文件必须每次同序**，
     否则 `chunk_id` 依赖的文档顺序变了，两次运行的输出对不上。"""
     if root.is_file():
@@ -410,6 +413,68 @@ def _keep_chunk(chunk: Chunk, args: argparse.Namespace) -> bool:
     return True
 
 
+async def _vocab(settings: Settings, args: argparse.Namespace) -> int:
+    """构建稀疏检索词表（详细设计 11.6.3 / 11.6.4）。
+
+    **为什么构建是独立的一步**：11.6.4 选了固定 IDF，而 IDF 依赖全库统计，
+    两者要同时成立只有一条路——先把词表冻结，再入库。见
+    `app/tools/rag/vocabulary.py` 的模块说明。
+
+    命令是**幂等**的：`rag_vocab` 只增不改，已发布的 token_id 与 df 原样沿用，
+    重复跑只会把新出现的词接在后面。因此可以放心重跑，
+    也可以在语料扩充后重跑来吸收新词。
+    """
+    engine = create_engine(settings)
+    try:
+        sessions = create_session_factory(engine)
+        repository = SqlVocabRepository(sessions)
+        existing = await repository.load()
+
+        files = _collect_documents(Path(args.path))
+        if not files:
+            print(f"没有可解析的文件：{args.path}")
+            return 1
+
+        tokenizer = Tokenizer.from_settings(settings)
+        texts: list[str] = []
+        for file in files:
+            meta = _document_meta(file)
+            parsed = parse_document(file)
+            chunks = chunk_document(
+                parsed, document_key=meta.key, settings=settings, title=meta.title
+            )
+            texts.extend(chunk.text for chunk in chunks)
+
+        result = build_vocabulary(
+            texts,
+            tokenizer=tokenizer,
+            sparse_dim=settings.rag.sparse_dim,
+            existing=existing,
+        )
+        added = await repository.add(result.added)
+        # **回读落库结果**，而不是相信内存里的那份：`add` 的语义是"已存在的跳过"，
+        # 而"内存里的词表"与"库里真实存在的词表"在并发跑两条 make vocab 时会分叉。
+        # 回读拿到的是下次分配 id 的真正起点。
+        stored = await repository.load()
+        version = await repository.version()
+        key = await export_snapshot(
+            build_object_storage(settings), result.vocabulary, version=version
+        )
+    finally:
+        await engine.dispose()
+
+    print(f"语料：{len(files)} 篇 / {result.total_chunks} 个 chunk（IDF 的分母）")
+    print(f"词表：历史 {len(existing)} 条 → 本次新增 {added} 条 → 合计 {len(result.vocabulary)} 条")
+    if result.added:
+        preview = "、".join(entry.token for entry in result.added[:12])
+        print(f"  新增样例：{preview}{' …' if len(result.added) > 12 else ''}")
+    max_id = max(entry.token_id for entry in stored)
+    print(f"  token_id 上限 {max_id} / 维度 {settings.rag.sparse_dim}")
+    print(f"版本 {version}")
+    print(f"快照 {key}")
+    return 0
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -477,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     group.add_argument("--table-only", action="store_true", help="只看表格块")
     group.add_argument("--text-only", action="store_true", help="只看正文块")
     chunk.set_defaults(summary=False, limit=0, table_only=False, text_only=False)
+    vocab = sub.add_parser("vocab", help="构建稀疏检索词表并导出快照（幂等，只增不改）")
+    vocab.add_argument("path", nargs="?", default="data/corpus", help="语料目录，默认 data/corpus")
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
@@ -502,6 +569,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "sql": _sql,
         "tokenize": _tokenize,
         "chunk": _chunk,
+        "vocab": _vocab,
     }
     # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。

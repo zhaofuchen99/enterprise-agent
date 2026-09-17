@@ -1,8 +1,13 @@
 """对象存储的**契约测试**（开发流程 6.3 验收命令 5）。
 
-参数化的形式是有意的：`s3` 实现按施工项清单留到 Phase 5，
-届时把它加进 `_IMPLEMENTATIONS` 就自动被同一套断言覆盖。
-契约于是是**被执行验证过**的，而不只是被声明过。
+**两个实现跑同一批断言**：`local` 与 `s3`（MinIO）都是 `make_storage` 的参数。
+契约于是是**被执行验证过**的，而不只是被声明过——
+上面那批用例原本就是照"换个实现自动被覆盖"写的，Phase 5 补 s3 时
+一行断言都没改，只有参数表多了一项。
+
+`s3` 那一项打 `integration`（要 MinIO 在跑）。它不能和 local 一起留在
+`make test` 里：契约测试的价值在于每次提交都跑，而把整份文件拖进
+"需要外部组件"的集合，等于让它从日常门禁里消失。
 
 **越界用例是这里最重要的部分**。`key` 来自上传接口的参数、用户可控，
 `../../etc/passwd` 这类 key 拼进路径就能读写到根目录之外——
@@ -18,21 +23,50 @@ from pathlib import Path
 
 import pytest
 
-from app.infrastructure.storage import InvalidObjectKeyError, LocalObjectStorage, ObjectStorage
+from app.core.config import get_settings
+from app.infrastructure.storage import (
+    InvalidObjectKeyError,
+    LocalObjectStorage,
+    ObjectNotFoundError,
+    ObjectStorage,
+    S3ObjectStorage,
+)
+
+#: 契约测试共用的桶。用固定名而不是每次随机建桶：S3 删桶要求先清空，
+#: 为几十条用例各建一个桶再清空，比"共用一个桶、各用各的 key"复杂得多，
+#: 而用例之间本来就是顺序执行、key 也不重叠的。
+_CONTRACT_BUCKET = "agent-knowledge-contract"
 
 
-@pytest.fixture
-def make_storage(tmp_path: Path) -> Callable[[], ObjectStorage]:
-    """参数化入口。Phase 5 补上 s3 实现后，在这里加一个分支即可。
+@pytest.fixture(
+    params=[
+        pytest.param("local", id="local"),
+        pytest.param("s3", id="s3", marks=pytest.mark.integration),
+    ]
+)
+def make_storage(request: pytest.FixtureRequest, tmp_path: Path) -> Callable[[], ObjectStorage]:
+    """参数化入口：返回**构造存储的工厂**而不是存储本身。
 
-    返回的是 `ObjectStorage` 而不是 `LocalObjectStorage`：
+    工厂的形态是为了让用例能造出第二个实例（`test_bytes_are_flushed_to_disk`
+    用另一个实例模拟另一个进程）。返回 `ObjectStorage` 而不是具体类型：
     用例只该依赖协议，依赖具体类型会让「换实现自动被覆盖」这件事失效。
     """
 
-    def _local() -> ObjectStorage:
+    def _build() -> ObjectStorage:
+        if request.param == "s3":
+            settings = get_settings()
+            assert (
+                settings.minio_endpoint and settings.minio_access_key and settings.minio_secret_key
+            )
+            return S3ObjectStorage(
+                endpoint=settings.minio_endpoint,
+                access_key=settings.minio_access_key,
+                secret_key=settings.minio_secret_key,
+                bucket=_CONTRACT_BUCKET,
+            )
         return LocalObjectStorage(tmp_path / "objects")
 
-    return _local
+    return _build
 
 
 @pytest.fixture
@@ -48,7 +82,13 @@ async def test_put_then_get_round_trips(storage: ObjectStorage) -> None:
 
 
 async def test_missing_key_raises_on_get(storage: ObjectStorage) -> None:
-    with pytest.raises(FileNotFoundError):
+    """两个实现必须抛**同一个**异常类型。
+
+    归一成 `ObjectNotFoundError` 之前，local 抛 `FileNotFoundError`、
+    s3 抛 `ClientError`——调用方要写两个 `except`，而漏掉一个的表现是
+    "换存储后端之后，某个兜底分支再也不生效了"，没有任何报错。
+    """
+    with pytest.raises(ObjectNotFoundError):
         await storage.get("docs/不存在.md")
 
 

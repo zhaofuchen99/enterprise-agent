@@ -35,6 +35,7 @@ from app.repositories import Repositories
 from app.repositories.conversation_repo import InMemoryConversationRepository
 from app.repositories.task_repo import InMemoryTaskRepository
 from app.repositories.user_repo import InMemoryUserRepository, seed_demo_users
+from app.repositories.vocab_repo import InMemoryVocabRepository
 from app.tools.sql.schemas import SqlExecutionResult, ValidatedSql
 
 
@@ -301,7 +302,7 @@ class FakeSqlRunner:
 
 
 def build_memory_repositories(settings: Settings) -> Repositories:
-    """三个仓储的内存实现（Pydantic 版）。
+    """四个仓储的内存实现（Pydantic 版）。
 
     与 MySQL 实现受同一份 `Protocol` 约束——仓储契约测试
     （`app/tests/repositories/`）会把同一批断言同时跑在两个实现上，
@@ -311,4 +312,5 @@ def build_memory_repositories(settings: Settings) -> Repositories:
         users=InMemoryUserRepository(seed_demo_users(settings)),
         conversations=InMemoryConversationRepository(),
         tasks=InMemoryTaskRepository(),
+        vocab=InMemoryVocabRepository(),
     )

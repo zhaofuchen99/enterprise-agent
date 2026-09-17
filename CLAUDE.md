@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | 🔄 进行中（7/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 1887 块，页眉页脚零泄漏、跨页表格表头还原）。**未完成**：③后半（`rag_vocab` 的 DB 仓储与词表构建）、⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
+| 5 RAG | 🔄 进行中（8/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 1887 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）。**未完成**：⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
 | 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -113,6 +113,16 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     按职责拆开，行为与 11.1 的流程顺序一致（Parse → Normalize → Chunk）。
     **清洗掉的内容一律进 `ParsedDocument.dropped` 并在 `make chunk` 里显示**——
     清洗是"正确时无声、错误时也无声"的操作，多丢一行不会有任何症状。
+17. **词表的读路径是 `Redis → 对象存储快照`，不读 MySQL**。
+    `rag_vocab` 存的是 `token / token_id / df / created_at`（11.6.3 定义的列），
+    而 IDF 的分母（chunk 总数）**不在其中**；硬从表里推分母只能拿"当前 chunk 数"
+    顶替，而词表冻结后再入库新文档两者必然分叉，查询侧与入库侧的 IDF 就不可比了。
+    于是 MySQL 是**词条账本**，快照 `system/vocab/{version}/vocab.json` 是**读取入口**。
+    快照缺失时报错提示重跑 `make vocab`，**不降级**。
+18. **`df` 的口径是「含该 token 的 chunk 数」，N = chunk 总数**，不是按源文件算。
+    16.8 的列注释写"文档频率"，BM25 里的"文档"指被索引的单元，本项目里是 chunk。
+    两种取法给出不同的 IDF 排序。**`df` 与 `token_id` 一样冻结**（`add` 不改任何列），
+    否则老向量里的权重与它当时的 IDF 对不上，而新旧向量会一起被打分。
 
 ### 【后续扩展】登记
 
@@ -244,6 +254,7 @@ make dict        # 生成业务词典（前置 make up + 业务库已灌数；�
 make chunk P=data/corpus/SP-015.pdf          # 解析 + 分块，逐条核对
 make chunk P=data/corpus SUMMARY=1           # 全语料只打汇总
 make chunk P=data/corpus/SP-015.pdf TABLES_ONLY=1  # 只看表格块
+make vocab       # 构建稀疏检索词表并导出快照（幂等，前置：make corpus）
 ```
 
 `make chunk` 会打印**解析阶段清洗掉了什么**（页眉页脚、修订记录）。
