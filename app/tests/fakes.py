@@ -33,6 +33,7 @@ from app.infrastructure.model_gateway import (
 from app.infrastructure.queue import JobQueue
 from app.repositories import Repositories
 from app.repositories.conversation_repo import InMemoryConversationRepository
+from app.repositories.knowledge_repo import InMemoryKnowledgeDocumentRepository
 from app.repositories.task_repo import InMemoryTaskRepository
 from app.repositories.user_repo import InMemoryUserRepository, seed_demo_users
 from app.repositories.vocab_repo import InMemoryVocabRepository
@@ -223,6 +224,12 @@ class FakeModelGateway:
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         self.embed_calls.append(list(texts))
+        # **`failure` 对 `embed` 同样生效**：它的类注释写的是"每次调用都抛错"，
+        # 而 Phase 5 之前没有任何用例用到向量化，这条分支就一直没被走。
+        # 少了它，"向量化服务不可用"的降级用例会**静默通过**——
+        # 替身老老实实返回占位向量，用例断言的事情一件都没发生。
+        if self.failure is not None:
+            raise _failure_error(self.failure)
         if self.embeddings:
             return list(self.embeddings)
         # 确定性占位向量：**不承载语义**，只保证形状与可复现。
@@ -313,4 +320,5 @@ def build_memory_repositories(settings: Settings) -> Repositories:
         conversations=InMemoryConversationRepository(),
         tasks=InMemoryTaskRepository(),
         vocab=InMemoryVocabRepository(),
+        documents=InMemoryKnowledgeDocumentRepository(),
     )

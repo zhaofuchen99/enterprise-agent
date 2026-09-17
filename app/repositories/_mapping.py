@@ -26,9 +26,11 @@ from datetime import UTC, datetime
 from typing import Any, overload
 
 from app.domain.conversation import Conversation
+from app.domain.knowledge import KnowledgeDocumentRecord
 from app.domain.task import Task
 from app.domain.user import User
 from app.infrastructure.models.identity import AgentConversation, AppUser
+from app.infrastructure.models.knowledge import KnowledgeDocument
 
 
 # --------------------------------------------------------------- 时间
@@ -190,3 +192,66 @@ def conversation_from_row(row: AgentConversation) -> Conversation:
     for name in _CONVERSATION_TIME_FIELDS:
         data[name] = from_db_time(data[name])
     return Conversation.model_validate(data)
+
+
+# --------------------------------------------------------- 知识文档版本
+#: 与 `app/domain/knowledge.py` 的 `KnowledgeDocumentRecord` 逐字段对应。
+#: **`document_type` 对应的列名叫 `type`**（16.8 的列名），这一处对不上是刻意的——
+#: `type` 在 Python 里是内建名，领域模型里用它做字段名会一直踩到遮蔽问题。
+_KNOWLEDGE_FIELDS: tuple[str, ...] = (
+    "id",
+    "logical_key",
+    "version",
+    "title",
+    "department",
+    "storage_path",
+    "checksum",
+    "effective_from",
+    "effective_to",
+    "classification",
+    "status",
+    "parser_version",
+    "embedding_version",
+    "chunk_count",
+    "error_summary",
+    "created_by",
+    # 两个时间戳也在这份清单里：库里是 NOT NULL，写入时必须给值。
+    # 漏掉它们**只在 SQL 实现上炸**（内存实现不看列），
+    # 而报错是 `KeyError: 'created_at'` 落在 `to_db_time` 那一行——
+    # 指出的是"转换时没这个键"，不是"这个字段忘了加进清单"。
+    "created_at",
+    "updated_at",
+)
+
+_KNOWLEDGE_TIME_FIELDS: tuple[str, ...] = ("created_at", "updated_at")
+
+
+def knowledge_to_row_values(record: KnowledgeDocumentRecord) -> dict[str, Any]:
+    """`KnowledgeDocumentRecord` -> `knowledge_document` 的列值。"""
+    values: dict[str, Any] = {name: getattr(record, name) for name in _KNOWLEDGE_FIELDS}
+    values["type"] = record.document_type
+    # `source_kind` 取 `.value`：写库的是字符串，而模型上是枚举。
+    # 直接塞枚举进去会在 SQLAlchemy 那一层被当成长度 16 的字符串处理，
+    # 恰好能存下（StrEnum 就是 str），所以**这个错误不会报错**——
+    # 只有读回来校验时才会发现存进去的是 `SourceKind.INTERNAL` 而不是 `INTERNAL`。
+    values["source_kind"] = record.source_kind.value
+    # 可见角色落 JSON 列。存 `roles_for()` 的结果而不是原始 `allowed_roles`：
+    # 原始值为空时它按密级回退，落库后这一行是**自解释**的——
+    # 事后查"谁能看见它"不必再去读一遍回退规则。
+    values["allowed_roles_json"] = list(record.roles_for())
+    values["status"] = record.status.value
+    for name in _KNOWLEDGE_TIME_FIELDS:
+        values[name] = to_db_time(values[name])
+    return values
+
+
+def knowledge_from_row(row: KnowledgeDocument) -> KnowledgeDocumentRecord:
+    """`knowledge_document` 行 -> `KnowledgeDocumentRecord`。"""
+    data: dict[str, Any] = {name: getattr(row, name) for name in _KNOWLEDGE_FIELDS}
+    data["document_type"] = row.type
+    data["source_kind"] = row.source_kind
+    data["allowed_roles"] = tuple(row.allowed_roles_json or [])
+    data["status"] = row.status
+    for name in _KNOWLEDGE_TIME_FIELDS:
+        data[name] = from_db_time(data[name])
+    return KnowledgeDocumentRecord.model_validate(data)

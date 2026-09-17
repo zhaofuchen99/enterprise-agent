@@ -18,6 +18,10 @@ from app.repositories.conversation_repo import (
     ConversationRepository,
     SqlConversationRepository,
 )
+from app.repositories.knowledge_repo import (
+    KnowledgeDocumentRepository,
+    SqlKnowledgeDocumentRepository,
+)
 from app.repositories.task_repo import SqlTaskRepository, TaskRepository
 from app.repositories.user_repo import SqlUserRepository, UserRepository
 from app.repositories.vocab_repo import SqlVocabRepository, VocabRepository
@@ -33,6 +37,9 @@ class Repositories:
     #: 仍然放在这里，是因为"仓储依赖只有一个入口"这条纪律比形状整齐更重要：
     #: 另开一条装配路径，就会出现「谁忘了给 worker 装配词表仓储」这类问题。
     vocab: VocabRepository
+    #: 知识文档版本（11.9）。与 `vocab` 同理放进同一入口：入库要同时用到两者，
+    #: 分开装配就会出现"词表来自 MySQL、文档来自内存"这种在测试里毫无症状的组合。
+    documents: KnowledgeDocumentRepository
 
 
 def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Repositories:
@@ -49,4 +56,5 @@ def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Reposi
         conversations=SqlConversationRepository(sessions),
         tasks=SqlTaskRepository(sessions),
         vocab=SqlVocabRepository(sessions),
+        documents=SqlKnowledgeDocumentRepository(sessions),
     )

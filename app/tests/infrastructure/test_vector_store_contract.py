@@ -283,6 +283,44 @@ async def test_document_type_filter(store: VectorStore) -> None:
     assert [h.chunk_id for h in hits] == ["chk_0001"]
 
 
+async def test_document_filter_is_version_scoped(store: VectorStore) -> None:
+    """按 `document_id` 过滤必须**按版本**，不能按 `logical_key` 串味。
+
+    同名制度的 v1.0 与 v2.0 共用 `logical_key`，内容却有意不同——
+    这正是 VERSION_PAIR 缺陷注入要测的东西。若这里的 `document_id`
+    退化成 `logical_key`，v1.0 与 v2.0 的 chunk 会互相被召回，
+    而"版本过滤生效"这条断言会在**另一处**（检索侧）才失败。
+    """
+    await store.upsert(
+        [
+            _point(0, dense=[1.0, 0, 0, 0], sparse={1: 1.0}, document_id="policy/ec@v1.0"),
+            _point(1, dense=[1.0, 0, 0, 0], sparse={1: 1.0}, document_id="policy/ec@v2.0"),
+        ]
+    )
+
+    v1 = await store.search_dense(
+        [1.0, 0, 0, 0],
+        limit=9,
+        chunk_filter=ChunkFilter(document_ids=("policy/ec@v1.0",)),
+    )
+
+    assert [h.chunk_id for h in v1] == ["chk_0000"]
+    assert await store.count(ChunkFilter(document_ids=("policy/ec@v1.0",))) == 1
+
+
+async def test_document_filter_sees_staging_before_publish(store: VectorStore) -> None:
+    """入库冒烟要在**发布之前**看到自己刚写的那批（11.1 的 Retrieval Smoke Test）。
+
+    这是唯一一处必须显式覆盖默认 `status=ACTIVE` 的读路径：
+    烟测跑在 `status=PROCESSING` 阶段，用默认过滤条件会一条都查不到，
+    于是"冒烟通过"变成"什么都没测"。
+    """
+    await store.upsert([_point(0, dense=[1.0, 0, 0, 0], sparse={1: 1.0}, status="PROCESSING")])
+
+    assert await store.count(ChunkFilter(document_ids=("doc_a",))) == 0
+    assert await store.count(ChunkFilter(status="PROCESSING", document_ids=("doc_a",))) == 1
+
+
 # ------------------------------------------------------------------ 写入语义
 
 

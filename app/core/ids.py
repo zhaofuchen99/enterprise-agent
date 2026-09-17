@@ -50,6 +50,10 @@ class IdPrefix(StrEnum):
     #: 这个 ID 是 row 与 point 之间唯一的对应关系（11.5 的 `point_id` 由它派生）。
     #: 沿用同一套 26 位格式，是为了让容器里的 id 在日志里长得一样、对得上。
     CHUNK = "chk"
+    #: 知识文档版本（Phase 5 的 `knowledge_document.id`，16.8）。
+    #: 与 `chunk_id` 的分工要分清：chunk 的身份是 `logical_key@version`（确定性派生，
+    #: 重复入库要覆盖同一条），而这一行是**入库这一次动作**的实体，随机生成。
+    DOCUMENT = "doc"
 
     # 业务演示库的维度表（Phase 2 的 `scripts/business_seed.py`）。
     # 它们属于「企业已有数据」，本可以自定编号方案；沿用同一套前缀 + 26 位

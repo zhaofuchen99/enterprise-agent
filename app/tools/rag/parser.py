@@ -62,6 +62,18 @@ from app.core.errors import AgentError, ErrorCode
 #: 「这是表格（要按表头+行序列化）」，再多的类型下游也用不上。
 BlockKind = Literal["HEADING", "PARAGRAPH", "TABLE"]
 
+#: 解析 + 清洗 + 分块这条链的版本，落进 `knowledge_document.parser_version`（16.8）。
+#:
+#: **一个版本号盖三个环节，是有意的**：三者共同决定"同一份文件切出哪些 chunk"，
+#: 而 16.8 只留了一列。分开记的话，改清洗规则而 parser_version 没动，
+#: 库里会显示"还是那一版建的"，于是没人知道该不该重建——
+#: 而那正是这一列存在的唯一理由（11.5：换规则必须全量重建）。
+#: 因此**改动 parser.py 或 chunker.py 里任何影响输出的逻辑，都要升它**。
+#:
+#: 做成字符串而不是 int：它要落 `VARCHAR(32)`，且注释里已经说明了它的复合语义，
+#: 写成 `rag-2` 比写成 `2` 更不容易被误当成"解析器的第 2 版"。
+PARSER_VERSION = "rag-1"
+
 #: 支持的扩展名 → 格式名。**这里是唯一的一份**：文件校验、CLI、测试都读它，
 #: 免得出现「入库放行了 .md 但 CLI 说不认识」这类两处清单不同步的问题。
 SUFFIX_TO_FORMAT: dict[str, str] = {
@@ -767,6 +779,7 @@ def _parse_text(text: str) -> ParsedDocument:
 
 
 __all__ = [
+    "PARSER_VERSION",
     "SUFFIX_TO_FORMAT",
     "Block",
     "BlockKind",

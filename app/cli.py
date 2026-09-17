@@ -16,6 +16,8 @@ import asyncio
 import json
 import sys
 from collections.abc import Callable, Coroutine, Sequence
+from datetime import UTC, date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -23,16 +25,26 @@ from app.agent.prompts import SMOKE_PROMPT
 from app.agent.schemas import SmokeAnswer
 from app.core.config import Settings, get_settings
 from app.core.errors import AgentError
+from app.domain.knowledge import SourceKind
+from app.infrastructure.cache import VersionedCache
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_CLI, setup_logging
 from app.infrastructure.model_gateway import EmbeddingDimensionError, build_model_gateway
+from app.infrastructure.redis import create_client
 from app.infrastructure.storage import build_object_storage
+from app.infrastructure.vector_store import build_vector_store
+from app.repositories.knowledge_repo import SqlKnowledgeDocumentRepository
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
 from app.repositories.vocab_repo import SqlVocabRepository
 from app.tools.rag.chunker import Chunk, chunk_document
+from app.tools.rag.ingestion import (
+    DocumentMetadata,
+    IngestionReport,
+    ingest_document,
+)
 from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
-from app.tools.rag.vocabulary import build_vocabulary, export_snapshot
+from app.tools.rag.vocabulary import build_vocabulary, export_snapshot, load_vocabulary
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
 
@@ -336,20 +348,43 @@ def _document_meta(file: Path) -> _DocMeta:
     （`SP-015.pdf` 的标题是「区域折扣授权额度表」），
     用文件名当标题会让标题路径悄悄变成一串编号。
     """
-    report = _CORPUS_ROOT / "corpus_report.json"
-    if report.exists():
-        try:
-            payload = json.loads(report.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            payload = {}
-        for item in payload.get("documents") or []:
-            if Path(item["path"]).resolve() == file.resolve():
-                return _DocMeta(
-                    id=item["id"],
-                    title=item["title"],
-                    key=f"{item['logical_key']}@{item['version']}",
-                )
+    item = _corpus_entries().get(_resolve(file))
+    if item is not None:
+        return _DocMeta(
+            id=item["id"],
+            title=item["title"],
+            key=f"{item['logical_key']}@{item['version']}",
+        )
     return _DocMeta(id=file.stem, title=file.stem, key=f"{file.stem}@v1.0")
+
+
+@lru_cache(maxsize=1)
+def _corpus_entries() -> dict[str, dict[str, Any]]:
+    """语料生成报告，按**解析后的绝对路径**索引。
+
+    做成缓存而不是每篇文件读一次：`chunk` 的旧写法在 88 篇上要重复解析
+    同一份 JSON 88 次，而 `ingest` 需要的字段更多。缓存后两条命令共用同一份。
+
+    用绝对路径而不是文件名作键：报告里写的是相对路径（`data/corpus/SP-001.pdf`），
+    而调用方给进来的可能是绝对路径或从别处传的相对路径，
+    只按字符串比会静默查不到——查不到的症状是"标题退化成文件名"，
+    然后这个文件名会一路进标题路径、进向量库。
+    """
+    report = _CORPUS_ROOT / "corpus_report.json"
+    if not report.exists():
+        return {}
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return {_resolve(Path(item["path"])): item for item in payload.get("documents") or []}
+
+
+def _resolve(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:  # pragma: no cover - 路径不存在时 resolve 也可能抛
+        return str(path)
 
 
 def _print_chunk_summary(meta: _DocMeta, parsed: ParsedDocument, chunks: list[Chunk]) -> None:
@@ -475,6 +510,209 @@ async def _vocab(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+async def _ingest(settings: Settings, args: argparse.Namespace) -> int:
+    """逐篇入库（详细设计 11.1 的九步 / 11.9 的幂等与发布）。
+
+    **前置条件有两条，缺一条都会在跑到一半才失败**：
+    `make corpus`（文件与元数据都在 `corpus_report.json` 里）与
+    `make vocab`（稀疏向量的 token_id 来自冻结的词表快照）。
+
+    一条命令跑完整个语料而不是逐篇调，是因为入库的失败模式大多是**全局的**
+    （Ollama 没起、词表没建、Qdrant 连不上），逐篇跑会把这些错误重复 88 次。
+    但**单篇失败不中断整批**：语料里本来就有 2 份扫描件注定失败（11.2 明确
+    "标记不支持"），一份失败把整批停下来会让另外 86 篇永远入不了库。
+    """
+    targets = _collect_documents(Path(args.path))
+    if args.only:
+        wanted = {item.strip() for item in args.only.split(",") if item.strip()}
+        targets = [
+            file
+            for file in targets
+            if (_corpus_entries().get(_resolve(file)) or {}).get("id") in wanted
+        ]
+    if not targets:
+        print(f"没有可入库的文件：{args.path}")
+        return 1
+
+    entries = _corpus_entries()
+    engine = create_engine(settings)
+    redis = create_client(settings)
+    storage = build_object_storage(settings)
+    vector_store = build_vector_store(settings)
+    gateway = build_model_gateway(settings)
+    reports: list[IngestionReport] = []
+    failures: list[tuple[str, str]] = []
+    try:
+        sessions = create_session_factory(engine)
+        documents = SqlKnowledgeDocumentRepository(sessions)
+        vocabulary = await load_vocabulary(
+            SqlVocabRepository(sessions),
+            VersionedCache(redis, default_ttl_seconds=settings.rag.vocab_cache_ttl_seconds),
+            storage,
+            ttl_seconds=settings.rag.vocab_cache_ttl_seconds,
+        )
+        tokenizer = Tokenizer.from_settings(settings)
+        # 建 collection 放在循环外：它是幂等的，但每篇一次就是 88 次往返，
+        # 而更重要的是——它**会在维度不匹配时立刻报错**（11.5），
+        # 放在循环外能让这个致命错误在第 1 篇之前就暴露，而不是第 88 篇之后。
+        await vector_store.ensure_collection(dim=settings.embedding_dim)
+
+        print(
+            f"入库 {args.path}：{len(targets)} 篇｜词表 {len(vocabulary)} 词条"
+            f"｜force={bool(args.force)}"
+        )
+        for index, file in enumerate(targets, start=1):
+            item = entries.get(_resolve(file))
+            if item is None:
+                failures.append((file.name, "语料报告里没有这篇的元数据，先跑 make corpus"))
+                print(f"[{index:3d}/{len(targets)}] {file.name:16} 跳过：报告里无元数据")
+                continue
+            try:
+                report = await ingest_document(
+                    file,
+                    _metadata_from_entry(item),
+                    settings=settings,
+                    storage=storage,
+                    vector_store=vector_store,
+                    documents=documents,
+                    gateway=gateway,
+                    tokenizer=tokenizer,
+                    vocabulary=vocabulary,
+                    force=bool(args.force),
+                )
+            except AgentError as exc:
+                # 已知错误（校验不过、同版本不同内容、词表未覆盖）：记下继续。
+                # 整批停下来会让"第 3 篇版本号写错了"变成"后面 85 篇都没入"
+                failures.append((file.name, str(exc)))
+                print(f"[{index:3d}/{len(targets)}] {file.name:16} 失败：{exc}")
+                continue
+            reports.append(report)
+            if not report.ok:
+                failures.append((file.name, report.error_summary or "入库失败"))
+            print(f"[{index:3d}/{len(targets)}] {_format_ingest_line(item['id'], report)}")
+    finally:
+        await gateway.aclose()
+        await vector_store.aclose()
+        await redis.aclose()
+        await engine.dispose()
+
+    # 退出码按"这次跑坏了没有"给，而不是"有没有文档是 FAILED"：
+    # 语料里 2 份扫描件注定 FAILED（11.2 允许"明确标记不支持"），
+    # 让它们把整条命令判成失败的话，`make ingest` 恒返回非零——
+    # 而 Phase 5 的门禁恰恰要求"标记不支持"算是通过。
+    # 反过来说，"Ollama 没起导致 88 篇全挂"必须返回非零，所以"不支持"与
+    # "真的坏了"要分开数（`report.unsupported`）。
+    _print_ingest_summary(reports, failures)
+    return 1 if _ingest_failure_count(reports, failures) else 0
+
+
+def _ingest_failure_count(reports: list[IngestionReport], failures: list[tuple[str, str]]) -> int:
+    """**真的坏了**的篇数：抛异常的，加上 FAILED 且非"文件不支持"的。
+
+    数错这里的代价不是退出码难看，而是门禁失去意义：
+    算多了 → 语料里那 2 份扫描件让 `make ingest` 永远非零，
+    于是没人再看退出码；算少了 → "Ollama 没起"变成一次安静的成功。
+    """
+    unsupported = sum(1 for r in reports if not r.ok and r.unsupported)
+    return len(failures) - unsupported
+
+
+def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
+    """语料报告的一条 → 入库元数据。
+
+    `source_kind` **显式转换而不透传字符串**：报告里是 `"EXTERNAL"`，
+    而 `DocumentMetadata` 收的是 `SourceKind`。直接透传字符串看着也能过
+    （Pydantic 会转），但转换失败时的报错落在"入库第 47 篇"上，
+    而这一处是**所有文档的来源标记唯一产生的地方**——FR-SEARCH-001 的
+    SOURCE 冲突判定全靠它。在这里转，错了就在启动时错。
+    """
+    return DocumentMetadata(
+        logical_key=item["logical_key"],
+        version=item["version"],
+        title=item["title"],
+        document_type=item["type"],
+        source_kind=SourceKind(item["source_kind"]),
+        classification=item.get("classification") or "INTERNAL",
+        department=item.get("department"),
+        effective_from=_parse_date(item.get("effective_from")),
+        effective_to=_parse_date(item.get("effective_to")),
+        published_at=_parse_datetime(item.get("published_at")),
+    )
+
+
+def _parse_date(value: Any) -> date | None:
+    return date.fromisoformat(str(value)) if value else None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    """`published_at` 在清单里可能只写到日（`2025-11-05`），补成当天零点。
+
+    解析失败**直接报错而不是当作没有**：一个拼错的日期被当成 `None`
+    意味着这篇文档变成"长期有效"，而它可能正是要通过生效区间排除掉的那一版。
+    """
+    if not value:
+        return None
+    text = str(value)
+    parsed = (
+        datetime.fromisoformat(text) if "T" in text else datetime.fromisoformat(f"{text}T00:00:00")
+    )
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _format_ingest_line(doc_id: str, report: IngestionReport) -> str:
+    if report.skipped:
+        return f"{doc_id:14} 已入库（指纹相同，跳过）"
+    smoke_ok = sum(1 for item in report.smoke if item.matched)
+    parts = [
+        f"{doc_id:14}",
+        f"{report.status.value:10}",
+        f"{report.chunk_count:4d} 块",
+        f"{report.page_count:3d} 页",
+    ]
+    if report.smoke:
+        parts.append(f"冒烟 {smoke_ok}/{len(report.smoke)}")
+    if report.dropped:
+        parts.append(f"清洗 {len(report.dropped)} 项")
+    if report.previous_checksum:
+        parts.append("重建")
+    if report.error_summary:
+        parts.append(f"⚠ {report.error_summary}")
+    else:
+        # 冒烟没全中要显眼：它意味着"发布出去了，但召回不到自己"，
+        # 而这正是 11.7 的检索质量在这个语料上最早能露出的马脚
+        failed = [item for item in report.smoke if not item.matched]
+        if failed:
+            parts.append(f"⚠ 冒烟未命中 {len(failed)} 条：{failed[0].chunk_id}")
+    return "｜".join(parts)
+
+
+def _print_ingest_summary(reports: list[IngestionReport], failures: list[tuple[str, str]]) -> None:
+    active = sum(1 for r in reports if r.ok and not r.skipped)
+    skipped = sum(1 for r in reports if r.skipped)
+    unsupported = sum(1 for r in reports if not r.ok and r.unsupported)
+    broken = sum(1 for r in reports if not r.ok and not r.unsupported)
+    print()
+    print("─" * 72)
+    aborted = len(failures) - broken - unsupported
+    print(
+        f"汇总：发布 {active} 篇｜幂等跳过 {skipped} 篇"
+        f"｜不支持 {unsupported} 篇｜入库失败 {broken} 篇｜异常中止 {aborted} 篇"
+    )
+    # **chunk 合计只数本次真的写了向量的那些**：跳过的文档把库里的旧值带回来了，
+    # 把它算进来会让"合计"在一条什么都没做的命令上显示一个非零数字
+    chunks = sum(r.chunk_count for r in reports if not r.skipped)
+    dropped = sum(len(r.dropped) for r in reports if not r.skipped)
+    smoke_total = sum(len(r.smoke) for r in reports)
+    smoke_hit = sum(1 for r in reports for item in r.smoke if item.matched)
+    print(f"chunk 合计 {chunks}｜清洗丢弃 {dropped} 项｜冒烟命中 {smoke_hit}/{smoke_total}")
+    if failures:
+        # **失败明细必须打全**：语料里 2 份扫描件注定失败，
+        # 而"失败 2 篇"这个数字看不出它们是"预期内的不支持"还是"真的坏了"
+        print("明细（未发布的每一篇）：")
+        for name, reason in failures:
+            print(f"  - {name}：{reason}")
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -544,6 +782,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     chunk.set_defaults(summary=False, limit=0, table_only=False, text_only=False)
     vocab = sub.add_parser("vocab", help="构建稀疏检索词表并导出快照（幂等，只增不改）")
     vocab.add_argument("path", nargs="?", default="data/corpus", help="语料目录，默认 data/corpus")
+    ingest = sub.add_parser("ingest", help="逐篇入库并发布（详细设计 11.1 / 11.9）")
+    ingest.add_argument("path", nargs="?", default="data/corpus", help="语料目录，默认 data/corpus")
+    ingest.add_argument(
+        "--only",
+        default="",
+        help="只入库指定 ID，逗号分隔，如 SP-001,MD-008",
+    )
+    ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="同一版本号下内容变了时允许原地重建。默认拒绝——"
+        "改内容必须升版本号，否则引用过该版 chunk_id 的证据会指向另一段文字",
+    )
+    ingest.set_defaults(only="", force=False)
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
@@ -570,6 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tokenize": _tokenize,
         "chunk": _chunk,
         "vocab": _vocab,
+        "ingest": _ingest,
     }
     # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。

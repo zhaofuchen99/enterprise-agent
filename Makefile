@@ -119,6 +119,8 @@ tokenize:  ## 逐条核对中文分词：make tokenize T="华东区域渠道折�
 
 vocab:  ## 构建稀疏检索词表并导出快照（幂等，前置：make corpus）
 	uv run python -m app.cli vocab $(if $(P),$(P),)
+ingest:  ## 逐篇入库并发布：make ingest [P=data/corpus] [ONLY=SP-001] [FORCE=1]（前置：make corpus + make vocab + Ollama）
+	uv run python -m app.cli ingest $(if $(P),$(P),) $(if $(ONLY),--only $(ONLY),) $(if $(FORCE),--force,)
 
 chunk:  ## 解析 + 分块，逐条核对：make chunk P=data/corpus/SP-015.pdf [SUMMARY=1] [LIMIT=5]
 	@test -n "$(P)" || (echo '用法：make chunk P=data/corpus/SP-015.pdf' && exit 1)

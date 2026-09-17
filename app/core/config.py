@@ -189,6 +189,13 @@ class RagTuning(BaseModel):
     chunk_overlap_chars: int = Field(default=100, ge=0, le=1000)
     #: 入库后的抽样检索条数：发布前的冒烟（11.1 的 Retrieval Smoke Test）
     publish_smoke_queries: int = Field(default=3, ge=0, le=50)
+    #: 一次 embedding 请求带多少条文本（11.1 的 Dense Embedding 一步）。
+    #:
+    #: **必须有上限**：一篇文档几十到上千块，整篇一次性发出去，
+    #: 请求体大小与耗时都不可控，而失败是"整篇重来"。
+    #: 取 16 而不是 64：本机 Ollama 上 `bge-m3` 是单进程推理，
+    #: 批再大也不会更快，只会让单次失败的影响面更大。
+    embed_batch_size: int = Field(default=16, ge=1, le=256)
 
 
 class WorkerTuning(BaseModel):

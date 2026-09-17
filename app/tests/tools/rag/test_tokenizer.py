@@ -6,10 +6,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
-import jieba
 import pytest
 
 from app.core.config import Settings
@@ -24,26 +22,9 @@ from app.tools.rag.tokenizer import (
 )
 from scripts.gen_dict import Terms, build_dict_text, load_handwritten_terms
 
-
-@pytest.fixture(autouse=True)
-def _isolate_jieba() -> Iterator[None]:
-    """把 jieba 的进程级词典恢复到用例开始前的样子。
-
-    **这不是洁癖**：`jieba.load_userdict` 改的是全局状态，
-    没有这个夹具的话，先跑的用例加载的词典会留在后续用例里——
-    表现为「单独跑通过、全量跑失败」，或者更糟：**全量跑也通过，
-    但通过的其实是另一个用例加载的词**，断言失去了它声称的意义。
-
-    `Tokenizer._loaded_paths` 是同一个问题的另一半：不清它的话，
-    第二个用例传同一个路径会被跳过加载，而词典已经被上一个用例清掉了。
-    """
-    saved = dict(jieba.dt.FREQ)
-    saved_paths = set(Tokenizer._loaded_paths)
-    yield
-    jieba.dt.FREQ.clear()
-    jieba.dt.FREQ.update(saved)
-    Tokenizer._loaded_paths.clear()
-    Tokenizer._loaded_paths.update(saved_paths)
+# `_isolate_jieba` 夹具已移到 `app/tests/tools/rag/conftest.py`：
+# 它恢复的必须是**进程初始**状态，而不是"本用例开始前"的状态——
+# 后者在同文件内够用，跨文件就不够了（见那个 conftest 的 docstring）。
 
 
 def _write(path: Path, content: str) -> str:

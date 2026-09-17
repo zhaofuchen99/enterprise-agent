@@ -107,6 +107,11 @@ class ChunkFilter(BaseModel):
     Attributes:
         status: 文档状态。**默认就是 `ACTIVE`**——11.9 要求"失败版本不得被
             在线查询过滤条件命中"，把默认值设成不过滤等于把这条纪律交给调用方自觉。
+        document_ids: 只在这些文档版本里找。值是 `logical_key@version`（见 11.5 的
+            落地记录），**按版本而不是按 `logical_key` 过滤**——同名制度的两个版本
+            共用 `logical_key`，按它过滤等于让 v1.0 与 v2.0 互相串味。
+            三个调用方：入库冒烟（只找刚写进去的那批）、失败回滚（只删这一版）、
+            11.7 第 8 步的邻近块扩展（只在同文档内扩）。
         document_types: 文档类型白名单，空表示不限。
         departments: 部门白名单，空表示不限。
         effective_at: 按生效区间过滤的基准日（`effective_from <= d <= effective_to`）。
@@ -118,6 +123,7 @@ class ChunkFilter(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     status: str | None = "ACTIVE"
+    document_ids: tuple[str, ...] = ()
     document_types: tuple[str, ...] = ()
     departments: tuple[str, ...] = ()
     effective_at: date | None = None
@@ -131,6 +137,8 @@ class ChunkFilter(BaseModel):
         `InMemoryVectorStore` 与真实实现**对同一组用例给出同一组结果**。
         """
         if self.status is not None and payload.get("status") != self.status:
+            return False
+        if self.document_ids and payload.get("document_id") not in self.document_ids:
             return False
         if self.document_types and payload.get("document_type") not in self.document_types:
             return False
@@ -202,7 +210,15 @@ class VectorStore(Protocol):
         ...
 
     async def delete_document(self, document_id: str) -> None:
-        """删掉某文档的全部 chunk。失败版本回滚、重建索引都要用它。"""
+        """删掉某文档**版本**的全部 chunk。失败回滚、`--force` 重建都要用它。
+
+        参数名沿用 11.4 的 `document_id`，但值是 `logical_key@version`
+        （见 11.5 的落地记录）。**按版本而不是按 `logical_key` 删**是必须的：
+        11.9 要删的是"这一版没发布成功的那批 point"，
+        按 `logical_key` 删会顺手把同一制度的其它已发布版本一起删掉，
+        而那个版本的文档记录仍然是 ACTIVE——检索侧从此少了一版，
+        没有任何地方会报错。
+        """
         ...
 
     async def count(self, chunk_filter: ChunkFilter | None = None) -> int:
@@ -465,6 +481,7 @@ def _build_filter(chunk_filter: ChunkFilter) -> models.Filter:
             models.FieldCondition(key="status", match=models.MatchValue(value=chunk_filter.status))
         )
     for key, values in (
+        ("document_id", chunk_filter.document_ids),
         ("document_type", chunk_filter.document_types),
         ("department", chunk_filter.departments),
         ("classification", chunk_filter.classifications),

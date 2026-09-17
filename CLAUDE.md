@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | 🔄 进行中（8/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 1887 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）。**未完成**：⑤`ingestion.py`（staging → 抽样 → 原子发布）、⑪入库幂等、⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
+| 5 RAG | 🔄 进行中（10/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）。**未完成**：⑧`retriever.py`、⑩`NO_RELEVANT_KNOWLEDGE`、⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 按 TBC-04 维持后置 |
 | 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -125,6 +125,40 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     16.8 的列注释写"文档频率"，BM25 里的"文档"指被索引的单元，本项目里是 chunk。
     两种取法给出不同的 IDF 排序。**`df` 与 `token_id` 一样冻结**（`add` 不改任何列），
     否则老向量里的权重与它当时的 IDF 对不上，而新旧向量会一起被打分。
+19. **`payload.document_id` 是 `logical_key@version`，不是 `logical_key`**。
+    按版本而不是按逻辑文档过滤是必须的：同名制度的 v1.0 与 v2.0 共用
+    `logical_key`，按它过滤等于让两版互相串味（VERSION_PAIR 缺陷注入正测这件事）。
+    这个值同时是 `chunk_id` 的派生种子、payload 的过滤键、以及
+    `delete_document` 的选择器——**三处必须是同一个字符串**，
+    否则"删掉这一版没发布成功的 point"会删到别处，而删除是不报错的。
+    11.4 的 `ChunkMetadata` 没有 `logical_key`，本实现显式多存了一份：
+    按 `@` 反解复合键，在 `logical_key` 里出现 `@` 的那天就会静默切错。
+20. **`payload.status` 用 `domain.knowledge.DocumentStatus`，不用 11.4 写的
+    `DRAFT / ACTIVE / ARCHIVED`**。11.1 的 staging 态是 `PROCESSING`、
+    11.9 的过滤条件比的是它——那三个值是**文档生命周期**的写法，
+    在入库流程里 DRAFT 根本不存在。两套取值并存必然漂移（过滤条件只认一个
+    字符串，而枚举有两个），所以行与 payload 共用一个枚举。
+21. **同版本号 + 不同内容 = 报错，不是覆盖**（`make ingest FORCE=1` 才允许重建）。
+    `chunk_id` 由 `logical_key@version` 确定性派生，静默覆盖会让此前引用过
+    `chk_xxx` 的证据指向另一段文字，而引用本身仍然打得开。反过来，
+    **同一份内容挂在两个 `logical_key` 下也要拒绝**——那会让同一批向量
+    在检索里并列出现，看起来像两个来源互相印证。
+22. **文档级永久性失败（扫描件无文本层）返回 FAILED 报告而不抛异常**，
+    且报告单列 `unsupported=True`。这不是"宽容"，是**退出码的判据**：
+    语料里 2 份扫描件注定失败，若它们也算命令失败，`make ingest` 恒返回非零，
+    退出码就没人看了；而"Ollama 没起导致 88 篇全挂"必须返回非零。
+    **抛异常**留给"这次跑坏了"（校验不过、词表没覆盖、基础设施不可用）。
+23. **`app/tests/db.py` 每个进程第一次会 `drop_all` + `create_all`**。
+    只 `create_all` 不够：它的 `checkfirst` 只看"表在不在"、不看列全不全，
+    于是模型加列后 `agent_test` 里的旧表照样通过，失败要到 INSERT 才发生，
+    报的是 `Unknown column 'xxx' in 'field list'`——**读起来像代码写错了列名**。
+    这条是 Phase 5 加 `source_kind` 时真踩到的。
+24. **RAG 测试的 jieba 全局状态由 `app/tests/tools/rag/conftest.py` 隔离**，
+    基线在**导入期**取（那时一次词典加载都还没发生）。
+    `jieba.load_userdict` 改的是进程级词典，而 `Tokenizer` 明确不支持
+    "不同实例用不同词典"——恢复成"本用例开始前"的状态在跨文件时是不够的，
+    因为那时基线**已经是脏的**。症状是"单独跑通过、全量跑失败"，
+    或者更糟：全量也通过，但通过的其实是别的用例加载的词。
 
 ### 【后续扩展】登记
 
@@ -141,7 +175,10 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 节点内检查取消标记（`TaskRunner.is_cancel_requested` 目前只在领取与收尾时检查） | Phase 7 |
 | `WAITING_CLARIFICATION` 的 `clarification_question` 字段 | Phase 6 |
 | 任务详情的步骤进度、证据、冲突、限制（等各自 Schema 产出后增补） | Phase 6 / 9 |
-| 对象存储 `s3` 实现（契约测试已就绪，加进参数表即被覆盖） | Phase 5 |
+| ~~对象存储 `s3` 实现~~ **已完成**（`make ingest` 起会真的用到它归档原文与报告） | ✅ Phase 5 |
+| `reindex` 接口：**原文件已归档、collection 已是可重建的派生数据，只差一条命令**。注意重建前要比对行的 `checksum` 与归档原文（`FORCE=1` 失败重建时两者会分叉，见详设 11.9 的落地记录） | Phase 5 收尾 |
+| 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |
+| Qdrant 的 `set_payload` 跨分片无事务保证 → 发布窗口内读者可能看到同一版本的部分 chunk。要严格就需把状态位提到文档级（见详设 11.1 的落地记录第 4 条） | 语料规模上去再评估 |
 | 登录接口限流（当前配额按已认证用户计，登录不受保护，可被口令爆破） | Phase 12 |
 | 未注册路径复用 `TASK_NOT_FOUND` 的语义含混（错误码表封闭所致） | 待定 |
 | token / 成本进 **OTel Metrics**（详设 19.4.3）。Phase 3 先落 span 属性，`observability.py` 目前只有 tracer、没有 meter | Phase 11「节点埋点」 |
