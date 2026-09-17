@@ -65,7 +65,13 @@ from app.infrastructure.vector_store import ChunkFilter, ScoredPoint, VectorStor
 from app.tools.rag.metadata import ChunkMetadata
 from app.tools.rag.prompts import QUERY_REWRITE_PROMPT
 from app.tools.rag.schemas import QueryRewrite, RagQueryArgs, RetrievalOutcome, RetrievedChunk
-from app.tools.rag.tokenizer import Tokenizer, Vocabulary, build_sparse, normalize_numbers
+from app.tools.rag.tokenizer import (
+    Tokenizer,
+    Vocabulary,
+    build_sparse,
+    is_general_word,
+    normalize_numbers,
+)
 
 #: 从文本里取"数字锚点"。**这是 11.7 第 2 步「必须保留实体和时间」里
 #: 唯一能靠代码判定的那一半**：年份、季度、金额都是数字，
@@ -86,33 +92,58 @@ _NUMBER = re.compile(r"\d+")
 #: 这份表只在这一个判定里用，把两件事分开，改它不需要重建索引。
 #: 把疑问词并入停用词表是更整齐的做法，但那要连带重跑 `make vocab` + `make ingest`，
 #: 已登记为【后续扩展】。
+#:
+#: ⚠️ **这是一份闭类词的枚举，漏一个的代价是"把好问题判成没有"**。
+#: 实测踩过：第一版只列了「怎么/怎样/如何」，漏了**「怎么样」**，
+#: 于是「2025 年第三季度的整体经营业绩怎么样」这条余弦 0.80 的**高度相关**
+#: 问题被判成 `NO_RELEVANT_KNOWLEDGE`。因此
+#: `app/tests/tools/rag/test_retriever.py` 里有一份**问句形式的清单**逐条钉住它，
+#: 补词时可以照着那个清单扩。
+#:
+#: 方向是**宁可多列**：多列一个虚词只会让判据少触发一次（还有余弦那一路兜底），
+#: 少列一个则会直接拒答一条真问题。
 _NON_TOPICAL: frozenset[str] = frozenset(
     {
+        # 疑问代词与疑问副词（闭类）
         "怎么",
+        "怎么样",
+        "怎么办",
         "怎样",
+        "怎的",
         "如何",
         "哪些",
         "哪个",
+        "哪一些",
         "哪里",
         "什么",
+        "什么样",
         "为什么",
+        "为何",
         "是否",
         "多少",
         "几个",
         "多久",
+        "多长时间",
         "何时",
+        "什么时候",
         "谁",
+        # 语气词与结构助词（单字在 `Tokenizer._keep` 里已被滤掉，这里收双字的）
         "吗",
         "呢",
         "的",
         "了",
         "是",
         "有",
+        "的话",
+        # 泛指动词：任何问句里都可能出现，不携带主题
         "请问",
         "介绍",
         "说明",
         "解释",
         "告诉",
+        "讲讲",
+        "说说",
+        "列举",
     }
 )
 
@@ -247,18 +278,42 @@ class Retriever:
         误判"没有"会让真问题拒答，误判"有"会让生成节点拿到一堆无关片段。
 
         未登录词则分得很干净，因为它是**词表事实**而不是相似度估计：
-        「碳积分」「直播带货」「保险费率」这些词在 88 篇语料里一次都没出现过，
+        「跨境」「出海」「直播」「食堂」这些词在 88 篇语料里一次都没出现过，
         词表里自然没有它们——而词表是入库时逐词统计出来的，不是猜的。
 
         **两个判据是「或」的关系**，各自补另一方的短板：未登录词拦不住
         "用词都在词表里、但语料没讲过这件事"的问题（重叠词组合出来的新话题），
         余弦拦不住"语义相近但其实是别的事"。余弦那一路取保守的低地板，
         见 `rag.score_threshold` 的配置说明。
+
+        ### 三个条件同时成立才算"主题词缺失"
+
+        1. **不在 `_NON_TOPICAL`**：疑问词不携带主题，而语料是陈述性的，
+           任何一个疑问词对它来说都是未登录的（见那份表的说明）；
+        2. **语料里没有被它包含的词**（`Vocabulary.covers`）：语料从未用过它；
+        3. **在 jieba 的通用词典里**（`is_general_word`）：排除**切分伪 token**。
+
+        后两条都是实测补上的，各挡住一类**误拒**：
+
+        - `「2025 年 8 月的经营月报里区域分布情况如何」` 被 jieba 切成
+          `…月报 / 报里 / 区域分布…`，`报里` 不在词表里 → 余弦 0.79 的问题被拒答。
+          伪 token 是无界的（任何切分抖动都会造出新的），只能从"它是不是一个词"挡。
+        - `「直营渠道的价格管理由哪个部门归口负责」` 里的 `归口` 不在词表里，
+          但它在语料里出现 **69 次**——业务词典把「归口管理部门」收成了一个词。
+          按"是不是一个 token"判断会漏掉它，按"是不是某个词的组成部分"才对。
+
+        **已知的漏网类：同义词**。「报备」在语料里一次都没出现（制度写「备案」），
+        也不被任何词包含，于是仍会被判成"语料没见过"而拒答——
+        而那条问题的余弦是 0.74，检索其实找得到。纯词汇规则区分不了
+        "语料没讲过这件事"与"语料用的是另一个说法"，那一类只能靠语义
+        （重排器 / Phase 8 的 Reviewer）。这一例留在金标集里当回归用例。
         """
         return tuple(
             token
             for token in self._tokenizer.cut(question)
-            if token not in _NON_TOPICAL and self._vocabulary.id_of(token) is None
+            if token not in _NON_TOPICAL
+            and not self._vocabulary.covers(token)
+            and is_general_word(token)
         )
 
     # ------------------------------------------------------------------ ④⑤ 召回

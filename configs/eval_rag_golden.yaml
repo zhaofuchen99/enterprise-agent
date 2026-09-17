@@ -1,0 +1,202 @@
+# RAG 金标评测集（开发流程 6.7 施工项 12：金标 20 条用于 Recall@8 校准）
+#
+# ## 判定标准是「命中金标文档」，不是「文本相似」
+#
+# 详设 22.3 要求 RAG 检索测「Recall@8、定位一致、无相关知识不编造」。
+# 这里的判定分三层，逐层收紧：
+#
+#   1. **命中文档**：Top 8 里出现了 `expect_docs` 里的任一份（按 `document_id`
+#      —— 即 `logical_key@version`，见 `app/tools/rag/metadata.py`）；
+#   2. **定位一致**：命中的那条分块的 `section_path` 含 `expect_sections` 里的任一个；
+#   3. **版本正确**：`as_of` 给定时，命中的必须是那一版。
+#
+# 只比"文本像不像"是没有约束力的——那是模型自己跟自己对答案。
+#
+# ## 为什么锚在 `document_id` 而不是 `chunk_id`
+#
+# `chunk_id` 由 `(logical_key@version, 块序号)` 派生，**序号会随分块逻辑变化**。
+# 把它写进金标，等于让任何一次 `chunker.py` 的改动都作废整份金标——
+# 而分块参数本来就"必须通过评测集校准"（11.3），两者会互相锁死。
+# 文档与章节是**语料事实**，分块是实现细节，金标锚在事实上。
+#
+# ## 金标是怎么来的
+#
+# 对着 **Phase 5 冻结的 88 篇语料手写**，不是让模型生成后回填——
+# 后者只能验证「模型等于它自己」，与 `eval_sql_golden.yaml` 同一条纪律。
+# `expect_docs` 与 `expect_sections` 是**从产物里查出来的**
+# （Qdrant 的 payload），不是照清单猜的：清单里写了什么不是证据，产物才是
+# （CLAUDE.md 约定 11）。
+#
+# ## 两类用例，两个分母
+#
+# - `cases`（20 条）：有答案，算 **Recall@8**。分母固定是 20。
+# - `absent_cases`（3 条）：**语料中不存在**的制度（16.11.2 第 10 项），
+#   期望结果是 `NO_RELEVANT_KNOWLEDGE` 而**不是**硬凑一段答案。
+#   它们**不进 Recall@8 的分母**——把"该拒答的"和"该召回的"混在一个比率里，
+#   两边都说不清。这两组也由 `make verify-corpus` 消费。
+version: "2026.09.17-1"
+
+cases:
+  # ---------------------------------------------------------- 制度（10 条）
+  - id: rag-01
+    question: 华东区域渠道折扣政策对直营渠道的折扣上限是怎么规定的？
+    expect_docs: [policy/east-china-channel-discount@v2.0]
+    expect_sections: [管理要求]
+    as_of: 2025-09-01
+    proves: 制度类精确问法；同名制度的 v1.0 已失效，必须命中 v2.0
+
+  - id: rag-02
+    question: 经销渠道返利政策的返利标准怎么计算？
+    expect_docs: [policy/partner-rebate@v2.0]
+    expect_sections: [管理要求]
+    as_of: 2025-12-01
+    proves: 与 rag-01 同型的版本对，用来区分"版本过滤"是不是只对某一篇生效
+
+  - id: rag-03
+    question: KA 客户专项折扣的审批流程是什么？
+    expect_docs: [policy/ka-special-discount-approval@v1.0]
+    expect_sections: [管理要求, 总则]
+    proves: 含 ASCII 精确词（KA）——这是稀疏路存在的意义
+
+  - id: rag-04
+    question: 临期产品清仓折扣的适用范围和条件是什么？
+    expect_docs: [policy/clearance-discount-guideline@v1.0]
+    expect_sections: [总则, 管理要求]
+    proves: 制度类
+
+  - id: rag-05
+    question: 直营渠道的价格管理由哪个部门归口负责？
+    expect_docs: [policy/direct-channel-pricing@v1.0]
+    expect_sections: [职责分工, 总则]
+    proves: 问"谁负责"——答案在职责分工节，测的是分块有没有把该节留住
+
+  - id: rag-06
+    question: 电商渠道促销活动需要提前多久报备？
+    expect_docs: [policy/online-channel-promotion@v1.0]
+    expect_sections: [管理要求, 职责分工]
+    proves: 制度类
+
+  - id: rag-07
+    question: 退货与冲减管理办法里退货冲减的处理要求是什么？
+    expect_docs: [policy/return-and-writeoff@v1.0]
+    expect_sections: [管理要求, 总则]
+    proves: 与 SQL 侧"净销售额 = 含税 − 折扣 − 退货"的口径配套，多源冲突会用到
+
+  - id: rag-08
+    question: 各区域的折扣授权额度是多少？
+    expect_docs: [policy/regional-discount-quota@v1.0]
+    expect_sections: [授权额度明细]
+    # 这一份是语料里 2 份 CONFIDENTIAL 之一（`allowed_roles` 只有 ADMIN）。
+    # **以 ANALYST 跑会被正确地挡住**，那时报出来的"未命中"看起来像召回缺陷，
+    # 实际是权限过滤在工作——两条用例的失败原因指错方向，调参的人会去调 embedding。
+    role: ADMIN
+    proves: 表格密集的文档（92 块）+ 机密件的权限过滤：ADMIN 看得到，
+      而 `make verify-corpus` 会断言 ANALYST 看不到
+
+  - id: rag-09
+    question: 渠道准入的等级是怎么划分的？
+    expect_docs: [channel/admission-and-grading@v1.0]
+    expect_sections: [管理要求, 职责分工]
+    proves: 渠道管理类
+
+  - id: rag-10
+    question: 经销商的年度考核评分表包括哪些指标和权重？
+    expect_docs: [channel/dealer-annual-assessment@v1.0]
+    expect_sections: [考核指标与权重]
+    proves: 含权重表的文档，缺陷注入的"跨页表格"之一
+
+  # ---------------------------------------------------------- 口径（4 条）
+  - id: rag-11
+    question: 净销售额的口径是怎么定义的？
+    expect_docs: [metric/net-sales-definition@v1.2]
+    expect_sections: [指标定义, 计算公式]
+    proves: "**与 SQL 侧口径对齐的那一份**，DEFINITION 冲突的两端之一"
+
+  - id: rag-12
+    question: 目标净销售额达成率是怎么计算的？
+    expect_docs: [metric/target-achievement-definition@v1.0]
+    expect_sections: [计算公式, 指标定义]
+    proves: 达成率口径
+
+  - id: rag-13
+    question: 区域划分与省份归属是怎么规定的？
+    expect_docs: [metric/region-division-definition@v1.0]
+    expect_sections: [区域与省份对照, 划分原则]
+    proves: SCOPE 冲突的判据来源（文档声称的省份数 vs 库里的 province_count）
+
+  - id: rag-14
+    question: 数据统计截止时点和关账是怎么规定的？
+    expect_docs: [metric/data-cutoff-definition@v1.0]
+    expect_sections: [指标定义, 使用注意事项]
+    proves: TIME 冲突的判据来源（报告截止日不同）
+
+  # ---------------------------------------------------------- 报告（3 条）
+  - id: rag-15
+    question: 2025 年第三季度的整体经营业绩怎么样？
+    expect_docs: [report/quarterly-2025-Q3@v1.0]
+    expect_sections: [经营业绩回顾, 核心摘要]
+    proves: 季度报告，也是 VALUE 冲突的注入点之一
+
+  - id: rag-16
+    question: 2025 年度经营分析报告的核心摘要是什么？
+    expect_docs: [report/annual-2025@v1.0]
+    expect_sections: [核心摘要]
+    proves: 年报
+
+  - id: rag-17
+    question: 2025 年 8 月的经营月报里区域分布情况如何？
+    expect_docs: [report/monthly-2025-08@v1.0]
+    expect_sections: [经营业绩回顾, 区域分布]
+    proves: 12 份同构月报里的一个月——**测的是"同名文档的月份区分"**，
+      命中相邻月份（如 7 月）算错，因为问的是 8 月
+
+  # ---------------------------------------------------------- 产品（2 条）
+  - id: rag-18
+    question: 智能门锁的技术参数有哪些？
+    expect_docs: [product/p0001@v1.0]
+    expect_sections: [技术参数]
+    proves: 产品类，20 份同构产品资料里的一份
+
+  - id: rag-19
+    question: 扫地机器人的价格与商务政策是什么？
+    expect_docs: [product/p0002@v1.0]
+    expect_sections: [价格与商务政策]
+    proves: 与 rag-18 同型，用来测产品之间的区分度
+
+  # ---------------------------------------------------------- 外部（1 条）
+  - id: rag-20
+    question: 2025 年上半年消费电子行业市场规模有多大？
+    expect_docs: [external/industry-association-2025H1@v1.0]
+    expect_sections: [行业整体概况, 细分品类表现]
+    proves: EXTERNAL 来源也能被召回（11.8 要求外部材料**进证据**，
+      由 Phase 9 的 SOURCE 冲突判定"不得覆盖内部事实"，而不是在检索侧过滤掉）
+
+# ---------------------------------------------------------------- 应拒答（3 条）
+#
+# 与 `configs/corpus_manifest.yaml` 的 `absent_policies` **一一对应**：
+# 那份清单登记的是"不该存在的文档"，这里登记的是"问它们的问法"。
+# 两边必须同时有东西——只登记一边时，"语料里确实没有"这件事就没有断言。
+absent_cases:
+  - id: rag-a1
+    question: 跨境出海业务管理办法怎么规定？
+    absent_topic: 跨境出海业务管理办法
+    #: 在**全部 1871 个 chunk 正文里出现次数为 0** 的词（实测）。
+    #: 它们才是"语料从没讲过这件事"的判据——用整串去匹配、或按 3 字切片，
+    #: 都会把「业务管理」「管理办法」这种通用组合算成命中。
+    absent_probes: [跨境, 出海]
+    proves: 演示库没有海外区域，业务上本就不该存在
+
+  - id: rag-a2
+    question: 直播带货专项补贴制度的补贴标准是多少？
+    absent_topic: 直播带货专项补贴制度
+    # 「补贴」在语料里出现 2 次（别的制度的促销补贴），**不能当探针**；
+    # 「直播」「带货」才是这份制度特有的、实测 0 次的词
+    absent_probes: [直播, 带货]
+    proves: 渠道只有直营/经销/电商/KA，没有直播
+
+  - id: rag-a3
+    question: 绿色供应链碳积分规则是什么？
+    absent_topic: 绿色供应链碳积分规则
+    # 「供应链」在语料里出现 11 次（别的制度讲供应链周转），**不能当探针**
+    absent_probes: [碳积分, 绿色, 积分]
+    proves: 与库存/物流制度形似（CM-006 讲周转），是最容易被模型张冠李戴的一条

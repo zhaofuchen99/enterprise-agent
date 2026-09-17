@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | 🔄 进行中（11/12） | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**未完成**：⑫金标 20 条 + Recall@8、`verify-corpus` 门禁。⑨Reranker 与 11.7 第 ⑧ 步按 TBC-04 维持后置 |
+| 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。⑨Reranker 与 11.7 第 ⑧ 步按 TBC-04 维持后置 |
 | 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -195,6 +195,38 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     而它看起来完全正常（`NO_RELEVANT_KNOWLEDGE` 是个合法错误码）。
     **但改写失败要降级**：改写是"补充召回"，改不动不等于查不了。
 
+30. **「语料里有没有这件事」由两个判据「或」起来，且未登录词那一路有**三个**
+    条件（`retriever._unseen_topics`）。金标 20 条校准后定稿：
+    1. **不在 `_NON_TOPICAL`**——疑问词不携带主题，而语料是陈述性的，
+       不排除它们的话**任何问句**都会被判成"语料没见过"；
+    2. **语料里没有被它包含的词**（`Vocabulary.covers`）——`归口` 不在词表里
+       却在语料里出现 **69 次**，因为业务词典把「归口管理部门」收成了一个词。
+       按"是不是一个 token"判定会漏掉它，按"是不是某个词的组成部分"才对；
+    3. **在 jieba 的通用词典里**（`tokenizer.is_general_word`）——排除**切分伪 token**：
+       「…经营月报里区域分布…」被切成 `月报 / 报里 / 区域分布`，
+       `报里` 不在词表里，于是余弦 0.79 的问题被拒答。伪 token 是无界的。
+    **已知漏网类：同义词**。「报备」语料里 0 次（制度写「备案」），也不被任何词包含，
+    于是仍会被判成"语料没见过"而拒答（余弦 0.74，检索其实找得到）。
+    纯词汇规则区分不了"语料没讲这件事"与"语料用了另一个说法"，
+    只能靠语义（重排器 / Phase 8 Reviewer）。**这一例留在金标里当回归用例**（rag-06）。
+31. **`RAG__SCORE_THRESHOLD` 已按金标 20 条校准为 0.60**，且**它是保守地板**，
+    真正的判别力在未登录词那一路。实测（金标跑出来的）：
+    真问题的最高余弦 0.61–0.86，语料中不存在的问题 0.51–0.71——**两类重叠**，
+    那是稠密模型各向异性的性质，不是调参能消除的。
+    任何"调阈值就能同时提召回又提拒答"的说法都与这份数据不符。
+32. **`verify-corpus` 的两种标注不能混**：`[OK]` 是"在这里就检出了"，
+    `[注入]` 是"语料侧确认注入了、但对应的冲突检出属 Phase 9"。
+    VALUE / TIME 两类冲突现在标的是 `[注入]`——**把它们说成 `[OK]` 就是
+    把"语料里有"说成"系统检得出"**，而 Phase 5 的门禁原文是"10 类缺陷逐条检出"，
+    这个差别必须在面试口径里说清楚。SCOPE 是例外：它在这里就能检出，
+    因为"文档声称的省份数 vs `dim_region` 的实际值"只要把两个数摆在一起就够了。
+33. **`app/tests/tools/rag/conftest.py` 必须在 import 期先 `jieba.initialize()` 再取基线**。
+    前缀词典是惰性构建的，未初始化时 `jieba.dt.FREQ` 是**空字典**；
+    取一份空基线再去"恢复"它，等于把词频表清空，而 `initialize()` 因为
+    `initialized=True` 不会重建。后果是分词退化成逐字切分，**而用例照样通过**
+    （`all(len(t) > 1 for t in tokens)` 在空序列上恒为真）。
+    这是本阶段真踩到的：它让"未登录词判据"静默失效，排查方向指向词表。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -214,6 +246,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **11.7 第 ⑧ 步「邻近块扩展」**：原文条件是「同文档、同章节且**确有上下文缺口**时」，而缺口判定依赖重排器的相关性信号。没有它只能退化成「块短就扩」，在本语料上几乎恒真（正文块中位 85 字），等于无条件把候选翻倍。**随重排器一起后置**——这是时序调整，不是砍需求 | 与 Reranker 同批 |
 | 文档侧的 `metric_code` / `definition_version` / `scope` 暂时留空（分块不带指标 code，按 `logical_key` 反推是把自由文本约定当语义用）。**13.4 的 DEFINITION / SCOPE 冲突因此暂时只覆盖 SQL 侧**，要等文档与指标目录挂钩 | Phase 9 |
 | 把疑问词并入 `configs/rag_stopwords.txt`（更整齐，但改切分必须重跑 `make vocab` + `make ingest` + 检索回归集） | Phase 5 收尾 |
+| **同义词导致的误拒**：`报备` vs 语料里的 `备案`（金标 rag-06，余弦 0.74 仍被拒答）。纯词汇规则解决不了，要靠重排器或 Phase 8 的 Reviewer 给语义信号 | 与 Reranker 同批 |
+| VALUE / TIME 冲突的**检出**（语料侧注入已由 `verify-corpus` 标 `[注入]` 确认）：`agent_conflict` 表与 13.4 的检测算法 | Phase 9 |
 | `reindex` 接口：**原文件已归档、collection 已是可重建的派生数据，只差一条命令**。注意重建前要比对行的 `checksum` 与归档原文（`FORCE=1` 失败重建时两者会分叉，见详设 11.9 的落地记录） | Phase 5 收尾 |
 | 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |
 | Qdrant 的 `set_payload` 跨分片无事务保证 → 发布窗口内读者可能看到同一版本的部分 chunk。要严格就需把状态位提到文档级（见详设 11.1 的落地记录第 4 条） | 语料规模上去再评估 |

@@ -35,9 +35,18 @@ from app.tools.rag.tokenizer import Tokenizer
 
 #: 进程最初始的 jieba 词典状态。**在导入期取**，见模块 docstring。
 #:
+#: ⚠️ **必须先 `initialize()` 再取**：前缀词典是惰性构建的，
+#: 未初始化时 `jieba.dt.FREQ` 是**空字典**。取一份空基线再去"恢复"它，
+#: 等于把整个词频表清空——而 `initialize()` 因为 `initialized` 已经是 True，
+#: 不会重建。后果是后续所有分词退化成逐字切分，**而用例照样通过**：
+#: 像 `all(len(t) > 1 for t in tokens)` 这种断言在空序列上恒为真。
+#: 实测的表现是"未登录词判据全部失效"（`get_FREQ` 对任何词都返回 None），
+#: 排查方向会跑到词表上去。
+#:
 #: 两份都要存：`load_userdict` 同时改 `FREQ`（词频表，决定切分）
 #: 与 `user_word_tag_tab`（词性标注表）。只恢复前者的话，
 #: 词性相关的行为仍然带着上一个用例的痕迹。
+jieba.initialize()
 _PRISTINE_FREQ = dict(jieba.dt.FREQ)
 _PRISTINE_TAGS = dict(jieba.dt.user_word_tag_tab)
 

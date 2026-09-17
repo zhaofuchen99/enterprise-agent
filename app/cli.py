@@ -21,6 +21,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from sqlalchemy import text
+
 from app.agent.prompts import SMOKE_PROMPT
 from app.agent.schemas import SmokeAnswer
 from app.core.config import Settings, get_settings
@@ -37,7 +39,9 @@ from app.repositories.knowledge_repo import SqlKnowledgeDocumentRepository
 from app.repositories.user_repo import SqlUserRepository, seed_demo_users
 from app.repositories.vocab_repo import SqlVocabRepository
 from app.tools.base import ToolResult
+from app.tools.rag import verify
 from app.tools.rag.chunker import Chunk, chunk_document
+from app.tools.rag.golden import load_golden
 from app.tools.rag.ingestion import (
     DocumentMetadata,
     IngestionReport,
@@ -46,7 +50,7 @@ from app.tools.rag.ingestion import (
 from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
 from app.tools.rag.schemas import RagQueryArgs
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
-from app.tools.rag.tool import build_rag_retrieve_tool
+from app.tools.rag.tool import build_rag_retrieve_tool, build_retriever
 from app.tools.rag.vocabulary import build_vocabulary, export_snapshot, load_vocabulary
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
@@ -820,6 +824,127 @@ def _parse_date_arg(value: str) -> date | None:
     return date.fromisoformat(value) if value else None
 
 
+async def _verify_corpus(settings: Settings, args: argparse.Namespace) -> int:
+    """逐条检出 10 类缺陷注入（开发流程 6.7 的门禁）。
+
+    **断言的是产物，不是清单标注**（CLAUDE.md 约定 11）：清单里写
+    `defects: [CROSS_PAGE_TABLE]` 只是一句声明，第一版语料就是三份标注齐全、
+    一张都没跨页。所以这里的输入全部来自 `make corpus` 与 `make ingest` 的产物。
+
+    **两类标注要分清**（见 `tools/rag/verify.py` 的模块说明）：
+    `[OK]` 是"在这里就检出了"，`[注入]` 是"语料侧确认注入了、但对应的冲突
+    检出属 Phase 9"。把后者标成 `[OK]` 就是把"语料里有"说成"系统检得出"。
+    """
+    documents = verify._load_manifest()
+    engine = create_engine(settings)
+    redis = create_client(settings)
+    storage = build_object_storage(settings)
+    vector_store = build_vector_store(settings)
+    gateway = build_model_gateway(settings)
+    try:
+        sessions = create_session_factory(engine)
+        documents_repo = SqlKnowledgeDocumentRepository(sessions)
+        records = await documents_repo.list_documents()
+        chunks = await _scroll_all_chunks(vector_store)
+        # 直接用 `Retriever` 而不是 `RagRetrieveTool`：这条命令要的是
+        # "召回/拒答的判定"，不需要 ToolResult 那层封装（证据、call_id、错误码
+        # 都不是它要的）。走工具的话还得把 payload 反解一遍，
+        # 而那条反解路径正是评测脚本刻意避开的东西。
+        retriever = await build_retriever(
+            settings,
+            gateway,
+            vector_store=vector_store,
+            storage=storage,
+            vocab=SqlVocabRepository(sessions),
+            cache=VersionedCache(redis, default_ttl_seconds=settings.rag.vocab_cache_ttl_seconds),
+        )
+        golden = load_golden()
+        corpus_text = "\n".join(chunk["payload"].get("text") or "" for chunk in chunks)
+        provinces = await _region_province_counts(settings)
+
+        results = [
+            verify.check_furniture(chunks),
+            await verify.check_version_pair(documents, chunks, retriever),
+            verify.check_value_conflict(documents, chunks),
+            verify.check_time_conflict(documents, chunks),
+            verify.check_scope_conflict(documents, chunks, provinces),
+            verify.check_source_pair(documents, records, chunks),
+            verify.check_scanned(documents, records, chunks),
+            verify.check_cross_page_table(documents, chunks),
+            verify.check_prompt_injection(documents, chunks),
+            await verify.check_absent(golden.absent_cases, corpus_text, retriever),
+        ]
+    finally:
+        await gateway.aclose()
+        await vector_store.aclose()
+        await redis.aclose()
+        await engine.dispose()
+
+    return _print_verify_results(results)
+
+
+async def _scroll_all_chunks(vector_store: Any) -> list[dict[str, Any]]:
+    """把全部 chunk 连同 payload 取回来。
+
+    **不走 `VectorStore` 接口**：那个接口刻意没有"列出全部"（把向量库当目录
+    服务用是错的方向，见 `vector_store.py` 的说明）——日常读路径都该走
+    MySQL 的 `knowledge_document` + 检索。这里是**一次性的人工核验**，
+    与检索的质量无关，所以要的是"库里到底有什么"，绕开接口去 Qdrant 取正是意图。
+    """
+    points: list[dict[str, Any]] = []
+    offset: Any = None
+    while True:
+        batch, offset = await vector_store._client.scroll(
+            vector_store.collection,
+            limit=1000,
+            offset=offset,
+            with_payload=True,
+            # **要显式关掉向量**：默认会把 1024 维的稠密向量一起取回来，
+            # 1871 个 chunk 就是几百万个浮点数——本条命令一个都用不上
+            with_vectors=False,
+        )
+        points.extend({"payload": dict(point.payload or {})} for point in batch)
+        if offset is None:
+            return points
+
+
+async def _region_province_counts(settings: Settings) -> dict[str, int]:
+    """业务库 `dim_region` 的真实省份数，供 SCOPE 冲突比对。
+
+    这一条是 verify-corpus 里**唯一需要读业务库的断言**，而它必须在：
+    SCOPE 冲突的定义就是"文档说的"与"库里是的"不一致，
+    只看文档那一侧永远判不出冲不冲突。
+    """
+    engine = create_engine(settings, url=settings.database_url_business_ro)
+    try:
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(text("SELECT region_name, province_count FROM dim_region"))
+            ).all()
+        return {str(row[0]): int(row[1]) for row in rows}
+    finally:
+        await engine.dispose()
+
+
+def _print_verify_results(results: Sequence[Any]) -> int:
+    width = max(len(result.name) for result in results)
+    for result in results:
+        print(f"{result.mark:6} {result.name:<{width}}  {result.expected:14} {result.detail}")
+    failed = [result for result in results if not result.ok]
+    injected = [result for result in results if result.ok and result.injected_only]
+    print()
+    print("─" * 72)
+    print(
+        f"检出 {len(results) - len(failed)}/{len(results)} 类"
+        f"｜其中 {len(injected)} 类只验证了语料侧（冲突检出属 Phase 9）"
+    )
+    if failed:
+        print("未通过：")
+        for result in failed:
+            print(f"  - {result.name}：{result.detail}")
+    return 1 if failed else 0
+
+
 def _print_attempts(payload: dict[str, Any] | None) -> None:
     """打印每次尝试。**失败的尝试也要打**——详设 6.6 施工项 5 要求每次尝试
     都落 `agent_tool_call`，而在落库之前，这里是唯一能看到「修复了几次、
@@ -921,6 +1046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--department", action="append", default=[], metavar="部门", help="部门过滤（可重复）"
     )
     retrieve.set_defaults(as_of="", doc_type=[], department=[])
+    sub.add_parser("verify-corpus", help="逐条检出 10 类缺陷注入（详细设计 6.7 的门禁）")
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
@@ -952,6 +1078,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vocab": _vocab,
         "ingest": _ingest,
         "retrieve": _retrieve,
+        "verify-corpus": _verify_corpus,
     }
     # 所有子命令都收 (settings, args)：让签名统一，代价只是几个用不到 args 的
     # 函数多一个参数；不统一的话分发处就得按命令名分支，加一个命令改一次。

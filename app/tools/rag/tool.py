@@ -217,7 +217,7 @@ def _failure_result(call_id: str, started_at: datetime, exc: AgentError) -> Tool
     )
 
 
-async def build_rag_retrieve_tool(
+async def build_retriever(
     settings: Settings,
     gateway: ModelGateway,
     *,
@@ -225,8 +225,14 @@ async def build_rag_retrieve_tool(
     storage: ObjectStorage,
     vocab: VocabRepository,
     cache: VersionedCache,
-) -> RagRetrieveTool:
-    """装配点。
+) -> Retriever:
+    """装配 `Retriever`（**与 Tool 分开**）。
+
+    分开的理由是**有两个消费方**：`rag_retrieve` 工具，以及
+    `make verify-corpus`——后者要直接跑检索来断言"失效版本不被召回"与
+    "无答案提问被拒答"，而它不需要 `ToolResult` 那层封装（证据、call_id、
+    错误码都不是它要的）。让 `verify` 去 `tool._retriever` 里掏，
+    就是让一个命令依赖另一个类的私有属性。
 
     **词表必须从快照装载**（`load_vocabulary`），不能按需去 MySQL 现算：
     查询侧与入库侧的 IDF 必须来自同一份冻结快照，否则同一个词在两侧的
@@ -239,14 +245,34 @@ async def build_rag_retrieve_tool(
         storage,
         ttl_seconds=settings.rag.vocab_cache_ttl_seconds,
     )
-    retriever = Retriever(
+    return Retriever(
         settings=settings,
         gateway=gateway,
         vector_store=vector_store,
         tokenizer=Tokenizer.from_settings(settings),
         vocabulary=vocabulary,
     )
+
+
+async def build_rag_retrieve_tool(
+    settings: Settings,
+    gateway: ModelGateway,
+    *,
+    vector_store: VectorStore,
+    storage: ObjectStorage,
+    vocab: VocabRepository,
+    cache: VersionedCache,
+) -> RagRetrieveTool:
+    """装配点。参数与 `build_retriever` 相同，见那里的说明。"""
+    retriever = await build_retriever(
+        settings,
+        gateway,
+        vector_store=vector_store,
+        storage=storage,
+        vocab=vocab,
+        cache=cache,
+    )
     return RagRetrieveTool(settings=settings, retriever=retriever)
 
 
-__all__ = ["RagRetrieveTool", "build_rag_retrieve_tool"]
+__all__ = ["RagRetrieveTool", "build_rag_retrieve_tool", "build_retriever"]

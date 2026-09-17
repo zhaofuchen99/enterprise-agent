@@ -303,6 +303,36 @@ class Tokenizer:
         return not (len(token) == 1 and not token.isascii())
 
 
+def is_general_word(token: str) -> bool:
+    """这个 token 在 jieba 的**通用词典**里是不是一个真词。
+
+    供检索侧的「语料从未出现过这个词」判定使用（见
+    `retriever._unseen_topics`）——**为什么需要它**：只说"词表里没有"
+    是不够的，切分本身会产生**伪 token**。实测一例：
+
+        「2025 年 8 月的经营月报里区域分布情况如何」
+        → jieba 切成 …月报 / 报里 / 区域分布…
+
+    `报里` 不在词表里（语料当然没用过这个词），于是它被判成"语料没见过
+    的主题词"，一条余弦 0.79 的**高度相关问题**被拒答。而这类伪 token 是
+    **无界**的：任何切分抖动都会造出新的，靠维护一份排除表堵不住。
+
+    加一道「通用词典认不认识」之后，判据变成一句可检验的话：
+    **一个通用词典认识的词，我们的语料一次都没用过**。
+    `报里` 连通用词典都不认识 → 出局；`食堂` 认识而语料没有 → 仍然触发。
+
+    代价是那些通用词典也不认识的**复合词**（`碳积分`、`带货`、`月报`、
+    `区域分布`）不再单独触发。这是**故意偏保守**的一侧：它们的漏判由
+    相关性门禁的余弦那一路兜，而误判会直接拒掉一条好问题。
+
+    **必须显式 `initialize()`**：前缀词典是惰性构建的，没构建时
+    `get_FREQ` 对**任何**词都返回 None，判据会静默失效（全部判成"不认识"
+    等于永不触发）。它幂等，只有第一次真的建词典。
+    """
+    jieba.initialize()
+    return jieba.get_FREQ(token) is not None
+
+
 def load_stopwords(path: str) -> frozenset[str]:
     """读停用词表。文件不存在或为空时返回空集。
 
@@ -352,6 +382,28 @@ class Vocabulary:
 
     def id_of(self, token: str) -> int | None:
         return self._token_ids.get(token)
+
+    def covers(self, token: str) -> bool:
+        """语料里**有没有以这个词为组成部分**的 token。
+
+        **`id_of(token) is None` 不等于"语料没见过这个词"**，这是实测踩到的：
+        「归口」在 88 篇语料的 chunk 文本里出现 **69 次**，而它的 `token_id` 是
+        `None`——因为业务词典把「归口管理部门」收成了一个词（`rag_terms.txt`），
+        jieba 从此不再单独切出「归口」。于是按"不在词表"判定，
+        一条余弦 0.84 的**高度相关问题**（「直营渠道的价格管理由哪个部门归口负责」）
+        会被判成 `NO_RELEVANT_KNOWLEDGE`。
+
+        分词把长词收成一个 token 是**业务词典的正常工作方式**，不是异常。
+        判据因此要说成"语料里有没有以它为组成部分的词"，而不是"它是不是一个 token"。
+
+        ⚠️ **它解决不了同义词**：「报备」在语料里一次都没出现（制度写的是「备案」），
+        也不被任何词包含，于是仍然会被判成"语料没见过"。那一类只能靠语义
+        （重排器 / Phase 8 的 Reviewer），纯词汇规则区分不了"语料没讲过这件事"
+        与"语料用的是另一个说法"。已知的这一例会长期留在金标集里当回归用例。
+        """
+        if token in self._token_ids:
+            return True
+        return any(token in known for known in self._token_ids)
 
     def idf(self, token: str) -> float:
         """该 token 的 IDF。未登录词返回一个保守的高值，理由见 `_UNSEEN_TOKEN_DF`。"""

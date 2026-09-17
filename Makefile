@@ -142,6 +142,10 @@ sql:  ## 跑一次自然语言 → SQL → 真数据 → 证据：make sql Q="20
 
 eval-sql:  ## 跑金标 SQL 评测集，产出正确率（前置：make up + 业务库已灌数）
 	uv run python scripts/eval_sql.py $(if $(ONLY),--only $(ONLY),)
+eval-rag:  ## 跑 RAG 金标 20 条，产出 Recall@8 与定位一致率（前置：make ingest + Ollama）
+	uv run python scripts/eval_rag.py $(if $(ONLY),--only $(ONLY),)
+verify-corpus:  ## 断言 10 类缺陷真的注入了产物（不是清单标注），任一失败即非零（前置：make ingest）
+	uv run python -m app.cli verify-corpus
 
 vector-spike:  ## TBC-05 向量库选型实测（四个候选项同口径对比，需独立 venv，见脚本 docstring）
 	@test -x /tmp/tbc05-venv/bin/python || { \
