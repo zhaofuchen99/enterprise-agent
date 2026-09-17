@@ -131,6 +131,55 @@ class SqlToolTuning(BaseModel):
     max_evidence_rows: int = Field(default=20, ge=1, le=1000)
 
 
+class RagTuning(BaseModel):
+    """RAG 检索与入库参数（详细设计 19.5 的 `rag` 段 / 11.3 / 11.6 / 11.7）。
+
+    **段名为什么可以叫 `rag`**：`RedisTuning` / `ModelTuning` 之所以要加 `_tuning`
+    后缀，是因为那两处已有扁平的 `REDIS_URL` / `MODEL_NAME`，再挂一个同名嵌套模型
+    会让 `REDIS_URL` 与 `REDIS__URL` 指向两个不同的东西。此处不存在这个情况——
+    Phase 0 留下的 `RAG_TOP_K` / `RAG_SCORE_THRESHOLD` 等扁平字段
+    **已在本阶段全部迁入本段**，环境变量是 `RAG__TOP_K`，与文档同名。
+
+    分块参数（`chunk_*`）"必须通过 RAG 评测集校准，而非视为永久常量"（11.3），
+    因此它们在这里是配置而不是常量。
+    """
+
+    #: collection 名（11.5）。**更换向量模型必须新建 collection 全量重建，
+    #: 禁止在同一 collection 混用维度或模型版本**——所以模型版本进了名字里。
+    collection: str = "enterprise_knowledge_chunks_v1"
+    #: 双路召回的 TopK（11.7 第 4 步），两路同值但**分开配置**：
+    #: 稀疏路的召回质量依赖分词与词表，调它和调 dense 是两件事。
+    dense_top_k: int = Field(default=20, ge=1, le=200)
+    sparse_top_k: int = Field(default=20, ge=1, le=200)
+    #: RRF 合并后的候选上限（11.7 第 5 步），不超过 30
+    max_candidates: int = Field(default=30, ge=1, le=200)
+    #: 最终进入证据的条数（11.7 第 7 步）
+    rerank_top_k: int = Field(default=8, ge=1, le=100)
+    #: 相关度阈值。**低于校准阈值的候选被剔除**（11.7 第 7 步）。
+    #: 当前值基于小规模演示语料，扩集后必须重校准——见本模块末的说明。
+    score_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    #: RRF 的秩常数 k（`1/(k + rank)`）。60 是原论文取值。
+    rrf_k: int = Field(default=60, ge=1, le=1000)
+
+    #: 稀疏向量维度固定值（11.6.3）。2^24 为词表增长预留空间，
+    #: 避免频繁扩容；**它的下限必须装得下 token_id 的分配上限**，见下方的交叉校验。
+    sparse_dim: int = Field(default=16_777_216, ge=1024, le=1_000_000_000)
+    #: 业务词典与停用词文件路径（11.6.2）
+    user_dict_path: str = "configs/rag_user_dict.txt"
+    stopword_path: str = "configs/rag_stopwords.txt"
+    #: 词表在 Redis 中的读缓存 TTL，键为 `cache:vocab:{version}`（4.4 纪律 1）
+    vocab_cache_ttl_seconds: int = Field(default=3600, ge=1, le=86_400)
+
+    #: 单个上传文件的大小上限（开发流程 6.7 施工项 5）
+    max_file_bytes: int = Field(default=52_428_800, ge=1024, le=512 * 1024 * 1024)
+    #: 分块目标块长与重叠（11.3 括号内的"中文正文字符"）
+    chunk_target_chars: int = Field(default=800, ge=100, le=4000)
+    chunk_min_chars: int = Field(default=500, ge=50, le=4000)
+    chunk_overlap_chars: int = Field(default=100, ge=0, le=1000)
+    #: 入库后的抽样检索条数：发布前的冒烟（11.1 的 Retrieval Smoke Test）
+    publish_smoke_queries: int = Field(default=3, ge=0, le=50)
+
+
 class WorkerTuning(BaseModel):
     """Worker 与队列参数（开发流程 6.3 / 详细设计 19.5 的 worker 段）。"""
 
@@ -233,12 +282,16 @@ class Settings(BaseSettings):
     redis_tuning: RedisTuning = Field(default_factory=RedisTuning)
 
     # ------------------------------------------------------------------ 向量库
-    milvus_uri: str = Field(min_length=1)
-    rag_score_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
-    rag_top_k: int = Field(default=20, ge=1, le=200)
-    rag_rerank_top_n: int = Field(default=8, ge=1, le=100)
-    rag_user_dict: str = "configs/rag_user_dict.txt"
-    rag_stopwords: str = "configs/rag_stopwords.txt"
+    #: Qdrant 服务端地址（TBC-05 已结案，2026-09-17）。
+    #:
+    #: **必须指向服务端，不要用 qdrant-client 的本地模式**（`path=` 参数）。
+    #: 本地模式单进程独占存储目录，第二个进程直接报
+    #: `Storage folder ... is already accessed by another instance`；
+    #: 而本项目 `make run` 是 api + worker 双进程，`make ingest` 又是第三个。
+    #: 这是选型时实测出来的硬约束，不是风格偏好——数据见详细设计 23.1.1。
+    qdrant_url: str = Field(min_length=1)
+    #: collection 名与检索/入库参数（详细设计 19.5 的 `rag` 段）
+    rag: RagTuning = Field(default_factory=RagTuning)
 
     # ------------------------------------------------------------------ 存储
     storage_backend: Literal["s3", "local"] = "local"
@@ -308,6 +361,21 @@ class Settings(BaseSettings):
                 "WORKER__HEARTBEAT_TTL_SECONDS 至少要是 WORKER__HEARTBEAT_INTERVAL_SECONDS "
                 f"的两倍（要容忍漏掉一拍），当前为 {self.worker.heartbeat_ttl_seconds} / "
                 f"{self.worker.heartbeat_interval_seconds}"
+            )
+
+        # 分块三个参数的关系必须在启动时挡住，而不是等入库脚本跑起来才暴露：
+        # 重叠大于最小块长会让「按句子边界二次切分」永远切不动——
+        # 切完一段仍短于最小块长，于是同一段被反复并入相邻块，
+        # 表现为入库很慢且块内容互相污染，从配置上根本看不出来。
+        if self.rag.chunk_min_chars >= self.rag.chunk_target_chars:
+            raise ValueError(
+                "RAG__CHUNK_MIN_CHARS 必须小于 RAG__CHUNK_TARGET_CHARS，当前为 "
+                f"{self.rag.chunk_min_chars} / {self.rag.chunk_target_chars}"
+            )
+        if self.rag.chunk_overlap_chars >= self.rag.chunk_min_chars:
+            raise ValueError(
+                "RAG__CHUNK_OVERLAP_CHARS 必须小于 RAG__CHUNK_MIN_CHARS，当前为 "
+                f"{self.rag.chunk_overlap_chars} / {self.rag.chunk_min_chars}"
             )
         return self
 

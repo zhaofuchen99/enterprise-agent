@@ -20,7 +20,7 @@ _MINIMAL: dict[str, str] = {
     "EMBEDDING_API_KEY": "k",
     "DATABASE_URL_AGENT": "mysql+asyncmy://a@127.0.0.1:3306/agent",
     "DATABASE_URL_BUSINESS_RO": "mysql+asyncmy://b@127.0.0.1:3307/business",
-    "MILVUS_URI": "http://127.0.0.1:19530",
+    "QDRANT_URL": "http://127.0.0.1:6333",
     "REDIS_URL": "redis://127.0.0.1:6379/0",
     "JWT_SECRET": "a-sufficiently-long-secret",
 }

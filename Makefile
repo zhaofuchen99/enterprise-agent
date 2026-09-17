@@ -16,16 +16,16 @@ bootstrap:  ## 首次启动：创建 .env 与虚拟环境
 	uv sync
 	@echo "完成。下一步：make up"
 
-up:  ## 启动有状态组件（redis / agent-mysql / business-mysql / minio）
+up:  ## 启动有状态组件（redis / agent-mysql / business-mysql / qdrant / minio）
 	$(COMPOSE) up -d
 	@echo "等待健康检查通过…"
 	@$(COMPOSE) ps
 
-rag-up:  ## 额外启动 Milvus（内存占用大，Phase 5 才需要）
-	$(COMPOSE) --profile rag up -d milvus
+rag-up:  ## 兼容旧写法：确保 Qdrant 已启动（它已并入默认 up，此目标可省略）
+	$(COMPOSE) up -d qdrant
 
 down:  ## 停止所有组件
-	$(COMPOSE) --profile rag down
+	$(COMPOSE) down
 
 ps:  ## 查看组件状态
 	$(COMPOSE) --profile rag ps
@@ -114,3 +114,11 @@ sql:  ## 跑一次自然语言 → SQL → 真数据 → 证据：make sql Q="20
 
 eval-sql:  ## 跑金标 SQL 评测集，产出正确率（前置：make up + 业务库已灌数）
 	uv run python scripts/eval_sql.py $(if $(ONLY),--only $(ONLY),)
+
+vector-spike:  ## TBC-05 向量库选型实测（四个候选项同口径对比，需独立 venv，见脚本 docstring）
+	@test -x /tmp/tbc05-venv/bin/python || { \
+		echo "缺少实测环境，先按脚本 docstring 的「复现」一节建独立 venv："; \
+		echo "  uv venv /tmp/tbc05-venv --python 3.12"; \
+		echo "  uv pip install --python /tmp/tbc05-venv/bin/python pymilvus milvus-lite qdrant-client chromadb"; \
+		exit 1; }
+	/tmp/tbc05-venv/bin/python scripts/spike_vector_store.py

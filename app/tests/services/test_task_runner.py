@@ -41,7 +41,7 @@ def _settings(**worker: object) -> Settings:
         database_url_agent="mysql+asyncmy://a@localhost/a",
         database_url_business_ro="mysql+asyncmy://a@localhost/b",
         redis_url="redis://localhost:6379/0",
-        milvus_uri="http://localhost:19530",
+        qdrant_url="http://localhost:6333",
         jwt_secret="x" * 32,
         worker=worker,
     )

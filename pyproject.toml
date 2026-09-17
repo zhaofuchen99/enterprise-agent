@@ -26,8 +26,10 @@ dependencies = [
     # --- Agent 编排 ---
     "langgraph>=0.2",
     "langchain-core>=0.3",
-    # --- 向量库（TBC-05：须支持 SPARSE_FLOAT_VECTOR）---
-    "pymilvus>=2.4",
+    # --- 向量库（TBC-05 已结案 2026-09-17：Qdrant 服务端）---
+    # 自带 py.typed，因此**不需要**加进下方 mypy 的 ignore_missing_imports 名单。
+    # 须支持稀疏向量与 RRF 融合——这是 11.5 / 11.7 的硬要求，选型实测见详细设计 23.1.1。
+    "qdrant-client>=1.12",
     # --- 中文分词 ---
     "jieba>=0.42.1",
     # --- 可观测 ---
@@ -124,7 +126,21 @@ show_error_codes = true
 
 [[tool.mypy.overrides]]
 # 无类型标注的第三方库
-module = ["jieba.*", "arq.*", "aioboto3.*", "asyncmy.*", "fakeredis.*", "pymilvus.*"]
+#
+# `chromadb.*` 与 `pymilvus.*` 是**选型实测脚本专用**的例外：
+# `scripts/spike_vector_store.py` 要用它们跑 TBC-05 的三方对比，但两者
+# **都不是项目依赖**（实测已否决 Chroma；Milvus 因单进程独占与内存被改判）。
+# 脚本用独立 venv 跑一次即可，不该为了跑通 mypy 把它们拖进项目依赖表——
+# 那等于让两个被否决的候选长期占着依赖位。
+module = [
+    "jieba.*",
+    "arq.*",
+    "aioboto3.*",
+    "asyncmy.*",
+    "fakeredis.*",
+    "chromadb.*",
+    "pymilvus.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -141,7 +157,7 @@ asyncio_default_fixture_loop_scope = "function"
 # 单独跑用 `make test-integration`（命令行上的 -m 会覆盖这里的值）。
 addopts = "-q --strict-markers --strict-config -m 'not integration'"
 markers = [
-    "integration: 需要真实外部依赖（Redis / MySQL / Milvus）",
+    "integration: 需要真实外部依赖（Redis / MySQL / Qdrant）",
     "e2e: 需要完整多进程栈",
 ]
 

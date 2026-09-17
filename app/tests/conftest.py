@@ -34,7 +34,7 @@ _TEST_ENV: dict[str, str] = {
     # 凭据与 docker-compose.dev.yml 里的 agent-mysql 一致。
     "DATABASE_URL_AGENT": "mysql+asyncmy://agent:agent_pw@127.0.0.1:3308/agent_test",
     "DATABASE_URL_BUSINESS_RO": "mysql+asyncmy://readonly:readonly_pw@127.0.0.1:3307/business",
-    "MILVUS_URI": "http://localhost:19530",
+    "QDRANT_URL": "http://localhost:6333",
     "REDIS_URL": "redis://localhost:6381/15",
     # 长度 >= 32 字节：HS256 的密钥短于摘要长度会被 PyJWT 警告（RFC 7518 3.2）
     "JWT_SECRET": "test-secret-not-for-production-but-long-enough",

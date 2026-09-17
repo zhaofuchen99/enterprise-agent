@@ -1,9 +1,13 @@
 # 开发环境有状态组件（开发流程 4.1 / 6.1）
 #
-# Milvus 放在 rag profile 下：它单独就要 4–8GB 内存，而本机 WSL 只有 7.6GB。
-# Phase 0–4 不需要它，Phase 5 开工前再决定是调 WSL 内存还是换向量库。
-#   make up        -> redis / agent-mysql / business-mysql / minio
-#   make rag-up    -> 额外拉起 milvus
+# 向量库是 Qdrant 服务端（TBC-05 结案，2026-09-17）。它实测只占约 300MB，
+# 因此**不再单独放 profile**，与其余组件一同由 `make up` 拉起。
+#
+# 为什么必须是服务端形态而不是 SDK 的本地模式：本地模式单进程独占目录，
+# 而本项目 `make run` 是 api + worker 双进程、`make ingest` 又是第三个。
+# 详细设计与实测数据见「详细设计 23.1.1」。
+#   make up        -> redis / agent-mysql / business-mysql / qdrant / minio
+#   make rag-up    -> 兼容旧写法，等价于确保 qdrant 已启动
 
 name: enterprise-agent-dev
 
@@ -103,32 +107,27 @@ services:
       timeout: 5s
       retries: 10
 
-  milvus:
-    profiles: ["rag"]
-    image: milvusdb/milvus:v2.4.15
-    container_name: ea-milvus
-    command: ["milvus", "run", "standalone"]
-    security_opt:
-      - seccomp:unconfined
-    environment:
-      ETCD_USE_EMBED: "true"
-      ETCD_DATA_DIR: /var/lib/milvus/etcd
-      COMMON_STORAGETYPE: local
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ea-qdrant
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      - "6333:6333"   # HTTP / REST，`QDRANT_URL` 指向它
+      - "6334:6334"   # gRPC
     volumes:
-      - milvus-data:/var/lib/milvus
+      - qdrant-data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 15s
-      timeout: 10s
+      # 镜像里没有 curl，用 bash 的内建 /dev/tcp 探端口。
+      # **不用 `/readyz` 之类的 HTTP 探测**：它需要额外装工具，
+      # 而"端口通不通"对本地开发已经足够——探针失败只会让 `make ps` 显示 unhealthy。
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 10
-      start_period: 90s
+      start_period: 15s
 
 volumes:
   redis-data:
   agent-mysql-data:
   business-mysql-data:
   minio-data:
-  milvus-data:
+  qdrant-data:

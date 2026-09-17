@@ -22,7 +22,7 @@
 | Python | 3.12.x | 由 `uv` 自动安装，无需手动准备 |
 | uv | 最新 | <https://docs.astral.sh/uv/> |
 | Docker + Compose | 最新稳定 | 承载有状态组件 |
-| 内存 | ≥ 16GB | Milvus 单实例就要 4–8GB，见下方「已知限制」 |
+| 内存 | ≥ 8GB 可用 | 向量库改判 Qdrant 后实测仅占 300MB（见下方「已知限制」） |
 
 ### 1. 初始化
 
@@ -93,7 +93,7 @@ curl -s localhost:8000/api/agent/tasks/<task_id> -H "Authorization: Bearer $TOKE
 
 ```
 make up         启动有状态组件          make check      提交前必跑（lint+类型+分层+测试）
-make rag-up     额外启动 Milvus         make lint       仅静态检查
+make rag-up     额外启动 Qdrant         make lint       仅静态检查
 make down       停止全部                make typecheck  仅类型检查
 make redis-cli  进入 Redis 排查         make layering   仅分层约束检查
 make api        只起 API 进程           make test       仅单元测试
@@ -164,7 +164,7 @@ app/
 ├── domain/         user / conversation / task / evidence / conflict / plan / loop / review（纯模型）
 ├── services/       auth_service / task_service / task_runner / event_bus / rate_limit / ...
 ├── repositories/   user_repo / conversation_repo / task_repo（Protocol + 实现）
-├── infrastructure/ db / redis / milvus / storage / model_gateway / observability / logging
+├── infrastructure/ db / redis / qdrant / storage / model_gateway / observability / logging
 ├── core/           config / ids / cache / errors / security
 └── tests/
 ```
@@ -190,7 +190,7 @@ LOOP__MAX_TOTAL_STEPS=30
 
 | 限制 | 影响 | 处理 |
 |---|---|---|
-| 本机 WSL 内存 7.6GB | Milvus 需 4–8GB，与 MySQL/Redis/MinIO 并存会很紧张 | Milvus 置于 `rag` profile，Phase 0–4 不受影响；Phase 5 前需决定是否上调 WSL 内存或更换向量库 |
+| 本机 WSL 内存 7.6GB | Milvus Standalone 需 8GB 起，跑不起来 | **已由 TBC-05 结案解决**：向量库改判 Qdrant（实测 300MB、多进程并发正常），见详细设计 23.1.1 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
 | `MODEL_*` / `EMBEDDING_*` 未选型（TBC-04） | Phase 3 起才真正需要 | 见开发流程 12.2 |
 | **用户与会话**仓储仍是进程内实现 | 重启丢数据、多实例互不可见 | Phase 2 换 MySQL；替换面收敛在 `app/main.py` 的 `wire_dependencies()` |

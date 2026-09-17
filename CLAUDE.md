@@ -9,7 +9,7 @@
 **企业智能数据分析与决策 Agent** —— 把自然语言问题转化为可追溯的数据结论的多 Agent 系统。
 SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环里协作，全过程可观测、可重放、有界收敛。
 
-技术栈：Python 3.12 · FastAPI · LangGraph · MySQL 8 · Redis · Milvus · OTel · arq · uv
+技术栈：Python 3.12 · FastAPI · LangGraph · MySQL 8 · Redis · Qdrant · OTel · arq · uv
 
 ## 当前进度
 
@@ -32,6 +32,10 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 > - **第 2 批**：Phase 5 RAG 裁剪版 → 最小 Graph（6 节点）→ Evidence → Reviewer-lite
 >
 > **Search / SSE / Reranker / 完整 Conflict / 评测扩集 / 生产部署后置**，切片内不要顺手做。
+>
+> ⚠️ **2026-09-17 变更**：项目负责人裁决 **RAG 不裁剪**（冲刺方案 §4.2 已撤销），
+> 语料回到 80+ 篇 / 10 类缺陷、完整入库发布流程、词表扩容机制、`verify-corpus` 门禁、
+> Recall@8 校准**都要做**。唯一维持后置的是 **Reranker**——依据是详设 TBC-04 的决议记录，不是本节裁剪。
 > 每次开工前先读冲刺方案的第 8 节（冻结范围与分批）和第 11 节（面试口径纪律——
 > 第 1 批做完时 RAG 还没做，简历与口述不得提前声称）。
 
@@ -90,10 +94,11 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 
 | 项 | 备注 |
 |---|---|
-| **Reranker**（选型 + 阈值校准） | 切片内用 RRF 融合后的 Top K 直接出证据 |
-| **语料扩到 80+ 篇 + 缺陷注入全套（10 类）** | 切片内先 15–25 篇、2 类缺陷。**扩集后必须重校准 RAG 阈值**——当前阈值基于小语料，结论不具代表性 |
-| 文档版本发布流程（staging → smoke test → publish）、知识管理接口 FR-ADM-001、扫描件 OCR、跨页表格还原 | 切片内直接入库 + 脚本 |
-| 词表扩容机制（`token_id` 只增不改的运维面） | **表结构与固定 IDF 方案已在切片内保留** |
+| **Reranker**（选型 + 阈值校准） | 依据详设 TBC-04 后置。实现 `reranker.py` 与 `RERANKER_ENABLED` 接缝，默认关闭走 RRF Top-K |
+| ~~语料扩到 80+ 篇 + 缺陷注入全套（10 类）~~ | **已移回 Phase 5**（§4.2 撤销裁剪）。**阈值必须基于该语料校准**，不得沿用任何小语料取值 |
+| ~~文档版本发布流程（staging → smoke test → publish）~~ | **已移回 Phase 5**。staging 载体是 payload 状态位，不是 partition |
+| 知识管理接口 FR-ADM-001、扫描件 OCR、跨页表格还原 | 入库走脚本不做后台；扫描件 PDF 在语料中保留但**明确标记不支持** |
+| ~~词表扩容机制（`token_id` 只增不改的运维面）~~ | **已移回 Phase 5**。需验证"扩容后历史 chunk 无需重算仍可召回" |
 | `agent_conflict` / `agent_review` 表与完整 5 类 Conflict 检测 | 切片内只做「报告数字 vs DB 数字」一类，且先不建表 |
 | `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
 | SSE 订阅端点与订阅令牌（Phase 1.5 已完成事件流，剩余是暴露端点） | |
@@ -213,7 +218,7 @@ make redis-cli
   用 `bind_context()` 绑定上下文字段，不要自己往 `extra` 塞任意键（会被 `ValueError` 拒绝）
 - **配置**：新增配置项写入 `app/core/config.py`，必须有**默认值、上下限、环境覆盖规则**。
   嵌套配置用双下划线：`LOOP__MAX_TOTAL_STEPS=30`
-- **测试**：单元测试不依赖真实外部组件；需要真实 Redis/MySQL/Milvus 的用例打 `@pytest.mark.integration`。
+- **测试**：单元测试不依赖真实外部组件；需要真实 Redis/MySQL/Qdrant 的用例打 `@pytest.mark.integration`。
   `make test` 默认**排除** integration，`make test-integration` 单独跑（前置 `make up`）。
   Redis 的替身是 `fakeredis`（它能跑真实 Lua 脚本，因此限流与仓储的原子性是被真实执行验证的）
 - **服务角色**：`service` 字段（api / worker）由入口模块的常量决定，**不是配置项**——
@@ -229,11 +234,11 @@ make redis-cli
 | 项 | 值 | 说明 |
 |---|---|---|
 | 项目路径 | `/home/zfc/projects/enterprise-agent` | WSL 原生 ext4。**不要放 `/mnt/c` 或 `/mnt/e`**——9p 协议小文件 I/O 慢 60–110 倍 |
-| 内存 | 7.6GB（物理机 16GB） | **Milvus Standalone 需 8GB 起，本机跑不起来** |
+| 内存 | 7.6GB（物理机 16GB） | **这就是 TBC-05 改判 Qdrant 的直接原因**：Milvus Standalone 需 8GB 起，本机跑不起来；Qdrant 实测仅占 300MB |
 | Redis | 宿主端口 **6381** | 6379 被本机原生 redis 占用（存有另一个项目的数据，不可动）；6380 被 redis-stack 占用。容器内仍是 6379 |
 | MinIO | 镜像用 `quay.io/minio/minio` | 本机 daemon 的 `docker.m.daocloud.io` 镜像源对 `minio/minio` 返回 403 |
 | MySQL | agent **`3308`** / business `3307` | business 用只读账号，写操作必须被数据库拒绝。agent 用 3308 而非 3306：**Windows 侧另有一个独立安装的 MySQL 占着 `0.0.0.0:3306`**，wslrelay 因此无法为 3306 建立 localhost 转发（实测 3307/6379/6380/6381/9000 都转发，唯独没有 3306）。用 Windows 的图形客户端连 `localhost:3306` 会连到**那个** MySQL，看不到 `agent_task` 等表 |
-| Milvus | 在 `rag` profile 下，默认不启动 | 见下方未决项 |
+| Qdrant | 宿主端口 **6333**（HTTP）/ 6334（gRPC） | 服务端形态，**不要用 SDK 的本地模式**——它单进程独占（见 TBC-05） |
 
 ### 从 Windows 侧的图形客户端连库（Navicat 等）
 
@@ -263,9 +268,15 @@ Windows 通过 `wslrelay` 转发 `127.0.0.1:<宿主端口>` 访问。**主机一
 
 ## 未决项
 
-| 编号 | 内容 | 何时需要定 |
+**当前没有未决项。**
+
+| 编号 | 状态 | 决议 |
 |---|---|---|
-| TBC-05 | **向量库**：Milvus Standalone 本机内存不足。候选为 Milvus Lite（嵌入式，`pymilvus` 同一客户端，只改 URI）、Qdrant、Chroma。**勘察性实测已有数据**（`scripts/spike_milvus_lite.py`：嵌入式方案支持 `SPARSE_FLOAT_VECTOR` + RRF 混合检索，2000 条 768 维下峰值 RSS 317MB），**但选型仍不结案** | Phase 5 开工前，三候选同口径对比后再定 |
+| **TBC-05** | ✅ **已结案（2026-09-17）** | **Qdrant 服务端**。原定 Milvus 2.4+，三候选同口径实测后改判：Chroma 无稀疏向量与融合排序，直接出局；Milvus Lite 与 Qdrant 本地模式**都是单进程独占**（`make run` 是 api + worker 双进程，无法共享）；Milvus Standalone 需 8GB 而本机 7.6GB，**生产形态在本机无法验证**。Qdrant 服务端实测：混合检索 4.4ms、内存 300MB、多进程并发正常。完整数据见详细设计 23.1.1，脚本 `scripts/spike_vector_store.py` |
+
+> ⚠️ **对外解释选型时，前提必须说全**：否决 Milvus 的**是这台开发机的内存约束**，
+> 不是 Milvus 本身不行。换台内存充裕的机器，Milvus Standalone 同样成立。
+> 略过这个前提，结论就从"有数据支撑的选型"退化成"随便选了一个"。
 
 **处理未决项的原则**：先做最小验证拿到数据再决策，不要靠读文档空猜。
 `infrastructure/` 层必须把外部组件隔离干净，使换实现的成本控制在一个文件内。
