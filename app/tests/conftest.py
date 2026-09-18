@@ -29,6 +29,13 @@ _TEST_ENV: dict[str, str] = {
     "EMBEDDING_MODEL": "test-embedding",
     "EMBEDDING_API_KEY": "test-key",
     "EMBEDDING_BASE_URL": "https://embedding.invalid/v1",
+    # 重排**必须显式钉住**。它的产品默认值是 false，但 Settings 还会读开发机的
+    # `.env`——那里**开着**（真 key、真服务），于是"没钉住"这一件事的后果比
+    # 别的配置项都重：单元测试会**真的去打付费外部服务并花钱**，
+    # 而且结果随对方模型浮动。与 `MODEL_BASE_URL` 钉在 `.invalid` 是同一条纪律，
+    # 只是那一条拦的是"打真实服务"，这一条还多拦一个"花真实的钱"。
+    # 实测踩到：打开 `.env` 的重排开关后，19 条用例当场变成"要到真服务去重排"。
+    "RERANKER_ENABLED": "false",
     # 指向**独立的测试库** agent_test，不是开发库 agent：
     # 契约测试会反复建表与清数据，指向开发库等于把本地数据当消耗品。
     # 凭据与 docker-compose.dev.yml 里的 agent-mysql 一致。

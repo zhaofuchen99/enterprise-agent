@@ -23,7 +23,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 2 数据库 | ✅ 完成 | Alembic 初始化、16 张表迁移（可升可回滚）、仓储层换 MySQL（用户/会话/任务）、`RedisTaskRepository` 已删除、MySQL 就绪探针、**业务演示库 8 表 + 反向构造 49.9 万行数据（11 条断言全过，含 EXPLAIN 索引验证）**。剩余项见下方登记的「后续扩展」 |
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
-| 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。**⑨Reranker 已实现（2026-09-18）**：`tools/rag/reranker.py`（11.7 第 ⑥⑦ 步）+ 网关 `rerank`（Cohere 契约，硅基流动/Jina 兼容）+ `make calibrate-rerank`。**默认关闭**（关掉与失败走同一条降级路径）。**11.7 第 ⑧ 步「邻近块扩展」仍然后置**——重排分已经有了，缺的是存储层"按定位取相邻块"的能力 |
+| 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。**⑨Reranker 已实现并校准（2026-09-18）**：`tools/rag/reranker.py`（11.7 第 ⑥⑦ 步）+ 网关 `rerank`（Cohere 契约，硅基流动/Jina 兼容）+ `make calibrate-rerank`。选型 `BAAI/bge-reranker-v2-m3`（云）。阈值 `RAG__RERANK_SCORE_THRESHOLD=0.07` 由实测分布定：有答案 20 条 0.1364–0.9989、语料中不存在 3 条 0.0008–0.0125，**差一个数量级**。**实测开/关对比**（同一份金标与语料）：Recall@8 **95.0% → 100.0%**（19/20 → 20/20）、定位一致率 **85% → 95%**，提升全部来自 rag-06（同义词误拒）被语义判据救回；3 条应拒答的仍然拒答、`verify-corpus` 仍 **10/10**。**默认关闭**（关掉与失败走同一条降级路径）。**11.7 第 ⑧ 步「邻近块扩展」仍然后置**——重排分已经有了，缺的是存储层"按定位取相邻块"的能力 |
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite | ✅ 完成（第一阶段） | **只做 14.1 的确定性检查**（六条：必需步骤是否跑过、claim 有无引用、引用是否存在、BLOCKING 冲突是否披露、敏感字段是否泄露、未解决问题是否列出）。**能 FAIL 任务**——14.3 的一票否决意味着"结论没有依据"时 `final` 输出"审查未通过"而不是把原答案放出去。`RETRY`/`CLARIFY` 不产出（要 retry_router 与状态位，属 Phase 8 完整版） |
@@ -361,9 +361,20 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     - 两路**都进 `safe_detail`**（判据一/二/三）：阈值调错了与语料真没有，
       症状相同、处置完全不同。
     ⚠️ 这个切换的收益是金标 rag-06 那类**同义词误拒**（「报备」vs 语料里的「备案」）
-    能被语义判据救回来；代价是拒答行为从此依赖一个云服务。**它的依据必须是
-    `make calibrate-rerank` 跑出来的分数分布**（20 条真问题的最低分 vs 3 条
-    不存在问题的最高分），不是"手感上应该能分开"。
+    能被语义判据救回来；代价是拒答行为从此依赖一个云服务。**它的依据是
+    `make calibrate-rerank` 跑出来的分数分布**（2026-09-18 实测，88 篇语料）：
+    有答案 20 条落在 **0.1364–0.9989**，语料中不存在 3 条落在 **0.0008–0.0125**
+    ——**相差一个数量级**，与稠密余弦那对"重叠 0.04"的样本完全不同。
+    阈值取 **0.07**（`RAG__RERANK_SCORE_THRESHOLD`）：不进区间中点，
+    而是往下压——两侧代价不对称，**误拒真问题的代价更大**。
+    另注：同一批样本两次跑的分不完全相同（0.1350↔0.1364、0.0129↔0.0125），
+    11 倍的间隔意味着这点抖动不影响结论。
+    **开/关的实测对比**（同一份语料与金标）：Recall@8 19/20 → **20/20**、
+    定位一致率 17/20 → **19/20**，两条提升都来自 rag-06 那条同义词用例；
+    3 条应拒答的仍全部拒答、`make verify-corpus` 仍 10/10。
+    ⚠️ **口径别说过头**：样本只有 20 条，一条的差别就是 5 个百分点，
+    该说的是"**唯一那条纯词汇规则救不回来的用例被救回来了**"，
+    而不是"重排让 Recall@8 提升了 5 个点"。
 58. **关闭与失败走同一条代码路径，但原因串必须不同**
     （`DISABLED` / `UNAVAILABLE:<错误码>` / `INCOMPLETE`）。
     两者的**处置完全一样**（按 RRF 序取 Top-K）——这正是"重排是增强步骤"的实现；
@@ -388,6 +399,12 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 62. **送进 cross-encoder 的是候选正文，不拼标题与章节路径**。
     语料的分块本身带层级标题，再拼一遍是拿实现细节去引导模型。
     校准若显示标题确有信息量，再改这里是**一次可测量的实验**。
+63. **`Settings` 会读开发机的 `.env`，所以"测试环境变量"必须把开关项显式钉住**
+    ——产品默认值管不了这件事。实测踩到：`.env` 里把 `RERANKER_ENABLED` 打开之后，
+    **19 条单元测试当场从"用替身"变成"要去真服务重排"**（还花钱、
+    结果还随对方的模型浮动）。现在 `app/tests/conftest.py` 的 `_TEST_ENV`
+    里显式写了 `RERANKER_ENABLED=false`。**新增任何"默认关、开发机可能开"
+    的开关（`SEARCH_ENABLED` 是下一个）时照此办理。**
 
 ### 【后续扩展】登记
 
