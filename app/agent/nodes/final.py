@@ -83,11 +83,20 @@ def _render(analysis: AnalysisResult, evidence: list[Evidence], state: AgentStat
         lines.extend(f"- {item}" for item in limits)
         lines.append("")
 
-    if not analysis.conflicts:
-        # **把"没检出冲突"与"还没做检测"分开说**：冲突检测属 Phase 9，
-        # 现在恒为空。不写这一句的话，读答案的人会以为
-        # "没有冲突"是被验证过的结论，而它其实只是个空列表。
-        lines.append("> 本次未执行多源冲突检测（该能力属 Phase 9）。")
+    if analysis.conflicts:
+        lines.append("## 数据不一致（需人工核对）")
+        # **冲突必须显式列出来，而且要说清"没有谁对谁错的结论"**：
+        # 检测器只发现不一致，判谁对要靠 13.2 的证据优先级（Phase 9）。
+        # 只说"发现冲突"而不说"未判定"，读者会默认系统已经选好了。
+        lines.extend(f"- {item}" for item in analysis.conflicts)
+        lines.append("")
+        lines.append("> 以上不一致已检出但**未判定哪一方为准**（证据优先级判定属 Phase 9）。")
+        lines.append("")
+    else:
+        # **把"没检出"与"没检测"分开说**：切片内只做 VALUE 一类（见
+        # `nodes/conflict.py` 的清单）。写"没有冲突"会让读答案的人以为
+        # 五类都比过了，而实际只比了一类。
+        lines.append("> 本次只对「同口径数值」做了比对，未覆盖口径/时点/范围/来源四类冲突。")
         lines.append("")
 
     if analysis.follow_up_questions:

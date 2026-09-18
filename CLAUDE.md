@@ -25,7 +25,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
 | 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。⑨Reranker 与 11.7 第 ⑧ 步按 TBC-04 维持后置 |
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
-| 7–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：Evidence 冲突检测（报告数字 vs DB）→ Reviewer-lite |
+| 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
+| 8–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -248,6 +249,25 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     而 `PermissionScope` 的空 `region_ids` 表示**不限**（TBC-03）——
     拿它当兜底等于让一个已删除用户的任务拿到全量数据，且不会有任何报错。
 
+38. **冲突检测只做 VALUE 一类，另外四类各有各的缺前提**（`nodes/conflict.py` 列了清单）：
+    `DEFINITION` / `SCOPE` 要文档侧的 `metric_code` 与 `scope`，而分块不带指标 code；
+    `TIME` 要文档的统计期间，而 `event_time` 是**生效区间**（报告恒为空）；
+    `SOURCE` 要判"方向相反"，属 Phase 9。**被问"冲突检测做了多少"时照这个答**，
+    不要笼统说"做了冲突检测"。
+39. **文档表头 → `metric_code` 靠指标目录，且精确名优先于别名**。
+    `net_sales` 的别名里有「销售额」，而报告里那一列是**含税 − 折扣**口径——
+    按别名匹配会把两列都映射到 `net_sales`，对同一个 SQL 数字报出**两条冲突**，
+    其中一条是假的。`_prefer_exact` 是这条的正面防线：
+    同一张表里某指标既有精确名列又有别名列时，别名列让位。
+    匹配方式（exact/alias）进 `detected_difference`，读冲突的人据此判断结论有多硬。
+40. **检测器不判谁对**（`resolution` 默认 `UNRESOLVED`，`severity` 取 WARNING 而非 BLOCKING）。
+    判谁对要按 13.2 的证据优先级，那是 Reviewer/Phase 9 的事。
+    默认成已处置会让一个未处置的冲突看起来已经处置过了。
+41. **已知误报类：表格行不区分合计行与分项行**。实测里「分区域经营情况」表的一行会被
+    当成区域的合计去比，而它其实是某个分项。模型能在 `claims` 里自己纠正
+    （实测出现过），但**检测器这一层还没有这个判别力**——需要表格的合计标记或
+    指标口径里的 grain 信息。同样登记为后续扩展。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -270,7 +290,9 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 文档侧的 `metric_code` / `definition_version` / `scope` 暂时留空（分块不带指标 code，按 `logical_key` 反推是把自由文本约定当语义用）。**13.4 的 DEFINITION / SCOPE 冲突因此暂时只覆盖 SQL 侧**，要等文档与指标目录挂钩 | Phase 9 |
 | 把疑问词并入 `configs/rag_stopwords.txt`（更整齐，但改切分必须重跑 `make vocab` + `make ingest` + 检索回归集） | Phase 5 收尾 |
 | **同义词导致的误拒**：`报备` vs 语料里的 `备案`（金标 rag-06，余弦 0.74 仍被拒答）。纯词汇规则解决不了，要靠重排器或 Phase 8 的 Reviewer 给语义信号 | 与 Reranker 同批 |
-| VALUE / TIME 冲突的**检出**（语料侧注入已由 `verify-corpus` 标 `[注入]` 确认）：`agent_conflict` 表与 13.4 的检测算法 | Phase 9 |
+| **冲突检测的另外四类**（DEFINITION / TIME / SCOPE / SOURCE）：前提分别是文档侧 `metric_code`+`scope`、文档统计期间、方向判定，见 `nodes/conflict.py` 的清单 | Phase 9 |
+| **表格合计行与分项行的区分**：现在两者都会被当成"该指标在该范围的值"去比，实测产生过误报 | Phase 9 |
+| `agent_conflict` 表落库（现在冲突只在 State 与 `answer_payload` 里） | Phase 9 |
 | `reindex` 接口：**原文件已归档、collection 已是可重建的派生数据，只差一条命令**。注意重建前要比对行的 `checksum` 与归档原文（`FORCE=1` 失败重建时两者会分叉，见详设 11.9 的落地记录） | Phase 5 收尾 |
 | 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |
 | Qdrant 的 `set_payload` 跨分片无事务保证 → 发布窗口内读者可能看到同一版本的部分 chunk。要严格就需把状态位提到文档级（见详设 11.1 的落地记录第 4 条） | 语料规模上去再评估 |

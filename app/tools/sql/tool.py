@@ -128,7 +128,10 @@ class SqlQueryTool:
     ) -> None:
         self.name: ToolName = TOOL_NAME
         self._settings = settings
-        self._catalog = catalog
+        #: 公开只读：Phase 6 的冲突检测要用它把文档表头映射到 `metric_code`
+        #: （`agent/nodes/conflict.py`）。给一个 property 而不是让调用方拿
+        #: `_catalog`，是为了这个用途在签名上可见。
+        self.catalog = catalog
         self._provider = provider
         self._generator = generator
         self._validator = validator
@@ -154,7 +157,7 @@ class SqlQueryTool:
                 "tool.call_id": call_id,
                 "task.id": ctx.task_id,
                 "sql.scope_restricted": not scope.unrestricted,
-                "sql.schema_version": self._catalog.version,
+                "sql.schema_version": self.catalog.version,
             },
         ) as current:
             try:
@@ -174,7 +177,7 @@ class SqlQueryTool:
                 outcome.result,
                 question=args.question,
                 scope=scope,
-                catalog=self._catalog,
+                catalog=self.catalog,
                 max_rows=self._settings.sql_tool.max_evidence_rows,
             )
             return _success_result(
@@ -241,13 +244,13 @@ class SqlQueryTool:
             data_time_range=validated.data_time_range,
             warnings=tuple(validated.rewrites)
             + (("已按当前账号的数据权限限定查询范围",) if validated.scope_injected else ()),
-            schema_version=self._catalog.version,
+            schema_version=self.catalog.version,
         )
         evidence = build_evidence(
             result,
             question=sql,
             scope=ctx.permission_scope,
-            catalog=self._catalog,
+            catalog=self.catalog,
             max_rows=self._settings.sql_tool.max_evidence_rows,
         )
         return _success_result(result, (), evidence, started_at=started_at)
@@ -403,7 +406,7 @@ class SqlQueryTool:
             metric_definitions=self._metric_definitions(candidate, context),
             warnings=tuple(warnings),
             attempts=tuple(attempts),
-            schema_version=self._catalog.version,
+            schema_version=self.catalog.version,
         )
 
     def _metric_codes(
@@ -416,7 +419,7 @@ class SqlQueryTool:
         这样「模型用了什么口径」与「我们给了什么口径」的差异是可观测的，
         而不是被我们单方面覆盖掉。
         """
-        declared = [code for code in candidate.value.metric_codes if self._catalog.metric(code)]
+        declared = [code for code in candidate.value.metric_codes if self.catalog.metric(code)]
         if declared:
             return tuple(declared)
         return tuple(metric.code for metric in context.metrics)
@@ -428,7 +431,7 @@ class SqlQueryTool:
         return tuple(
             f"{metric.name}({metric.code}) = {metric.expression}｜口径版本 {metric.version}"
             for code in self._metric_codes(candidate, context)
-            if (metric := self._catalog.metric(code)) is not None
+            if (metric := self.catalog.metric(code)) is not None
         )
 
 

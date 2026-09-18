@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from app.agent.nodes.conflict import render as render_conflicts
 from app.agent.prompts.analysis import ANALYSIS_PROMPT
 from app.agent.schemas.analysis import AnalysisResult, InvestigationStep, SupportedClaim
 from app.agent.state import AgentState
@@ -57,6 +58,7 @@ def build_analysis_node(
             return {
                 "analysis_result": AnalysisResult(
                     direct_answer="没有检索到可支撑该问题的内容。",
+                    conflicts=tuple(item.description for item in (state.get("conflicts") or [])),
                     limitations=tuple(_no_evidence_limitations(state)),
                 )
             }
@@ -68,6 +70,10 @@ def build_analysis_node(
                 AnalysisResult,
                 question=state.get("user_query") or "",
                 evidence=_render(numbered),
+                # **冲突在分析之前就算好了**（详设 6.1 的
+                # `evidence_aggregate → conflict_detect → analysis`）：
+                # 让模型在写结论时就知道哪里对不上，而不是写完再补一段。
+                conflicts=render_conflicts(state.get("conflicts") or []),
             )
         except AgentError as exc:
             return {
@@ -118,6 +124,10 @@ def _with_resolved_ids(
     return result.model_copy(
         update={
             "claims": tuple(claims),
+            # **冲突由代码写进 `conflicts`，不采用模型在正文里提没提**
+            # （详设 13.3 的 `Conflict` 是结构化字段）。模型只负责在
+            # `direct_answer` 里把它说清楚，那是措辞的事。
+            "conflicts": tuple(item.description for item in (state.get("conflicts") or [])),
             "limitations": (*result.limitations, *_pipeline_limitations(state)),
             "investigation_chain": _chain(state),
         }

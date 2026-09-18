@@ -1,0 +1,214 @@
+"""多源冲突检测（详细设计 13.3 / 13.4 的 VALUE 一类）。
+
+**这里最容易犯的错是"报出一个看起来被算出来的冲突"**——它格式正确、
+有数字、有差值，只是配错了对。所以用例大多在测"不该报的时候不报"：
+指标名不同不报、范围不同不报、容差内不报、单位读不出来不报。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+
+from app.agent.nodes.conflict import detect_value_conflicts, render
+from app.core.ids import IdPrefix, new_id
+from app.domain.evidence import Evidence, TimeRange
+from app.tools.sql.schemas import MetricSpec, SchemaCatalog
+
+
+def _catalog(*metrics: MetricSpec) -> SchemaCatalog:
+    return SchemaCatalog(version="test-1", tables=(), metrics=metrics)
+
+
+def _metric(code: str, name: str, aliases: tuple[str, ...] = ()) -> MetricSpec:
+    return MetricSpec(
+        code=code,
+        name=name,
+        aliases=aliases,
+        expression="SUM(x)",
+        unit="CNY",
+        grain="订单行",
+    )
+
+
+def _sql_evidence(value: float, *, metric: str = "net_sales", region: str = "华东") -> Evidence:
+    return Evidence(
+        id=new_id(IdPrefix.EVIDENCE),
+        source_type="SQL",
+        title="问题（结果第 1 行）",
+        claim=f"region_name={region}；{metric}={value}",
+        locator={"sql_fingerprint": "f" * 64, "result_slice": [0, 1]},
+        event_time=TimeRange(
+            start=datetime(2025, 7, 1, tzinfo=UTC), end=datetime(2025, 10, 1, tzinfo=UTC)
+        ),
+        retrieved_at=datetime(2026, 9, 18, tzinfo=UTC),
+        metric_code=metric,
+        scope={"region": region},
+        reliability="HIGH",
+        content_hash="a" * 64,
+    )
+
+
+def _document_evidence(text: str, *, title: str = "华东区域2025年第三季度专项分析") -> Evidence:
+    return Evidence(
+        id=new_id(IdPrefix.EVIDENCE),
+        source_type="DOCUMENT",
+        title=title,
+        claim=text,
+        locator={"section_path": [title, "二、经营业绩回顾"], "chunk_id": "chk_x"},
+        retrieved_at=datetime(2026, 9, 18, tzinfo=UTC),
+        reliability="MEDIUM",
+        content_hash="b" * 64,
+    )
+
+
+_TABLE = """华东区域2025年第三季度专项分析 > 二、经营业绩回顾
+表：分区域经营情况
+区域 | 销售额（万元） | 净销售额（万元） | 同比 | 占比 | 省份数
+华东 | 11,233.87 | 11,039.58 | -13.2% | 100.0% | 4"""
+
+
+def test_detects_a_value_conflict_across_sources() -> None:
+    """文档表格里的净销售额 vs 库里的净销售额，超出容差 → 报冲突。
+
+    单位（万元）**必须从表头读出来**：不换算的话 11,039.58 与 1.1 亿
+    差四个数量级，报出来的差值毫无意义，而它看起来是一条正常的冲突。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额", ("净销售", "销售额")))
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
+    )
+
+    assert len(conflicts) == 1
+    item = conflicts[0]
+    assert item.type.value == "VALUE"
+    # 11,039.58 万元 = 110,395,800 元
+    assert item.detected_difference["document_value"] == pytest.approx(110_395_800.0)
+    assert item.detected_difference["database_value"] == pytest.approx(111_967_031.73)
+    # **用的是精确名而不是别名**：别名里那个「销售额」是含税口径，用它匹配会报假冲突
+    assert item.detected_difference["matched_by"] == "exact"
+    # 未判定谁对——那是 Reviewer 的事（14.3），不是检测器的
+    assert item.resolution.value == "UNRESOLVED"
+    assert len(item.evidence_ids) == 2
+
+
+def test_the_exact_column_wins_over_the_aliased_one() -> None:
+    """**同一张表里精确名列优先，别名列让位**——这是那个陷阱的正面防线。
+
+    语料里的报表同时有这两列：`区域 | 销售额（万元） | 净销售额（万元）`，
+    而 `net_sales` 的别名表里**包含「销售额」**（它是含税 − 折扣口径）。
+    不处理的话两列都会映射到 `net_sales`，对同一个 SQL 数字报出**两条冲突**，
+    其中拿含税口径比的那一条是假的——而它和真冲突长得一模一样。
+
+    上一条用例（`test_detects_a_value_conflict_across_sources` 断言只有 1 条）
+    就是这条规则的另一个侧面。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额", ("销售额",)))
+    only_aliased = _TABLE.replace("净销售额（万元） | ", "")
+    conflicts = detect_value_conflicts(
+        [_document_evidence(only_aliased), _sql_evidence(111_967_031.73)], catalog=catalog
+    )
+
+    # 只剩别名列时仍然比——只是要标出来它是靠别名对上的
+    assert len(conflicts) == 1
+    assert conflicts[0].detected_difference["matched_by"] == "alias"
+
+
+def test_no_conflict_when_the_difference_is_within_tolerance() -> None:
+    """容差内不报（13.4 第 4 步：绝对 1 元与相对 0.1% 取较大者）。
+
+    这条防的是"任何舍入差异都报冲突"——那会让冲突列表变成噪声，
+    而真冲突被淹在里面。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    # 差 0.05%（小于 0.1% 的相对容差）
+    close = 110_395_800.0 * 1.0005
+
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_TABLE), _sql_evidence(close)], catalog=catalog
+    )
+
+    assert conflicts == ()
+
+
+def test_no_conflict_when_the_scope_differs() -> None:
+    """范围不同不报——两个不同区域的数本来就不该相等。
+
+    不比对范围的话，"华东 1.1 亿"与"华南 1.06 亿"会被报成一条冲突，
+    而它其实只是两个地方。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_TABLE), _sql_evidence(111_967_031.73, region="华南")],
+        catalog=catalog,
+    )
+
+    assert conflicts == ()
+
+
+def test_no_conflict_when_the_metric_differs() -> None:
+    """指标不同不报。`销售额` 那一列（含税口径）不该与净销售额比。"""
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    conflicts = detect_value_conflicts(
+        [
+            _document_evidence(_TABLE),
+            _sql_evidence(111_967_031.73, metric="gross_sales"),
+        ],
+        catalog=catalog,
+    )
+
+    assert conflicts == ()
+
+
+def test_sql_without_a_matching_value_in_the_claim_is_skipped() -> None:
+    """SQL 证据的 `claim` 里找不到 `metric_code` 的值时**跳过，不猜**。
+
+    这条是"报出一个看起来被算出来的冲突"最可能的来源：
+    从别的列里取一个数去比对，配出来的冲突格式完全正常。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    mismatched = _sql_evidence(111_967_031.73).model_copy(
+        update={"claim": "region_name=华东；gross_sales=12345"}
+    )
+
+    assert detect_value_conflicts([_document_evidence(_TABLE), mismatched], catalog=catalog) == ()
+
+
+def test_a_document_without_tables_produces_nothing() -> None:
+    """正文里的数字不解析——从自由文本取数要知道"这个数说的是哪个指标"，
+    那是语义，纯正则硬做出来的是一堆看起来像冲突的噪声。"""
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    prose = _document_evidence("报告期内，华东实现销售额 11,233.87 万元，净销售额11,039.58 万元。")
+
+    assert detect_value_conflicts([prose, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+
+
+def test_without_a_catalog_nothing_is_compared() -> None:
+    """没有指标目录就没有"表头 → metric_code"的桥，整条检测跳过。
+
+    **跳过不等于"没有冲突"**：`final` 的渲染会把这两种情形分开说
+    （见 `nodes/final.py`），否则读答案的人会以为五类都比过了。
+    """
+    from app.agent.nodes.conflict import build_conflict_node
+
+    node = build_conflict_node(catalog=None)
+    state: Any = {"evidence": [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)]}
+
+    assert node(state) == {"conflicts": []}
+
+
+def test_render_lists_the_possible_explanations() -> None:
+    """渲染给模型看的文本要带上可能原因——那是它披露冲突时的措辞依据。"""
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
+    )
+
+    text = render(conflicts)
+
+    assert "[C1]" in text
+    assert "可能原因" in text
+    assert "UNRESOLVED" in text
+    assert render(()) == "（未检出冲突）"

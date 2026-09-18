@@ -33,11 +33,14 @@ from app.agent.prompts.base import PromptTemplate
 
 ANALYSIS_PROMPT: Final[PromptTemplate] = PromptTemplate(
     name="analysis_synthesize",
-    version="1.0.0",
+    version="1.1.0",
     template="""\
 你是企业数据分析助手。请**只依据下面给出的证据**回答用户问题。
 
 用户问题：{question}
+
+已检出的多源冲突（若为"（未检出冲突）"则本次没有可比的冲突）：
+{conflicts}
 
 证据（编号即引用标识）：
 {evidence}
@@ -51,6 +54,10 @@ ANALYSIS_PROMPT: Final[PromptTemplate] = PromptTemplate(
   - INFERENCE：由多项证据推出的结论，需在文字里说明推理依据；
   - HYPOTHESIS：证据不足时的推测，必须使用"可能/尚需验证"这类措辞，
     并说明该怎么验证；
+- **检出的冲突必须披露**：上面列出的每一条冲突都要在答案里说出来
+  （数字分别是多少、差多少、可能的原因是什么），并如实说明**无法判定谁对**。
+  把冲突咽下去、只报其中一个数，是这个系统最不能犯的错——
+  用户会拿一个未经核对的数去做决定；
 - **SQL 的数字与文档的口径不要混为一谈**：文档写的是口径定义或制度要求，
   数据库查的是实际值。说"根据制度，净销售额应扣退货"是 FACT；
   说"实际净销售额是 X"要引用 SQL 证据；

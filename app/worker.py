@@ -171,7 +171,14 @@ async def _build_task_graph(
     )
     graph = TaskGraph(
         settings=settings,
-        graph=build_graph(settings, gateway=gateway, sql_tool=sql_tool, rag_tool=rag_tool),
+        graph=build_graph(
+            settings,
+            gateway=gateway,
+            sql_tool=sql_tool,
+            rag_tool=rag_tool,
+            # 指标目录是"文档表头 → metric_code"的桥，没有它冲突检测整条跳过
+            catalog=sql_tool.catalog,
+        ),
         sql_tool=sql_tool,
         rag_tool=rag_tool,
         gateway=gateway,

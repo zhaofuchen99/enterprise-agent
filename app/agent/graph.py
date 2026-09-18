@@ -6,7 +6,9 @@ START → supervisor ─┬─(sql)──→ sql ──┐
                     └─(analysis)─────┘           └─(收敛)──────────→ analysis → final → END
 ```
 
-六个节点：`supervisor / sql / rag / reflect / analysis / final`。
+七个节点：`supervisor / sql / rag / reflect / conflict / analysis / final`。
+（§8.1 的最小集是六个；`conflict` 是 §8.3 第 6 项「Evidence（含简化冲突检测）」
+按详设 6.1 的 `conflict_detect` 加上的。）
 **`dispatch` 不是节点，是条件边函数**——详设 6.1 里它单独成节点是因为
 计划可能有多条带依赖的步骤；本版的计划是"每条数据源一步、互不依赖"，
 "找下一步"就退化成一个纯函数（`route_dispatch`），
@@ -23,7 +25,8 @@ START → supervisor ─┬─(sql)──→ sql ──┐
 | `rag_rewrite/retrieve/rerank` | 合进 `rag` 节点 | 同上 |
 | `normalize_tool_result` | 合进 `sql`/`rag` 节点 | `nodes/tool_nodes._normalize` |
 | `plan_extend` | 无（`reflect` 直接改计划） | 【后续扩展】模型的 EXPAND 判定 |
-| `conflict_detect` | 无 | 【Phase 9】 |
+| `conflict_detect` | **`conflict` 节点（切片版）** | 只做 VALUE 一类 |
+| | | 四类缺前提的理由见 `nodes/conflict.py` |
 | `reviewer` / `retry_router` | 无 | 【Phase 8】冲刺方案 §8.5 第 1 项 |
 | `clarify` | 无 | 澄清以答案文本表达，状态位见【后续扩展】 |
 
@@ -40,6 +43,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.nodes.analysis import build_analysis_node
+from app.agent.nodes.conflict import build_conflict_node
 from app.agent.nodes.final import build_final_node
 from app.agent.nodes.reflect import build_reflect_node
 from app.agent.nodes.supervisor import build_supervisor_node
@@ -60,6 +64,7 @@ _NODE_SUPERVISOR = "supervisor"
 _NODE_SQL = "sql"
 _NODE_RAG = "rag"
 _NODE_REFLECT = "reflect"
+_NODE_CONFLICT = "conflict"
 _NODE_ANALYSIS = "analysis"
 _NODE_FINAL = "final"
 
@@ -69,7 +74,7 @@ _NODE_FINAL = "final"
 _TARGETS: dict[Route, str] = {
     Route.SQL: _NODE_SQL,
     Route.RAG: _NODE_RAG,
-    Route.ANALYSIS: _NODE_ANALYSIS,
+    Route.ANALYSIS: _NODE_CONFLICT,
     Route.CLARIFY: _NODE_FINAL,
     Route.FAIL: _NODE_FINAL,
 }
@@ -105,7 +110,11 @@ def _after_supervisor(state: AgentState) -> str:
 
 
 def _after_reflect(state: AgentState) -> str:
-    """`reflect → ?`：还有待执行就继续，否则收敛到 `analysis`。"""
+    """`reflect → ?`：还有待执行就继续，否则收敛到 `conflict`（再进 `analysis`）。
+
+    **收敛的出口是 `conflict` 而不是 `analysis`**：冲突检测要的是
+    "全部证据都到齐了"这个时点，而它就在 `reflect` 判 SUFFICIENT 的那一刻。
+    """
     route = route_dispatch(state)
     return _TARGETS[route]
 
@@ -130,6 +139,7 @@ def build_graph(
     gateway: ModelGateway,
     sql_tool: Any,
     rag_tool: Any,
+    catalog: Any | None = None,
 ) -> CompiledStateGraph[AgentState]:
     """组装并编译图。
 
@@ -150,6 +160,7 @@ def build_graph(
     _add_node(graph, _NODE_SQL, build_sql_node(settings, sql_tool))
     _add_node(graph, _NODE_RAG, build_rag_node(settings, rag_tool))
     _add_node(graph, _NODE_REFLECT, build_reflect_node())
+    _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog))
     _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway))
     _add_node(graph, _NODE_FINAL, build_final_node())
 
@@ -166,8 +177,12 @@ def build_graph(
     graph.add_conditional_edges(
         _NODE_REFLECT,
         _after_reflect,
-        [_NODE_SQL, _NODE_RAG, _NODE_ANALYSIS],
+        [_NODE_SQL, _NODE_RAG, _NODE_CONFLICT],
     )
+    # 详设 6.1 的顺序是 `evidence_aggregate → conflict_detect → analysis`：
+    # **冲突在分析之前算好**，让模型写结论时就知道哪里对不上，
+    # 而不是写完再补一段"此外还有冲突"。
+    graph.add_edge(_NODE_CONFLICT, _NODE_ANALYSIS)
     graph.add_edge(_NODE_ANALYSIS, _NODE_FINAL)
     graph.add_edge(_NODE_FINAL, END)
     return graph.compile()

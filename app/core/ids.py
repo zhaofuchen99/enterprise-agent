@@ -56,6 +56,10 @@ class IdPrefix(StrEnum):
     #: 而两个来源各生成一个 id 比"按 statement 文本去重"可靠——
     #: 后者在模型换一种措辞重述同一条时就不去重了。
     FINDING = "fnd"
+    #: 多源冲突（Phase 6 的 `Conflict`，13.3）。与 `Finding` 同理：
+    #: `agent_conflict` 表属 Phase 9，但 id 现在就要有——冲突是
+    #: "答案为什么这么写"的追溯入口之一，`cft_` 与 `evd_` 在日志里要能一眼分开。
+    CONFLICT = "cft"
     #: 知识文档版本（Phase 5 的 `knowledge_document.id`，16.8）。
     #: 与 `chunk_id` 的分工要分清：chunk 的身份是 `logical_key@version`（确定性派生，
     #: 重复入库要覆盖同一条），而这一行是**入库这一次动作**的实体，随机生成。

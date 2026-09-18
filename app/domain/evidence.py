@@ -25,6 +25,7 @@ Phase 5 的 RAG 往同一张表里写。
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -96,4 +97,75 @@ class Evidence(BaseModel):
         return (self.metric_code or "", self.title)
 
 
-__all__ = ["Evidence", "EvidenceSource", "Reliability", "TimeRange"]
+__all__ = [
+    "Conflict",
+    "ConflictResolution",
+    "ConflictSeverity",
+    "ConflictType",
+    "Evidence",
+    "EvidenceSource",
+    "Reliability",
+    "TimeRange",
+]
+
+
+class ConflictType(StrEnum):
+    """冲突类型（详细设计 13.3）。
+
+    五类各有各的判据，**取值封闭**：多一类意味着多一套检测算法，
+    而写成 `str` 会让未知取值一路走到 Reviewer 才炸。
+    """
+
+    VALUE = "VALUE"  # 同口径数值超出容差
+    DEFINITION = "DEFINITION"  # 口径版本不同
+    TIME = "TIME"  # 时间区间或数据快照不一致
+    SCOPE = "SCOPE"  # 维度过滤范围不同
+    SOURCE = "SOURCE"  # 外部材料与内部事实相悖
+
+
+class ConflictSeverity(StrEnum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    #: 阻断性冲突。**切片内不产出它**：要判到 BLOCKING 得有"哪一方一定对"的依据，
+    #: 而那正是 13.2 的证据优先级要回答的问题（Phase 9 完整版）
+    BLOCKING = "BLOCKING"
+
+
+class ConflictResolution(StrEnum):
+    """冲突的处置（13.3）。
+
+    `UNRESOLVED` 是**默认**：检测器只负责"发现了不一致"，
+    谁对谁错需要证据优先级（13.2）与 Reviewer 判断。
+    默认成 `RESOLVED` 会让一个未处置的冲突看起来已经处置过了。
+    """
+
+    RESOLVED = "RESOLVED"
+    DISCLOSED = "DISCLOSED"
+    UNRESOLVED = "UNRESOLVED"
+
+
+class Conflict(BaseModel):
+    """一条多源冲突（详细设计 13.3）。
+
+    `possible_explanations` **不是客套字段**：它是这个检测器对自己结论的限定。
+    数值不一致的原因可能是口径、时点、范围、或真的有一方错了，
+    而**光看证据分不出来**（文档的统计期间不在 Evidence 里）。
+    把它列为"可能原因"而不是直接断言"数据错了"，是这一版能给出的最诚实的结论。
+
+    `selected_basis` 在切片内恒为 `None`：那是 Reviewer 在拿到冲突之后
+    做的判断（14.3 的 `resolution`），不由检测器代劳。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    type: ConflictType
+    #: 参与冲突的证据。**至少两条**——只有一条构不成冲突
+    evidence_ids: tuple[str, ...] = Field(min_length=2)
+    severity: ConflictSeverity = ConflictSeverity.WARNING
+    description: str
+    #: 机器可比的差异明细（两边的值、差值、相对差、用的容差）
+    detected_difference: dict[str, object] = Field(default_factory=dict)
+    possible_explanations: tuple[str, ...] = ()
+    resolution: ConflictResolution = ConflictResolution.UNRESOLVED
+    selected_basis: str | None = None
