@@ -33,10 +33,19 @@ def build_final_node() -> Callable[[AgentState], Any]:
     def final(state: AgentState) -> dict[str, Any]:
         analysis = state.get("analysis_result")
         evidence = list(state.get("evidence") or [])
+        review = state.get("review_result")
 
-        # `analysis is None` 说明 supervisor 之前就失败了（模型不可用 / 计划非法）：
-        # **不要编一个答案**，把已经发生的错误如实说出去。
-        answer = _failure_answer(state) if analysis is None else _render(analysis, evidence, state)
+        if analysis is None:
+            # supervisor 之前就失败了（模型不可用 / 计划非法）：
+            # **不要编一个答案**，把已经发生的错误如实说出去。
+            answer = _failure_answer(state)
+        elif review is not None and review.status == "FAIL":
+            # 14.3 的一票否决：**结论没有依据时不把答案放出去**。
+            # 这类答案看起来和别的答案一样，只是那句结论是空口说的，
+            # 而人会拿它去做决定——拦住它是 Reviewer 存在的全部意义。
+            answer = _blocked_answer(analysis, review)
+        else:
+            answer = _render(analysis, evidence, state, review)
 
         return {
             "final_answer": answer,
@@ -46,7 +55,31 @@ def build_final_node() -> Callable[[AgentState], Any]:
     return final
 
 
-def _render(analysis: AnalysisResult, evidence: list[Evidence], state: AgentState) -> str:
+def _blocked_answer(analysis: AnalysisResult, review: Any) -> str:
+    """审查未通过时的答案。
+
+    **把"没通过"和"为什么"一起说出去**，而不是回一个通用文案：
+    用户看到的应该是一条可行动的说明（哪条结论没依据），
+    而不是"系统出错了"。
+    """
+    lines = ["本条回答未通过发布前的落地检查，因此不作为结论提供。", ""]
+    lines.append("## 未通过的原因")
+    lines.extend(f"- {item.message}" for item in review.blocking)
+    lines.append("")
+    lines.append(f"> 审查：{review.status}（{review.reason_code}）")
+    if analysis.limitations:
+        lines.append("")
+        lines.append("## 补充说明")
+        lines.extend(f"- {item}" for item in analysis.limitations)
+    return "\n".join(lines)
+
+
+def _render(
+    analysis: AnalysisResult,
+    evidence: list[Evidence],
+    state: AgentState,
+    review: Any = None,
+) -> str:
     by_id = {item.id: item for item in evidence}
     lines: list[str] = [analysis.direct_answer.strip(), ""]
 
@@ -97,6 +130,13 @@ def _render(analysis: AnalysisResult, evidence: list[Evidence], state: AgentStat
         # `nodes/conflict.py` 的清单）。写"没有冲突"会让读答案的人以为
         # 五类都比过了，而实际只比了一类。
         lines.append("> 本次只对「同口径数值」做了比对，未覆盖口径/时点/范围/来源四类冲突。")
+        lines.append("")
+
+    if review is not None and review.warnings:
+        # **审查的警告也进"限制"**：它是"这条答案有个已知的弱点"，
+        # 与证据层面的限制对读者是同一种信息。分成两节只会让人只看其中一节。
+        lines.append("## 发布前检查的提醒")
+        lines.extend(f"- {item.message}" for item in review.warnings)
         lines.append("")
 
     if analysis.follow_up_questions:
@@ -162,6 +202,12 @@ def _payload(
             for step_id, result in (state.get("step_results") or {}).items()
         },
         "plan_revision": state.get("plan_revision", 0),
+        # 审查结论进 payload：API 与前端要能看到"这条答案经过检查、结论如何"
+        "review": (
+            state["review_result"].model_dump(mode="json")
+            if state.get("review_result") is not None
+            else None
+        ),
     }
 
 

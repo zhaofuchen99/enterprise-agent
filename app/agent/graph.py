@@ -6,9 +6,9 @@ START → supervisor ─┬─(sql)──→ sql ──┐
                     └─(analysis)─────┘           └─(收敛)──────────→ analysis → final → END
 ```
 
-七个节点：`supervisor / sql / rag / reflect / conflict / analysis / final`。
-（§8.1 的最小集是六个；`conflict` 是 §8.3 第 6 项「Evidence（含简化冲突检测）」
-按详设 6.1 的 `conflict_detect` 加上的。）
+八个节点：`supervisor / sql / rag / reflect / conflict / analysis / reviewer / final`。
+（§8.1 的最小集是六个；`conflict` 是 §8.3 第 6 项「Evidence（含简化冲突检测）」、
+`reviewer` 是第 7 项「Reviewer-lite」按详设 6.1 加上的。）
 **`dispatch` 不是节点，是条件边函数**——详设 6.1 里它单独成节点是因为
 计划可能有多条带依赖的步骤；本版的计划是"每条数据源一步、互不依赖"，
 "找下一步"就退化成一个纯函数（`route_dispatch`），
@@ -27,7 +27,8 @@ START → supervisor ─┬─(sql)──→ sql ──┐
 | `plan_extend` | 无（`reflect` 直接改计划） | 【后续扩展】模型的 EXPAND 判定 |
 | `conflict_detect` | **`conflict` 节点（切片版）** | 只做 VALUE 一类 |
 | | | 四类缺前提的理由见 `nodes/conflict.py` |
-| `reviewer` / `retry_router` | 无 | 【Phase 8】冲刺方案 §8.5 第 1 项 |
+| `reviewer` | **`reviewer` 节点（第一阶段）** | 确定性检查；模型审查属 Phase 8 |
+| `retry_router` | 无 | 【Phase 8】`RETRY` / `CLARIFY` 两个状态要有预算与续跑入口 |
 | `clarify` | 无 | 澄清以答案文本表达，状态位见【后续扩展】 |
 
 **这份表是面试口径的一部分**：说"做了最小 Graph"时，被问"详设里那 20 个节点呢"
@@ -46,6 +47,7 @@ from app.agent.nodes.analysis import build_analysis_node
 from app.agent.nodes.conflict import build_conflict_node
 from app.agent.nodes.final import build_final_node
 from app.agent.nodes.reflect import build_reflect_node
+from app.agent.nodes.reviewer import build_reviewer_node
 from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
 from app.agent.state import AgentState, Route, pending_steps
@@ -66,6 +68,7 @@ _NODE_RAG = "rag"
 _NODE_REFLECT = "reflect"
 _NODE_CONFLICT = "conflict"
 _NODE_ANALYSIS = "analysis"
+_NODE_REVIEWER = "reviewer"
 _NODE_FINAL = "final"
 
 #: `Route` → 节点名。`CLARIFY` / `FAIL` 都收敛到 `final`：
@@ -162,6 +165,7 @@ def build_graph(
     _add_node(graph, _NODE_REFLECT, build_reflect_node())
     _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog))
     _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway))
+    _add_node(graph, _NODE_REVIEWER, build_reviewer_node())
     _add_node(graph, _NODE_FINAL, build_final_node())
 
     graph.add_edge(START, _NODE_SUPERVISOR)
@@ -183,7 +187,11 @@ def build_graph(
     # **冲突在分析之前算好**，让模型写结论时就知道哪里对不上，
     # 而不是写完再补一段"此外还有冲突"。
     graph.add_edge(_NODE_CONFLICT, _NODE_ANALYSIS)
-    graph.add_edge(_NODE_ANALYSIS, _NODE_FINAL)
+    # 详设 6.1 的顺序是 `analysis → reviewer → final_answer`：审查的是
+    # **草稿**（`analysis_result`），而不是渲染后的 Markdown——
+    # 渲染会丢掉结构（claim 与引用的对应关系），从文本反推回结构是错的方向。
+    graph.add_edge(_NODE_ANALYSIS, _NODE_REVIEWER)
+    graph.add_edge(_NODE_REVIEWER, _NODE_FINAL)
     graph.add_edge(_NODE_FINAL, END)
     return graph.compile()
 
