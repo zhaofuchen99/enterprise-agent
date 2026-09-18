@@ -40,6 +40,7 @@ DIM = 4
 #: 留着未登录会让"未登录词判据"的用例断言不出它真正要断的东西。
 _KNOWN = (
     "华东",
+    "归口",
     "区域",
     "渠道折扣",
     "政策",
@@ -333,6 +334,42 @@ async def test_unseen_topic_is_rejected_even_when_similarity_passes(
     )
     assert ok.unseen_topics == ()
     assert not ok.no_relevant_knowledge
+
+
+async def test_a_compound_containing_a_known_term_is_not_unseen(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """**语料认识的词被包在更大的词里时，不算"语料没见过"。**
+
+    实测踩到的：用户写「华东**地区**」，而语料一律写「华东**区域**」，
+    jieba 把「华东地区」切成一个整词——于是 `id_of()` 是 None，
+    一条余弦 0.71 的**真问题**被判成"没有相关知识"。
+    `covers` 只查了"问题词被语料词包含"（归口 ⊂ 归口管理部门），
+    缺了镜像方向。这条钉住它。
+    """
+    assert vocabulary.covers("华东地区") is True  # 华东 ⊂ 华东地区
+    assert vocabulary.covers("归口") is True  # 归口 ⊂ 归口管理部门（另一方向）
+    assert vocabulary.covers("碳积分") is False  # 两个方向都不沾
+
+
+async def test_demonstratives_do_not_count_as_unseen_topics(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """指示代词同样是 OOV 的常客，且同样不携带主题。
+
+    语料是陈述性的，从不用「**这个**口径怎么定」这种指代写法——
+    而用户会很自然地这么问。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert([_point(0, text="华东渠道折扣", dense=[1.0, 0, 0, 0])])
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策这个口径", [1.0, 0, 0, 0])
+
+    outcome = await _retriever(settings, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策这个口径"), scope=_scope()
+    )
+
+    assert outcome.unseen_topics == ()
+    assert not outcome.no_relevant_knowledge
 
 
 async def test_interrogatives_do_not_count_as_unseen_topics(

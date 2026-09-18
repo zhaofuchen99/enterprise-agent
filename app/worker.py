@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from typing import Any, ClassVar
 
@@ -30,7 +31,11 @@ from arq.connections import RedisSettings
 from arq.worker import Worker
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.agent.graph import TaskGraph, build_graph
+from app.agent.runner import build_task_body
 from app.core.config import Settings, get_settings
+from app.domain.task import Task
+from app.infrastructure.cache import VersionedCache
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import (
     SERVICE_WORKER,
@@ -38,7 +43,7 @@ from app.infrastructure.logging import (
     clear_context,
     setup_logging,
 )
-from app.infrastructure.model_gateway import build_model_gateway
+from app.infrastructure.model_gateway import ModelGateway, build_model_gateway
 from app.infrastructure.observability import (
     business_trace_id_from_context,
     restore_trace_context,
@@ -47,9 +52,15 @@ from app.infrastructure.observability import (
 )
 from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
 from app.infrastructure.redis import RedisKey, create_client
+from app.infrastructure.storage import build_object_storage
+from app.infrastructure.vector_store import build_vector_store
 from app.repositories import build_sql_repositories
+from app.repositories.user_repo import SqlUserRepository
+from app.repositories.vocab_repo import SqlVocabRepository
 from app.services.event_bus import RedisStreamEventBus
-from app.services.task_runner import TaskRunner
+from app.services.task_runner import TaskBody, TaskRunner
+from app.tools.rag.tool import build_rag_retrieve_tool
+from app.tools.sql.tool import build_sql_query_tool
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +115,14 @@ def _worker_id() -> str:
 
 
 def _build_runner(
-    settings: Settings, redis: aioredis.Redis, queue: ArqJobQueue, engine: AsyncEngine
+    settings: Settings,
+    redis: aioredis.Redis,
+    queue: ArqJobQueue,
+    engine: AsyncEngine,
+    *,
+    body: TaskBody,
 ) -> TaskRunner:
-    """装配 Worker 侧的任务仓储。
+    """装配 Worker 侧的任务仓储与任务体。
 
     与 `app/main.py` 走**同一份** SQL 装配（`build_sql_repositories`），
     只取其中的任务仓储——不共用一个函数的话，API 与 Worker 的仓储实现
@@ -119,7 +135,48 @@ def _build_runner(
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
+        body=body,
     )
+
+
+async def _build_task_graph(
+    settings: Settings, redis: aioredis.Redis, gateway: ModelGateway, engine: AsyncEngine
+) -> tuple[TaskGraph, Callable[[Task], Awaitable[str | None]]]:
+    """装配最小 Graph 与它的任务体。
+
+    **只在 Worker 进程里装配**：`app/main.py`（API 进程）不得 import
+    `agent.graph` / `tools.*`——分层检查器 L1 拦的就是这件事（API 进程加载
+    LangGraph 与全部 Tool 会让启动变慢、内存翻倍）。这个函数在 `worker.py`
+    里，正是那条约束的落点。
+
+    **装配失败就让 Worker 起不来**（`on_startup` 里不 catch）：向量库、
+    对象存储、词表快照缺一个的报错是"跑任务时连不上"，而那时已经在处理
+    真实请求了——半可用的 Worker 比起不来的 Worker 难查得多。
+
+    词表从**快照**装载（`build_rag_retrieve_tool` 内部做），所以这是
+    async 的：快照缺失时会以"先跑 make vocab"报错，而不是退化成一个
+    查不到东西的检索器。
+    """
+    sessions = create_session_factory(engine)
+    storage = build_object_storage(settings)
+    vector_store = build_vector_store(settings)
+    sql_tool = build_sql_query_tool(settings, gateway)
+    rag_tool = await build_rag_retrieve_tool(
+        settings,
+        gateway,
+        vector_store=vector_store,
+        storage=storage,
+        vocab=SqlVocabRepository(sessions),
+        cache=VersionedCache(redis, default_ttl_seconds=settings.rag.vocab_cache_ttl_seconds),
+    )
+    graph = TaskGraph(
+        settings=settings,
+        graph=build_graph(settings, gateway=gateway, sql_tool=sql_tool, rag_tool=rag_tool),
+        sql_tool=sql_tool,
+        rag_tool=rag_tool,
+        gateway=gateway,
+    )
+    return graph, build_task_body(graph, SqlUserRepository(sessions))
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:
@@ -148,7 +205,12 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["db_engine"] = engine
     ctx["model_gateway"] = gateway
     ctx["worker_id"] = _worker_id()
-    ctx["runner"] = _build_runner(settings, redis, queue, engine)
+    # 任务体（最小 Graph）在**启动时**装配好：它的依赖里有两样会在启动时
+    # 真的连一次（Qdrant 的 collection 检查、词表快照的读取），
+    # 放到第一次跑任务时才连等于把那两类故障推迟到有真实请求的时候。
+    task_graph, body = await _build_task_graph(settings, redis, gateway, engine)
+    ctx["task_graph"] = task_graph
+    ctx["runner"] = _build_runner(settings, redis, queue, engine, body=body)
     logger.info("worker 启动完成", extra={"status": ctx["worker_id"]})
 
 
@@ -170,9 +232,16 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
     engine: AsyncEngine | None = ctx.get("db_engine")
     if engine is not None:
         await engine.dispose()
-    gateway = ctx.get("model_gateway")
-    if gateway is not None:
-        await gateway.aclose()
+    # 先关图（它会关掉两个工具），再关网关：工具持有网关的引用，
+    # 顺序反了会在已关闭的网关上发请求，而那个报错指向的是"连接被关闭"
+    # 而不是"生命周期写错了"。
+    task_graph: TaskGraph | None = ctx.get("task_graph")
+    if task_graph is not None:
+        await task_graph.aclose()
+    else:
+        gateway = ctx.get("model_gateway")
+        if gateway is not None:
+            await gateway.aclose()
     clear_context()
 
 

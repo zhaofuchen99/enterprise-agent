@@ -50,6 +50,12 @@ class IdPrefix(StrEnum):
     #: 这个 ID 是 row 与 point 之间唯一的对应关系（11.5 的 `point_id` 由它派生）。
     #: 沿用同一套 26 位格式，是为了让容器里的 id 在日志里长得一样、对得上。
     CHUNK = "chk"
+    #: 任务循环里的中间发现（Phase 6 的 `Finding`）。
+    #: 它**不是数据库主键**——`agent_finding` 表要 Phase 7 才建（切片内先存 JSON），
+    #: 但 id 现在就要有：`findings` 的 reducer 按 id 去重（详设 7.2），
+    #: 而两个来源各生成一个 id 比"按 statement 文本去重"可靠——
+    #: 后者在模型换一种措辞重述同一条时就不去重了。
+    FINDING = "fnd"
     #: 知识文档版本（Phase 5 的 `knowledge_document.id`，16.8）。
     #: 与 `chunk_id` 的分工要分清：chunk 的身份是 `logical_key@version`（确定性派生，
     #: 重复入库要覆盖同一条），而这一行是**入库这一次动作**的实体，随机生成。

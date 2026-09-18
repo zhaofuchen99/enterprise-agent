@@ -1,0 +1,67 @@
+"""Analysis 节点的 prompt（详细设计 13.5）。
+
+## 证据是**编号列表**，不是散在文本里
+
+模型看到的证据带显式编号（`[E1]`、`[E2]`），`claims[].evidence_ids` 里填编号。
+**不填 `evd_` 原始 id**：那是 26 位 Base32 字符串（`Ids` 模块生成），
+让模型逐字抄一遍的出错率高得没有道理，而抄错一个字符的后果是引用指向
+不存在的证据——`final` 渲染时才发现，那时已经分不清是它抄错了还是证据没落库。
+
+编号到真实 id 的映射**由代码在调用前后完成**（`nodes/analysis.py`），
+模型从头到尾看不到 `evd_` 是什么。
+
+## 三条措辞纪律直接对应 13.5 的 `kind`
+
+`FACT` 必须由直接证据支持；`INFERENCE` 至少两项相互支持的证据或一条明确
+计算链；`HYPOTHESIS` 必须用不确定语言并说明验证方法。这三条**不能只写在
+类型里**——类型管不了"用 FACT 的措辞写了一条推断"，只有 prompt 能压住，
+而下游 Reviewer 会按 kind 去核对措辞（Phase 8）。
+
+## 限制那一栏是必填的
+
+语料里没有、某一步失败、时点没给——这些都必须写进 `limitations`。
+留空等于声称"结论没有前提"，而任何结论都有前提，只是有时恰好都满足了。
+**"没查到"也是结论**：SQL 返回 0 行时照实说"按当前条件没有数据"，
+不要改写成"没有销售额"——后者是一个关于业务的断言，而前者才是事实。
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+from app.agent.prompts.base import PromptTemplate
+
+ANALYSIS_PROMPT: Final[PromptTemplate] = PromptTemplate(
+    name="analysis_synthesize",
+    version="1.0.0",
+    template="""\
+你是企业数据分析助手。请**只依据下面给出的证据**回答用户问题。
+
+用户问题：{question}
+
+证据（编号即引用标识）：
+{evidence}
+
+要求：
+- direct_answer 用一到三句话直接回答用户问题，不要复述证据列表；
+- claims 里的每一条都必须绑定它依据的证据编号（evidence_ids）。
+  **没有证据支撑的话不要写进 claims**；
+- 每条 claim 标注 kind：
+  - FACT：由直接证据支持的客观事实（例如某个数值、某条规定）；
+  - INFERENCE：由多项证据推出的结论，需在文字里说明推理依据；
+  - HYPOTHESIS：证据不足时的推测，必须使用"可能/尚需验证"这类措辞，
+    并说明该怎么验证；
+- **SQL 的数字与文档的口径不要混为一谈**：文档写的是口径定义或制度要求，
+  数据库查的是实际值。说"根据制度，净销售额应扣退货"是 FACT；
+  说"实际净销售额是 X"要引用 SQL 证据；
+- limitations 必须如实列出：证据覆盖不到的部分、执行失败的数据源、
+  问题里未明确的前提（例如没给时间范围）。**没有限制时留空数组**，
+  不要写"无"；
+- 如果证据为空或全部与问题无关，direct_answer 要直接说明"没有检索到
+  可支撑该问题的内容"，claims 留空，并在 limitations 里写明原因。
+  **不要用常识或猜测补出一段答案**；
+- follow_up_questions 填用户可能接着问的问题，最多 3 条。""",
+)
+
+
+__all__ = ["ANALYSIS_PROMPT"]

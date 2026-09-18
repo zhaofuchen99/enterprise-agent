@@ -13,9 +13,13 @@
 | 回收 `reclaim_orphans` | 任意实例的定时任务 | 心跳过期的 RUNNING 任务转 FAILED，释放并发配额 |
 | 补偿 `reconcile_queue` | 任意实例的定时任务 | 写库成功但没进队列的任务重投，超过次数转 FAILED |
 
-**任务体在本阶段是空实现**（见 `_run_body`）。Phase 7 会用 LangGraph 替换它，
-其余部分——投递、领取、心跳、回收——都不需要再改。这正是把执行模型放在
-所有业务逻辑之前做的理由。
+**任务体由调用方注入**（`body=`）。本模块提供的是执行模型——投递、领取、
+心跳、回收、超时与取消——而"任务具体怎么跑"是另一件事：Phase 6 起它是
+`app/agent/graph.py` 的最小 Graph，在此之前（以及单测里）是空实现。
+
+**这条注入缝不是为测试留的**：把执行模型放在所有业务逻辑之前做的理由，
+就是让换任务体时这一层一个字都不用改。`body` 缺省时保持原来的空实现，
+因此 Phase 5 之前的所有用例继续按原样通过。
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,6 +45,12 @@ from app.repositories.task_repo import TaskPatch, TaskRepository
 from app.services.event_bus import EventBus, TaskEventType
 
 logger = logging.getLogger(__name__)
+
+#: 任务体的签名：给定任务，返回最终答案（Markdown）或 None。
+#:
+#: **只传 `Task` 而不是整个上下文**：任务体需要的用户权限范围由它自己去装载，
+#: 而"装载权限"这一步必须紧贴着执行发生（见 `_run_body` 的说明）。
+TaskBody = Callable[["Task"], Awaitable[str | None]]
 
 #: 单次扫描最多处理多少个任务。设上限是为了让扫描本身有界——
 #: 一次性处理积压的十万条任务会把 Worker 卡死，而扫描是定时跑的，
@@ -76,6 +86,7 @@ class TaskRunner:
         events: EventBus,
         settings: Settings,
         redis: aioredis.Redis,
+        body: TaskBody | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tasks = tasks
@@ -83,6 +94,8 @@ class TaskRunner:
         self._events = events
         self._settings = settings
         self._redis = redis
+        #: 任务体。**缺省是空实现**，Phase 5 之前的所有用例因此继续成立
+        self._body = body
         self._scripts = register_scripts(redis)
         self._tuning = settings.redis_tuning
         self._worker_tuning = settings.worker
@@ -248,15 +261,19 @@ class TaskRunner:
         return await self._finish_succeeded(task, answer=answer)
 
     async def _run_body(self, task: Task) -> str | None:
-        """任务体。
+        """任务体。**装配点没给 `body` 时是空实现**——任务以 `SUCCEEDED` 且
+        `final_answer_md` 为 None 结束。Phase 1.5 起一直如此，
+        而这条路径仍然被 `test_worker_stack.py` 的用例覆盖着。
 
-        【后续扩展】Phase 7 用 LangGraph 替换本函数（登记于 CLAUDE.md）。
-        在此之前它是空实现，因此任务会以 `SUCCEEDED` 且 `final_answer_md`
-        为 None 结束——**这是本阶段的预期行为**，不是 bug：
-        Phase 1.5 验证的是执行链路（投递/领取/心跳/写回/事件），不是分析能力。
+        注入的 `body`（Phase 6 起是 `app/agent/graph.py` 的 `TaskGraph.run`）
+        **自己负责把用户的数据权限范围装进 State**。那一步不在这一层做：
+        这里关心的是"任务有没有跑完、有没有被取消、心跳还在不在"，
+        而权限的装载属于分析链路，与执行模型无关。
         """
-        logger.info("任务体为空实现，直接完成", extra={"task_id": task.id})
-        return None
+        if self._body is None:
+            logger.info("任务体为空实现，直接完成", extra={"task_id": task.id})
+            return None
+        return await self._body(task)
 
     # ------------------------------------------------------------------ 收尾
     async def _finish_succeeded(self, task: Task, *, answer: str | None) -> Task | None:

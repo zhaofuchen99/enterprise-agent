@@ -396,14 +396,27 @@ class Vocabulary:
         分词把长词收成一个 token 是**业务词典的正常工作方式**，不是异常。
         判据因此要说成"语料里有没有以它为组成部分的词"，而不是"它是不是一个 token"。
 
+        **两个方向都要查，缺一个就会误拒**（两条都是实测踩到的）：
+
+        - **问题词是语料某个词的一部分**：`归口` ⊂ `归口管理部门`（语料里出现 69 次）。
+        - **语料某个词是问题词的一部分**：`华东` ⊂ `华东地区`——用户写「华东地区」，
+          语料一律写「华东区域」，jieba 把前者切成一个整词，于是 `.id_of()` 是 None。
+          只查第一个方向的话，这条余弦 0.71 的**真问题**会被拒答。
+
+        第二个方向加一道"被包含的语料词至少两个字"的闸：语料词表里有 `q`
+        这种单字母 token（产品型号切出来的），它几乎出现在任何字符串里，
+        不加闸等于让判据恒为真。
+
         ⚠️ **它解决不了同义词**：「报备」在语料里一次都没出现（制度写的是「备案」），
-        也不被任何词包含，于是仍然会被判成"语料没见过"。那一类只能靠语义
+        也不与任何词互相包含，于是仍然会被判成"语料没见过"。那一类只能靠语义
         （重排器 / Phase 8 的 Reviewer），纯词汇规则区分不了"语料没讲过这件事"
         与"语料用的是另一个说法"。已知的这一例会长期留在金标集里当回归用例。
         """
         if token in self._token_ids:
             return True
-        return any(token in known for known in self._token_ids)
+        if any(token in known for known in self._token_ids):
+            return True
+        return any(known in token for known in self._token_ids if len(known) > 1)
 
     def idf(self, token: str) -> float:
         """该 token 的 IDF。未登录词返回一个保守的高值，理由见 `_UNSEEN_TOKEN_DF`。"""

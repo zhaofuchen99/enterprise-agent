@@ -24,7 +24,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 3 LLM 封装 | ✅ 完成 | **TBC-04 结案**：`deepseek-flash`（云）+ `bge-m3`（本地 Ollama，1024 维）。`ModelGateway`（OpenAI 兼容单实现）、Fake 替身、`PromptTemplate` 版本机制、两条独立重试预算（详设 9.4 的 TRANSIENT / VALIDATION）、密钥脱敏、OTel span 埋点、`make model-smoke`。新错误码 `MODEL_OUTPUT_INVALID`（已回写详设 19.1）。`make check` 285 测试全绿 + 集成 29 通过（1 条待密钥跳过） |
 | 4 SQL Tool | ✅ 完成 | **第 1 批收尾**：`SchemaProvider`（YAML 目录，8 表 + 指标口径 + JOIN/函数白名单）、`SqlGenerator`、`SqlValidator`（详设 10.4 的 12 步 + 绑定参数完整性）、只读 `SqlExecutor`、自修复 ≤2、Evidence 生成、`make sql` / `make eval-sql`。**安全与越权 28 条 100% 阻断**；**金标 SQL 10/10**（结果集等价；列形状一致 9/10）。`make check` 426 测试 + 集成 43 全绿 |
 | 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。⑨Reranker 与 11.7 第 ⑧ 步按 TBC-04 维持后置 |
-| 6–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：最小 Graph（6 节点）→ Evidence → Reviewer-lite |
+| 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
+| 7–9 冲刺切片 | ⬜ 未开始 | 第 2 批剩余：Evidence 冲突检测（报告数字 vs DB）→ Reviewer-lite |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -227,6 +228,26 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     （`all(len(t) > 1 for t in tokens)` 在空序列上恒为真）。
     这是本阶段真踩到的：它让"未登录词判据"静默失效，排查方向指向词表。
 
+34. **`reflect` 是确定性的，不调模型**（冲刺方案 §8.1：先跑通再跑准）。
+    它的判定只看 State 里的**事实**：还有没有 PENDING 步骤、哪条路跑了但空、
+    演进预算还剩多少。第二条就是「Agent 能根据工具结果继续分析」的落点——
+    SQL 判成只要查库而库按条件查不到时，它补一路 RAG 去找制度与报告的解释。
+    **不接模型判定的理由**：接上之后"循环会不会收敛"就依赖云模型连通性，
+    而那是验收标准第③条的核心，不该由外部服务决定。
+35. **模型不可用时 supervisor 报错，不降级成"两路都查"**。
+    降级看起来更稳，但它会在故障期间把 FR-PLAN-002 那条验收悄悄作废，
+    而结果看起来完全正常（确实拿到了数据）。
+36. **「查不到」与「查不成」在图里分开走**（`tool_nodes._normalize`）：
+    SQL 的 0 行 / RAG 的 `NO_RELEVANT_KNOWLEDGE` 是**关于数据的事实**，
+    只进 `step_results.empty`，不进 `errors`；其余失败两边都进。
+    混在一起的话，最终答案会把"服务挂了"说成"公司没有这条数据"。
+    ⚠️ SQL 的空结果走的是 `SUCCEEDED` + `payload["is_empty"]`（9.4 明写
+    「SQL 空集不算失败」），与 RAG 走错误码**不是同一条路径**，两处都要认。
+37. **`PermissionScope` 在 `_run_body` 里从用户记录装载**（`agent/runner.py`），
+    **查不到用户就拒绝执行**。`agent_task` 表没有数据范围字段，
+    而 `PermissionScope` 的空 `region_ids` 表示**不限**（TBC-03）——
+    拿它当兜底等于让一个已删除用户的任务拿到全量数据，且不会有任何报错。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -238,9 +259,11 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |
 | `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
 | 用户消息落库（FR-CHAT-001 处理流程的「保存用户消息」，`agent_message` 表） | Phase 2 |
-| 任务体换成 LangGraph（`TaskRunner._run_body` 一个函数） | Phase 7 |
+| ~~任务体换成 LangGraph~~ **已完成**（`TaskRunner` 收 `body=` 注入） | ✅ Phase 6 |
 | 节点内检查取消标记（`TaskRunner.is_cancel_requested` 目前只在领取与收尾时检查） | Phase 7 |
-| `WAITING_CLARIFICATION` 的 `clarification_question` 字段 | Phase 6 |
+| `WAITING_CLARIFICATION` 的**状态位**：澄清现在在答案文本里表达，任务终态仍是 SUCCEEDED。真正停在澄清态要 API/SSE 侧的配套 | Phase 6 收尾 |
+| 图上的 `plan_extend` 与**模型的 EXPAND 判定**：现在由 `reflect` 确定性演进，`plan_deltas` 因此恒空、`investigation_chain.triggered_step_id` 恒为 None | Phase 7 |
+| LangGraph **checkpointer**（断点续跑）：与"整任务重跑"是两种重试语义，并存会出"重投了一个跑了一半的任务" | 需要时 |
 | 任务详情的步骤进度、证据、冲突、限制（等各自 Schema 产出后增补） | Phase 6 / 9 |
 | ~~对象存储 `s3` 实现~~ **已完成**（`make ingest` 起会真的用到它归档原文与报告） | ✅ Phase 5 |
 | **11.7 第 ⑧ 步「邻近块扩展」**：原文条件是「同文档、同章节且**确有上下文缺口**时」，而缺口判定依赖重排器的相关性信号。没有它只能退化成「块短就扩」，在本语料上几乎恒真（正文块中位 85 字），等于无条件把候选翻倍。**随重排器一起后置**——这是时序调整，不是砍需求 | 与 Reranker 同批 |

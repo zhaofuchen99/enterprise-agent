@@ -482,7 +482,11 @@ def _success_result(
         started_at=started_at,
         finished_at=_now(),
         summary=summary,
-        payload=result.model_dump(mode="json"),
+        # `is_empty` **必须显式放进 payload**：它是 `SqlToolResult` 的
+        # `@property`，而 `model_dump` 只序列化字段，property 不会进去。
+        # 调用方（Phase 6 的 `reflect`）要靠它区分"查了但没数据"与"查成了"——
+        # 两者在 `status` 上都是 SUCCEEDED，只看状态分不出来。
+        payload={**result.model_dump(mode="json"), "is_empty": result.is_empty},
         evidence=list(evidence),
     )
 

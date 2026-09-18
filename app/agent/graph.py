@@ -1,0 +1,250 @@
+"""最小 Graph 的拓扑与运行入口（冲刺方案 §8.1 / 详细设计 6.1 的裁剪版）。
+
+```text
+START → supervisor ─┬─(sql)──→ sql ──┐
+                    ├─(rag)──→ rag ──┼→ reflect ─┬─(还有待执行)──→ dispatch（回到上面两路）
+                    └─(analysis)─────┘           └─(收敛)──────────→ analysis → final → END
+```
+
+六个节点：`supervisor / sql / rag / reflect / analysis / final`。
+**`dispatch` 不是节点，是条件边函数**——详设 6.1 里它单独成节点是因为
+计划可能有多条带依赖的步骤；本版的计划是"每条数据源一步、互不依赖"，
+"找下一步"就退化成一个纯函数（`route_dispatch`），
+让它当节点只会多一次 State 往返。
+
+## 与详设 6.1 的偏差清单（都记在案）
+
+| 详设节点 | 本版 | 归属 |
+|---|---|---|
+| `input_guard` | 无 | 输入清洗在 API 层做（`api/schemas.py` 的长度与格式校验） |
+| `planner` | 合进 `supervisor` | 确定性计划，见 `nodes/supervisor.py` |
+| `dispatch` | 条件边函数 | 见上 |
+| `sql_prepare/generate/validate/execute` | 合进 `sql` 节点 | 七个子步骤活在 `SqlQueryTool` 内部 |
+| `rag_rewrite/retrieve/rerank` | 合进 `rag` 节点 | 同上 |
+| `normalize_tool_result` | 合进 `sql`/`rag` 节点 | `nodes/tool_nodes._normalize` |
+| `plan_extend` | 无（`reflect` 直接改计划） | 【后续扩展】模型的 EXPAND 判定 |
+| `conflict_detect` | 无 | 【Phase 9】 |
+| `reviewer` / `retry_router` | 无 | 【Phase 8】冲刺方案 §8.5 第 1 项 |
+| `clarify` | 无 | 澄清以答案文本表达，状态位见【后续扩展】 |
+
+**这份表是面试口径的一部分**：说"做了最小 Graph"时，被问"详设里那 20 个节点呢"
+要能一条条说清它们去哪了，而不是笼统地说"简化了"。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+
+from app.agent.nodes.analysis import build_analysis_node
+from app.agent.nodes.final import build_final_node
+from app.agent.nodes.reflect import build_reflect_node
+from app.agent.nodes.supervisor import build_supervisor_node
+from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
+from app.agent.state import AgentState, Route, pending_steps
+from app.core.config import Settings
+from app.domain.task import Task, TaskStatus
+from app.infrastructure.model_gateway import ModelGateway
+from app.infrastructure.observability import span
+
+#: 节点名。**写成常量而不是散在字符串里**：条件边的候选列表与 `add_node`
+#: 引用的是同一批名字，而两处各写一遍字符串时，改一处漏一处的报错是
+#: "节点不存在"——一个只说结果不说原因的错。
+#:
+#: 条件边返回的是 `Route` 枚举、由 `_TARGETS` 映射到这些名字：
+#: 枚举值恰好与节点名同形是巧合，不该依赖巧合。
+_NODE_SUPERVISOR = "supervisor"
+_NODE_SQL = "sql"
+_NODE_RAG = "rag"
+_NODE_REFLECT = "reflect"
+_NODE_ANALYSIS = "analysis"
+_NODE_FINAL = "final"
+
+#: `Route` → 节点名。`CLARIFY` / `FAIL` 都收敛到 `final`：
+#: 澄清与失败都是"给出一个面向用户的说明"，而 6 个节点的版本里没有
+#: 独立的 `clarify` / `finalize_failure` 节点（登记为【后续扩展】）。
+_TARGETS: dict[Route, str] = {
+    Route.SQL: _NODE_SQL,
+    Route.RAG: _NODE_RAG,
+    Route.ANALYSIS: _NODE_ANALYSIS,
+    Route.CLARIFY: _NODE_FINAL,
+    Route.FAIL: _NODE_FINAL,
+}
+
+
+def route_dispatch(state: AgentState) -> Route:
+    """`supervisor` 与 `reflect` 之后共同的出口：下一步去哪。
+
+    **它读的是"还没跑的步骤"，不是 `next_route`**：`next_route` 是节点写的
+    一个字段，而字段会被覆盖、会过期。从 `task_list` 与 `step_results`
+    现推出来的结果不会——那两个字段的合并语义由 reducer 保证。
+
+    没有待执行步骤时回 `ANALYSIS`（详设 6.3 的 `route_dispatch` 同）。
+    """
+    pending = pending_steps(state)
+    if not pending:
+        return Route.ANALYSIS
+    step = pending[0]
+    return Route.SQL if step.tool == "sql_query" else Route.RAG
+
+
+def _after_supervisor(state: AgentState) -> str:
+    """`supervisor → ?`：失败/澄清走 `final`，否则按步骤分派。"""
+    if state.get("execution_status") is TaskStatus.FAILED:
+        return _NODE_FINAL
+    if not (state.get("task_list") or []):
+        # CLARIFICATION / UNSUPPORTED：没有可执行步骤，直接去分析（会走
+        # 无证据分支）还是去 final？——**去 final**：这类问题不需要"分析"，
+        # 而 `analysis` 在无证据时会产出"没有检索到内容"，
+        # 那句话对"你问的年度没说清"这种澄清场景是答非所问。
+        return _NODE_FINAL
+    return _TARGETS[route_dispatch(state)]
+
+
+def _after_reflect(state: AgentState) -> str:
+    """`reflect → ?`：还有待执行就继续，否则收敛到 `analysis`。"""
+    route = route_dispatch(state)
+    return _TARGETS[route]
+
+
+def _add_node(graph: StateGraph[AgentState], name: str, node: Any) -> None:
+    """注册节点。
+
+    **`graph` 的类型必须写全 `StateGraph[AgentState]`，不能省成 `StateGraph`。**
+    省掉之后 `add_node` 的 `NodeInputT` 就推不出来了——它的实参是
+    **工厂函数返回的 `Callable[[AgentState], Any]`**（一个变量），
+    而 mypy 要从 `_Node[NodeInputT] | Runnable[...]` 这个联合里反解；
+    把同样的函数写成内联 `async def` 就能过。这条是拿最小复现试出来的，
+    写成 `Any` 或加 `type: ignore` 都能让它闭嘴，但那会把这个文件里
+    唯一一处能验证"节点签名与 State 对得上"的检查也一并关掉。
+    """
+    graph.add_node(name, node)
+
+
+def build_graph(
+    settings: Settings,
+    *,
+    gateway: ModelGateway,
+    sql_tool: Any,
+    rag_tool: Any,
+) -> CompiledStateGraph[AgentState]:
+    """组装并编译图。
+
+    **不在这里 `compile(checkpointer=...)`**：检查点（断点续跑）需要一张
+    持久化表与一套恢复语义，而本项目的任务级重试是"整任务重跑"
+    （`agent_task` 的 `max_requeue_attempts`）。接检查点等于引入第二种
+    重试语义，两者并存时会出"重投了一个已经跑了一半的任务"这类问题。
+    登记为【后续扩展】。
+
+    Raises:
+        ValueError: 图装配错误（节点/边引用了未注册的节点名）。
+            **编译期抛比运行期抛好**：路由函数返回一个不存在的节点名时，
+            LangGraph 要到那个分支真的被走到才报错，而那时已经跑了一半。
+    """
+    graph = StateGraph(AgentState)
+
+    _add_node(graph, _NODE_SUPERVISOR, build_supervisor_node(settings, gateway))
+    _add_node(graph, _NODE_SQL, build_sql_node(settings, sql_tool))
+    _add_node(graph, _NODE_RAG, build_rag_node(settings, rag_tool))
+    _add_node(graph, _NODE_REFLECT, build_reflect_node())
+    _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway))
+    _add_node(graph, _NODE_FINAL, build_final_node())
+
+    graph.add_edge(START, _NODE_SUPERVISOR)
+    graph.add_conditional_edges(
+        _NODE_SUPERVISOR,
+        _after_supervisor,
+        [_NODE_SQL, _NODE_RAG, _NODE_ANALYSIS, _NODE_FINAL],
+    )
+    graph.add_edge(_NODE_SQL, _NODE_REFLECT)
+    graph.add_edge(_NODE_RAG, _NODE_REFLECT)
+    # **回边**：`reflect → sql/rag` 就是详设 6.1 里 `reflect -> plan_extend -> dispatch`
+    # 那条任务循环的回边。本版没有 `plan_extend` 节点，演进由 `reflect` 直接改写计划。
+    graph.add_conditional_edges(
+        _NODE_REFLECT,
+        _after_reflect,
+        [_NODE_SQL, _NODE_RAG, _NODE_ANALYSIS],
+    )
+    graph.add_edge(_NODE_ANALYSIS, _NODE_FINAL)
+    graph.add_edge(_NODE_FINAL, END)
+    return graph.compile()
+
+
+class TaskGraph:
+    """图 + 它依赖的外部资源（工具与网关）的生命周期。
+
+    做成一个对象而不是散在 `worker.py` 里：`SqlQueryTool` 持有数据库会话工厂、
+    `RagRetrieveTool` 持有向量库与模型网关，这些都要在 Worker 停机时
+    按顺序关闭。所有权集中在一处，才不会出现"关了一个忘了另一个"。
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        graph: CompiledStateGraph[AgentState],
+        sql_tool: Any,
+        rag_tool: Any,
+        gateway: ModelGateway,
+    ) -> None:
+        self._settings = settings
+        self._graph = graph
+        self._sql_tool = sql_tool
+        self._rag_tool = rag_tool
+        self._gateway = gateway
+
+    async def run(self, task: Task, *, permission_scope: Any) -> str | None:
+        """跑一个任务，返回最终答案（Markdown）。
+
+        `permission_scope` **由调用方传入**而不是在这里从 `task.user_id` 查：
+        调用方（`_run_body`）已经持有仓储，而这一层不应该再依赖用户仓储——
+        它拿到一个 `PermissionScope` 就够跑图了。
+        """
+        started = datetime.now(UTC)
+        initial: AgentState = {
+            "user_query": task.query_text,
+            "sanitized_query": task.query_text,
+            "user_id": task.user_id,
+            "conversation_id": task.conversation_id or "",
+            "task_id": task.id,
+            "trace_id": task.trace_id,
+            "permission_scope": permission_scope,
+            "deadline_at": deadline_for(self._settings, started),
+            "evidence": [],
+            "errors": [],
+            "step_results": {},
+            "findings": [],
+            "task_list": [],
+            "plan_revision": 0,
+        }
+        with span(
+            "agent.graph",
+            **{"task.id": task.id, "conversation.id": task.conversation_id or ""},
+        ) as current:
+            final_state = await self._graph.ainvoke(
+                initial,
+                # 递归上限：图的正常路径最多 6 个节点 + 一次演进（2 步），
+                # 给 25 是留足余量又能在"回边失控"时立刻停住。
+                # **不设它的话，回边写错会一直绕到进程 OOM**，
+                # 而那时看到的是内存曲线而不是"图跑飞了"。
+                config={"recursion_limit": 25},
+            )
+            current.set_attribute("agent.steps", len(final_state.get("step_results") or {}))
+            current.set_attribute("agent.evidence", len(final_state.get("evidence") or []))
+            assessment = final_state.get("progress_assessment")
+            if assessment is not None:
+                current.set_attribute("agent.decision", assessment.decision)
+        return final_state.get("final_answer")
+
+    async def aclose(self) -> None:
+        """按依赖顺序关闭。**工具自己的 `aclose` 不关共享的网关与向量库**
+        （那是装配点的责任），所以这里显式关网关。"""
+        await self._sql_tool.aclose()
+        await self._rag_tool.aclose()
+        await self._gateway.aclose()
+
+
+__all__ = ["TaskGraph", "build_graph", "route_dispatch"]
