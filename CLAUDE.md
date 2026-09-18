@@ -287,12 +287,27 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     还是当制度问的"，排查误答时第一个要看的字段。之前一直是空的——
     supervisor 判出来放进 State，而没有人把它写进那一列。
 
+47. **执行产出落进 16.6 / 16.7 的五张表**（`repositories/agent_repo.py`），
+    入口是 `TaskOutcome` 的五个字段，由 `TaskRunner._persist_artifacts` 一次写齐。
+    **五张表一次写而不是分开写**：它们的不一致（证据落了、冲突没落）不会报错，
+    只会让复盘时看到的图景缺一块。
+48. **重投时整体替换，不是追加**。这几张表都没有天然唯一键，追加会造出两批
+    并存的行而**从数据上分不出哪批属于最后一次执行**——复盘看到的是两份
+    互相矛盾的证据清单，且没有任何地方报错。代价如实记下：跨重投的历史轨迹会丢。
+49. **落库失败吞异常、只记日志**。它不该把一次成功的分析变成任务失败，
+    但也不能静默——那是"复盘时发现表里没有产出"的唯一线索。
+50. **`repositories/` 只认识 `domain/` 的对象**（分层方向使然）。所以
+    `TaskStep` + `StepResult` 由 `services/` 合成 `StepRecord` 再传下来，
+    `ReviewResult` 同理合成为 `ReviewRecord`。这个约束逼着仓储的入参只描述**行**。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
 |---|---|
 | ~~任务仓储换 MySQL~~ **已完成**（`RedisTaskRepository` 与 5 个索引键已删） | ✅ Phase 2 |
-| `agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_trace_event` 的仓储实现（表已建，仓储待写；调用方在 Phase 6/7 才出现）。**`agent_tool_call` 的待写数据已经就位**：SQL Tool 的 `ToolResult.payload["attempts"]` 就是它的行 | Phase 6 / 7 |
+| ~~`agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_conflict` / `agent_review` 的仓储实现~~ **已完成**（`repositories/agent_repo.py`，任务收尾时一次写齐五张表） | ✅ Phase 6 收尾 |
+| `agent_trace_event` 的仓储实现（表已建，仓储待写；它是事件流的**权威重放**来源，属 Phase 10） | Phase 10 |
+| **跨重投的执行轨迹会丢**：五张表在重投时整体替换（见 `agent_repo.py` 的说明），上几次失败的过程没有留痕。要留就得加 `attempt_no` 或一张执行流水表 | 需要时 |
 | `schema_catalog` / `agent_config` 建表（切片内目录是 `configs/schema_catalog.yaml`，SQL Tool 已按它的形状写好 `SchemaCatalog`；接表只需换 `SchemaProvider` 的加载实现） | 后置 |
 | `make cleanup` 的保留期策略与实现（详细设计 16.12） | Phase 2 收尾 |
 | 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |

@@ -28,6 +28,7 @@ from app.infrastructure.observability import setup_error_tracking, setup_observa
 from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
 from app.repositories import Repositories, build_sql_repositories
+from app.repositories.agent_repo import SqlAgentArtifactRepository
 from app.services.auth_service import AuthService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.rate_limit import RedisFixedWindowLimiter
@@ -94,6 +95,11 @@ def wire_dependencies(
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
+        # **API 进程也要装配它**，虽然它自己不跑任务：`TaskRunner` 的构造签名
+        # 对两条进程是同一份，差别只在 body（API 不传）。让 API 传 None
+        # 会诱使 `_persist_artifacts` 长出"仓储不存在就跳过"的分支，
+        # 而那条分支在 Worker 里永远为假——测试不出来的死代码。
+        artifacts=SqlAgentArtifactRepository(app.state.sessions),
     )
 
     app.state.repositories = repos

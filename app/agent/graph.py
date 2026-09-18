@@ -50,9 +50,10 @@ from app.agent.nodes.reflect import build_reflect_node
 from app.agent.nodes.reviewer import build_reviewer_node
 from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
+from app.agent.schemas.plan import StepStatus
 from app.agent.state import AgentState, Route, pending_steps
 from app.core.config import Settings
-from app.domain.task import Task, TaskOutcome, TaskStatus
+from app.domain.task import ReviewRecord, StepRecord, Task, TaskOutcome, TaskStatus
 from app.infrastructure.model_gateway import ModelGateway
 from app.infrastructure.observability import span
 
@@ -276,6 +277,12 @@ class TaskGraph:
             # 而这三样才是"它是怎么查出来的"要回答的问题。
             plan=_plan_digest(final_state),
             payload=final_state.get("answer_payload"),
+            # 五张表的行，一次带出去（见 `TaskOutcome` 的说明）
+            steps=_step_records(final_state),
+            tool_calls=tuple(final_state.get("tool_calls") or ()),
+            evidence=tuple(final_state.get("evidence") or ()),
+            conflicts=tuple(final_state.get("conflicts") or ()),
+            review=_review_record(final_state),
         )
 
     async def aclose(self) -> None:
@@ -310,6 +317,56 @@ def _plan_digest(state: AgentState) -> dict[str, Any]:
         "decision": assessment.decision if assessment is not None else None,
         "reason": assessment.reason if assessment is not None else None,
     }
+
+
+def _step_records(state: AgentState) -> tuple[StepRecord, ...]:
+    """`task_list` + `step_results` → `agent_task_step` 的行（16.6）。
+
+    **两个来源缺一不可**：计划给出"本来要做哪几步"，结果给出"做成了没有"。
+    只落计划的话，读的人看不出"那一步其实没查到东西"。
+    """
+    results = state.get("step_results") or {}
+    return tuple(
+        StepRecord(
+            step_key=step.id,
+            objective=step.objective,
+            tool=step.tool,
+            depends_on=step.depends_on,
+            required=step.required,
+            status=(
+                results[step.id].status.value if step.id in results else StepStatus.PENDING.value
+            ),
+            result_summary=(
+                {"summary": results[step.id].summary, "empty": results[step.id].empty}
+                if step.id in results
+                else None
+            ),
+            # **`origin` 恒为 PLANNER**：切片内没有 plan_extend，
+            # 演进由 reflect 直接追加步骤。接 Phase 7 时这里要按
+            # `plan_deltas` 区分 EXTENDED，否则"哪些步骤是下钻出来的"
+            # 在表里查不到——而开发流程 7.5 正是靠它做循环类评分的。
+            origin="PLANNER",
+            revision_no=state.get("plan_revision", 0),
+        )
+        for step in state.get("task_list") or []
+    )
+
+
+def _review_record(state: AgentState) -> ReviewRecord | None:
+    review = state.get("review_result")
+    if review is None:
+        return None
+    return ReviewRecord(
+        status=review.status,
+        score=review.score,
+        coverage_score=review.coverage_score,
+        evidence_score=review.evidence_score,
+        consistency_score=review.consistency_score,
+        issues=tuple(issue.model_dump(mode="json") for issue in review.issues),
+        missing_evidence=review.missing_evidence,
+        retry_target=review.retry_target,
+        reason_code=review.reason_code,
+    )
 
 
 __all__ = ["TaskGraph", "build_graph", "route_dispatch"]

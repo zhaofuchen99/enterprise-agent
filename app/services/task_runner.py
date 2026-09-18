@@ -41,6 +41,7 @@ from app.infrastructure.logging import bind_context
 from app.infrastructure.observability import capture_trace_context, span
 from app.infrastructure.queue import JobQueue
 from app.infrastructure.redis import RedisKey, register_scripts
+from app.repositories.agent_repo import AgentArtifactRepository
 from app.repositories.task_repo import TaskPatch, TaskRepository
 from app.services.event_bus import EventBus, TaskEventType
 
@@ -90,6 +91,7 @@ class TaskRunner:
         events: EventBus,
         settings: Settings,
         redis: aioredis.Redis,
+        artifacts: AgentArtifactRepository,
         body: TaskBody | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -98,6 +100,10 @@ class TaskRunner:
         self._events = events
         self._settings = settings
         self._redis = redis
+        #: 执行产出的落点（16.6 / 16.7 的五张表）。**必填**：
+        #: 给它一个默认值的话，"忘了装配"会表现为"那几张表一直是空的"，
+        #: 而没有任何报错——那正是这几张表此前长期为空的原因。
+        self._artifacts = artifacts
         #: 任务体。**缺省是空实现**，Phase 5 之前的所有用例因此继续成立
         self._body = body
         self._scripts = register_scripts(redis)
@@ -258,6 +264,7 @@ class TaskRunner:
                 detail=type(exc).__name__,
             )
 
+        await self._persist_artifacts(task, outcome)
         if outcome.failed:
             # **图判成失败就按失败收尾，不写 SUCCEEDED**（见 `TaskOutcome.failed`）。
             # 混在一起的话，"模型挂了"与"分析完成了"在 API、SSE 与任务列表上
@@ -280,6 +287,28 @@ class TaskRunner:
             return await self._finish_cancelled(task, worker_id=worker_id)
 
         return await self._finish_succeeded(task, outcome=outcome)
+
+    async def _persist_artifacts(self, task: Task, outcome: TaskOutcome) -> None:
+        """把这次执行的产出落进 16.6 / 16.7 的五张表。
+
+        **失败路径也要落**：模型不可用时，`plan` 与部分证据仍然有价值——
+        用户看到的是"没跑完"，而排查的人要知道它跑到哪一步了。
+        `TaskOutcome` 在两条路径上都带着它们，落不落是这里决定的。
+
+        **异常吞掉、只记日志**：落库失败不该把一次成功的分析变成任务失败。
+        但也不能静默——它是"复盘时发现表里没有这条任务的产出"的唯一线索。
+        """
+        try:
+            await self._artifacts.save(
+                task.id,
+                steps=outcome.steps,
+                tool_calls=outcome.tool_calls,
+                evidence=outcome.evidence,
+                conflicts=outcome.conflicts,
+                review=outcome.review,
+            )
+        except Exception:
+            logger.exception("执行产出落库失败", extra={"task_id": task.id})
 
     async def _run_body(self, task: Task) -> TaskOutcome:
         """任务体。**装配点没给 `body` 时是空实现**——任务以 `SUCCEEDED` 且

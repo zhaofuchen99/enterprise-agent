@@ -38,6 +38,7 @@ from app.agent.state import AgentState, pending_steps
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
 from app.core.ids import IdPrefix, new_id
+from app.domain.task import ToolCallRecord
 from app.domain.user import PermissionScope
 from app.tools.base import ToolContext, ToolError, ToolResult
 
@@ -115,6 +116,7 @@ def _normalize(state: AgentState, step: TaskStep, result: ToolResult) -> dict[st
     update: dict[str, Any] = {
         "step_results": {step.id: step_result},
         "evidence": list(result.evidence),
+        "tool_calls": _tool_calls(step, result),
     }
     if result.evidence:
         # 发现（finding）**由代码从证据里提炼一行**，不让模型写：
@@ -153,6 +155,54 @@ def _as_agent_error(error: ToolError) -> AgentError:
     except ValueError:
         code = ErrorCode.INTERNAL_ERROR
     return AgentError(code, error.message, details={"error_class": error.error_class})
+
+
+def _tool_calls(step: TaskStep, result: ToolResult) -> list[ToolCallRecord]:
+    """`ToolResult` → `agent_tool_call` 的行（16.6）。
+
+    **一次尝试一行**，不是一次调用一行：SQL 的自修复会让同一步骤产生
+    「生成 → 修复 → 执行」多行，而"修复了几次、每次为什么失败"正是
+    排查 SQL 生成质量的第一手材料（`SqlAttempt` 就是为它存在的）。
+    RAG 没有自修复，所以恒为一行。
+
+    `attempts` **只在 SQL 的 payload 里**（`SqlToolResult.attempts`）。
+    拿不到时退化成一行 —— 那不是"少记了"，而是"这个工具没有分步尝试"。
+    """
+    attempts = (result.payload or {}).get("attempts") or []
+    if not attempts:
+        return [
+            ToolCallRecord(
+                step_id=step.id,
+                tool_name=str(result.tool),
+                attempt_no=1,
+                status=result.status,
+                error_code=result.error.code if result.error else None,
+                error_summary=_clip(result.error.message) if result.error else None,
+                duration_ms=result.duration_ms,
+                result_summary={"summary": _clip(result.summary)},
+            )
+        ]
+    return [
+        ToolCallRecord(
+            step_id=step.id,
+            tool_name=str(result.tool),
+            # **`request_summary` 不带原始 SQL 全文**：`normalized_sql` 单独一列
+            # 是有意的（10.6 与 19.4 的脱敏纪律），混进 summary 会让它
+            # 出现在本该只有摘要的地方。
+            attempt_no=int(item.get("attempt_no") or index),
+            status=str(item.get("status") or result.status),
+            normalized_sql=item.get("normalized_sql"),
+            sql_fingerprint=item.get("sql_fingerprint"),
+            error_code=item.get("error_code"),
+            # **`error_summary` 已经是脱敏过的**（`SqlAttempt` 的约定：
+            # 存的是"哪一类错、错在第几个字符"，不是模型原文或库回显）。
+            # 这里不再加工，加工只会把它变成另一个东西。
+            error_summary=item.get("error_summary"),
+            duration_ms=item.get("duration_ms"),
+            result_summary={"stage": item.get("stage")},
+        )
+        for index, item in enumerate(attempts, start=1)
+    ]
 
 
 def _clip(text: str) -> str:

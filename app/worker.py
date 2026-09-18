@@ -55,6 +55,7 @@ from app.infrastructure.redis import RedisKey, create_client
 from app.infrastructure.storage import build_object_storage
 from app.infrastructure.vector_store import build_vector_store
 from app.repositories import build_sql_repositories
+from app.repositories.agent_repo import SqlAgentArtifactRepository
 from app.repositories.user_repo import SqlUserRepository
 from app.repositories.vocab_repo import SqlVocabRepository
 from app.services.event_bus import RedisStreamEventBus
@@ -135,6 +136,7 @@ def _build_runner(
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
+        artifacts=SqlAgentArtifactRepository(create_session_factory(engine)),
         body=body,
     )
 

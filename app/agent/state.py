@@ -44,7 +44,7 @@ from app.agent.schemas.analysis import AnalysisResult
 from app.agent.schemas.plan import Finding, IntentResult, ProgressAssessment, StepResult, TaskStep
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
-from app.domain.task import TaskStatus
+from app.domain.task import TaskStatus, ToolCallRecord
 
 #: 单值字段（后写覆盖）不需要 `Annotated`，直接写类型即可；
 #: 这里给它起个名字只是为了让下面的字段表读起来一致。
@@ -134,6 +134,10 @@ class AgentState(TypedDict, total=False):
     #: 【Phase 6 未接】演进预算与修订记录，属 plan_extend（后置）
     plan_revision: int
     plan_deltas: list[Scalar]
+
+    #: 每一次工具**尝试**（SQL 的自修复会产生多条）。落 `agent_tool_call`。
+    #: 与 `evidence` 同样用按 id 去重的追加 reducer——`id` 是每条独立的行键。
+    tool_calls: Annotated[list[ToolCallRecord], merge_by_id]
 
     # ---------------------------------------------------------- 工具中间产物
     #: 【Phase 4/5 未接】SQL 与 RAG 的分步中间态留在各自 Tool 内部，

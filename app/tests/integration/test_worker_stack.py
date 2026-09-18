@@ -248,6 +248,7 @@ async def test_orphan_reclamation_picks_up_a_dead_worker_task(
         at=dead_at,
     )
 
+    from app.repositories.agent_repo import InMemoryAgentArtifactRepository
     from app.services.task_runner import TaskRunner
 
     runner = TaskRunner(
@@ -256,6 +257,7 @@ async def test_orphan_reclamation_picks_up_a_dead_worker_task(
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
+        artifacts=InMemoryAgentArtifactRepository(),
     )
     report = await runner.reclaim_orphans()
     await runner._queue.aclose()

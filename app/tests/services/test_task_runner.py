@@ -23,6 +23,7 @@ from app.core.config import Settings
 from app.core.errors import ErrorCode
 from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.redis import RedisKey
+from app.repositories.agent_repo import InMemoryAgentArtifactRepository
 from app.repositories.task_repo import InMemoryTaskRepository, TaskPatch, TaskRepository
 from app.services.event_bus import RedisStreamEventBus, TaskEventType
 from app.services.task_runner import TaskRunner
@@ -121,7 +122,15 @@ def build_runner(
     events = RedisStreamEventBus(redis, settings)
     job_queue = queue or FakeJobQueue()
     runner = runner_cls(
-        tasks=repo, queue=job_queue, events=events, settings=settings, redis=redis, clock=clock
+        tasks=repo,
+        queue=job_queue,
+        events=events,
+        settings=settings,
+        redis=redis,
+        # 产出落库的替身：这几个用例验证的是**编排逻辑**，不是那五张表的写入
+        # （仓储行为由 `app/tests/repositories/test_agent_repo.py` 覆盖）。
+        artifacts=InMemoryAgentArtifactRepository(),
+        clock=clock,
     )
     return runner, repo, job_queue, events
 

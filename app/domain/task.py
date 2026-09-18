@@ -13,9 +13,11 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.errors import ErrorCode
+from app.core.ids import IdPrefix, new_id
+from app.domain.evidence import Conflict, Evidence
 
 
 class TaskStatus(StrEnum):
@@ -115,3 +117,94 @@ class TaskOutcome(BaseModel):
     intent: str | None = None
     plan: dict[str, Any] | None = None
     payload: dict[str, Any] | None = None
+    #: 落 `agent_task_step` / `agent_tool_call` / `agent_evidence` /
+    #: `agent_conflict` / `agent_review` 五张表的行（16.6 / 16.7）。
+    #:
+    #: **它们与 `payload` 不是一个东西**：`payload` 是给 API 与前端看的
+    #: 一坨 JSON，而这几张表是**能按内容查的**（按 `sql_fingerprint` 找
+    #: 反复出现的烂 SQL、按 `content_hash` 找同一条证据）。
+    #: 只留 JSON 的话，那些索引一个都用不上。
+    steps: tuple[StepRecord, ...] = ()
+    tool_calls: tuple[ToolCallRecord, ...] = ()
+    evidence: tuple[Evidence, ...] = ()
+    conflicts: tuple[Conflict, ...] = ()
+    review: ReviewRecord | None = None
+
+
+class StepRecord(BaseModel):
+    """`agent_task_step` 的一行（16.6）。
+
+    **它不直接用 `agent/schemas/plan.py` 的 `TaskStep`**：那张表还带
+    `status` / `attempt_count` / `result_summary_json`，而那些来自
+    `StepResult`——两个模型合起来才是这一行。更重要的是**分层方向**：
+    `repositories/` 在依赖链的底端，不能 import `agent/schemas`，
+    所以"计划里的一步"与"这一步的结果"必须在**调用方**（`services/`）
+    合成这个领域对象，仓储只认识它。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: 行的身份。**在这里生成而不是落库时**：`StepRecord` 会进 State 的 reducer
+    #: （按 id 去重），而"两条记录是不是同一条"这个问题必须在**造出它的时候**
+    #: 就有答案——等到写库时再分配，去重就只能靠内容比对了。
+    id: str = Field(default_factory=lambda: new_id(IdPrefix.TASK))
+    step_key: str
+    objective: str
+    tool: str | None = None
+    depends_on: tuple[str, ...] = ()
+    required: bool = True
+    status: str
+    attempt_count: int = 0
+    result_summary: dict[str, Any] | None = None
+    origin: str = "PLANNER"
+    revision_no: int = 0
+
+
+class ToolCallRecord(BaseModel):
+    """`agent_tool_call` 的一行（16.6）——**一次工具尝试**，不是一次工具调用。
+
+    `attempt_no` 是它有别于 `StepRecord` 的地方：SQL 的自修复会让同一个步骤
+    产生多次尝试（生成 → 修复 → 修复），而"修复了几次、每次为什么失败"
+    正是排查 SQL 生成质量的第一手材料（`SqlToolResult.attempts` 就是它的来源）。
+
+    **不保存原始行**：`result_summary` 只放行数、列名与摘要（19.4 与 10.6
+    的脱敏纪律）。绑定参数也不在这里——`normalized_sql` 是规范化后的语句，
+    参数另行脱敏。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(default_factory=lambda: new_id(IdPrefix.TOOL_CALL))
+    step_id: str | None = None
+    tool_name: str
+    attempt_no: int = 1
+    request_summary: dict[str, Any] | None = None
+    normalized_sql: str | None = None
+    sql_fingerprint: str | None = None
+    result_summary: dict[str, Any] | None = None
+    status: str
+    error_code: str | None = None
+    error_summary: str | None = None
+    duration_ms: int | None = None
+
+
+class ReviewRecord(BaseModel):
+    """`agent_review` 的一行（16.7 / 14.2）。
+
+    与 `StepRecord` / `ToolCallRecord` 同理：`repositories/` 不能 import
+    `agent/schemas/review.py`，由 `services/` 合成这一行再传下来。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(default_factory=lambda: new_id(IdPrefix.EVIDENCE))
+    round_no: int = 1
+    status: str
+    score: int = 0
+    coverage_score: int = 0
+    evidence_score: int = 0
+    consistency_score: int = 0
+    issues: tuple[dict[str, Any], ...] = ()
+    missing_evidence: tuple[str, ...] = ()
+    retry_target: str | None = None
+    reason_code: str = ""
