@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -27,6 +28,7 @@ from app.tests.fakes import FakeFailure, FakeModelGateway
 from app.tools.base import ToolContext
 from app.tools.rag.evidence import build_document_evidence
 from app.tools.rag.metadata import ChunkMetadata
+from app.tools.rag.reranker import SKIP_DISABLED, SKIP_INCOMPLETE, SKIP_UNAVAILABLE, Reranker
 from app.tools.rag.retriever import Retriever, _keeps_numbers
 from app.tools.rag.schemas import QueryRewrite, RagQueryArgs
 from app.tools.rag.tokenizer import Tokenizer, Vocabulary, build_sparse
@@ -143,12 +145,37 @@ def _retriever(
     gateway: FakeModelGateway,
     vocabulary: Vocabulary,
 ) -> Retriever:
+    """按 `settings` 装配检索器。
+
+    `settings.reranker_enabled` 决定重排是否生效——**默认的测试配置里它是关的**，
+    因此绝大多数用例走的仍是"RRF 序直接取 Top-K"那条路径；
+    要验重排的用例自己把开关打开（见 `_with_reranker`）。
+    """
     return Retriever(
         settings=settings,
         gateway=gateway,
         vector_store=store,
         tokenizer=Tokenizer.from_settings(settings),
         vocabulary=vocabulary,
+        reranker=Reranker(settings=settings, gateway=gateway),
+    )
+
+
+def _with_reranker(settings: Settings, *, threshold: float = 0.2) -> Settings:
+    """打开重排的配置副本。
+
+    用 `model_copy` 而不是造一份完整 Settings：这里要改的只有"开不开"与
+    "阈值多少"，其余（Top-K、召回条数、词表路径）必须与线上那份逐字相同——
+    另造一份等于让用例测的是一个不存在的配置。
+    """
+    return settings.model_copy(
+        update={
+            "reranker_enabled": True,
+            "reranker_model": "fake-reranker",
+            "reranker_base_url": "https://rerank.invalid/v1",
+            "reranker_api_key": "test-key",
+            "rag": settings.rag.model_copy(update={"rerank_score_threshold": threshold}),
+        }
     )
 
 
@@ -176,6 +203,19 @@ def test_keeps_numbers_accepts_the_chinese_numeral_form() -> None:
     而它们指的是同一段时间——那会把一条完全正确的改写误杀。
     """
     assert _keeps_numbers("2025年第三季度净销售额", "2025年Q3净销售额")
+
+
+class _RerankUnavailable(FakeModelGateway):
+    """只让**重排**失败，改写与向量化照常。
+
+    用 `failure=FakeFailure.UNAVAILABLE` 一把全关掉测的是另一条路径：
+    向量化挂掉时检索**必须抛异常**（不能伪装成"语料里没有"，见
+    `test_embedding_outage_is_not_reported_as_no_knowledge`），
+    根本走不到重排那一步。
+    """
+
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
+        raise AgentError(ErrorCode.UPSTREAM_UNAVAILABLE, "重排服务不可用（测试构造）")
 
 
 class _RewriteUnavailable(FakeModelGateway):
@@ -486,7 +526,12 @@ async def test_document_type_filter_reaches_the_store(
 
 
 async def test_top_k_bounds_the_evidence(settings: Settings, vocabulary: Vocabulary) -> None:
-    """11.7 第 7 步：最终只取 Top 8（配置值 `rerank_top_k`）。"""
+    """11.7 第 7 步：最终只取 Top 8（配置值 `rerank_top_k`）。
+
+    **这条走的是重排关闭的那条路径**（默认配置）：按 RRF 序取前 K 条。
+    重排生效时的 Top-K 在 `test_reranker_takes_top_k_only_after_reordering`
+    ——那里要证明的是"先重排再截断"，顺序反过来就会把候选范围预先砍掉。
+    """
     store = InMemoryVectorStore()
     await store.upsert(
         [
@@ -768,3 +813,304 @@ def test_sparse_drops_tokens_outside_the_vocabulary(
 
     assert set(vector) == {vocabulary.id_of("华东")}
     assert all(weight > 0.0 for weight in vector.values())
+
+
+# ------------------------------------------------------------------ 重排（① 11.7 第 ⑥⑦ 步）
+
+
+def _rerank_gateway(
+    settings: Settings, question: str, vector: list[float], scores: list[float]
+) -> FakeModelGateway:
+    """带重排脚本的替身网关。
+
+    `scores` 与**候选同序**（候选按 RRF 序给出，本文件里通常就是 chunk_id 序——
+    所有点的向量相同时融合分会并列，`_fuse` 按 chunk_id 兜底排序）。
+    """
+    return FakeModelGateway(
+        responses=[QueryRewrite(queries=(question,))],
+        embedding_dim=DIM,
+        embeddings=[vector],
+        rerank_scores=[scores],
+    )
+
+
+async def _three_candidates() -> InMemoryVectorStore:
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [_point(index, text=f"华东渠道折扣第{index}条", dense=[1.0, 0, 0, 0]) for index in range(3)]
+    )
+    return store
+
+
+async def test_reranker_reorders_by_semantic_score(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """重排分高的排前面，**名次由重排重编**（不是 RRF 的名次）。
+
+    `rank` 的语义是"最终第几条"。重排之后还留着 RRF 的名次，读的人会以为
+    那就是融合序——而两者在这条用例里恰好相反。
+
+    分数全部高于阈值，因此这条用例只看**排序**；剔除是下一条的事。
+    """
+    store = await _three_candidates()
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.25, 0.5, 0.9])
+
+    outcome = await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert outcome.rerank_applied is True
+    assert outcome.rerank_skipped_reason is None
+    assert [c.chunk_id for c in outcome.candidates] == ["chk_0002", "chk_0001", "chk_0000"]
+    assert [c.rank for c in outcome.candidates] == [1, 2, 3]
+    assert [c.rerank_score for c in outcome.candidates] == [0.9, 0.5, 0.25]
+    assert outcome.best_rerank_score == 0.9
+
+
+async def test_reranker_prunes_candidates_below_the_threshold(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """11.7 第 ⑦ 步：低于校准阈值的候选**剔除**，不是排到后面。
+
+    这是重排器存在的第二个理由（第一个是排序）：稀疏路独有的候选没有稠密分，
+    逐候选的语义判定只有它有资格做（见 `reranker.py` 的模块说明）。
+    """
+    store = await _three_candidates()
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.9, 0.05, 0.3])
+
+    outcome = await _retriever(
+        _with_reranker(settings, threshold=0.2), store, gateway, vocabulary
+    ).retrieve(RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope())
+
+    assert [c.chunk_id for c in outcome.candidates] == ["chk_0000", "chk_0002"]
+    assert outcome.rerank_pruned == 1
+    assert outcome.rerank_threshold == 0.2
+    assert outcome.no_relevant_knowledge is False
+
+
+async def test_all_candidates_pruned_is_reported_as_no_knowledge(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """一条都没留下 → `NO_RELEVANT_KNOWLEDGE`，且**候选清空**。
+
+    重排生效时这就是"语料里没有"的判据：cross-encoder 把问题与候选一起过了一遍
+    模型，它给出的分数正是那两条代偿规则（词表、余弦）想近似的东西。
+    """
+    store = await _three_candidates()
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.01, 0.05, 0.1])
+
+    outcome = await _retriever(
+        _with_reranker(settings, threshold=0.5), store, gateway, vocabulary
+    ).retrieve(RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope())
+
+    assert outcome.rerank_applied is True
+    assert outcome.no_relevant_knowledge is True
+    assert outcome.candidates == ()
+    # 剔空了也要留下"离阈值多远"：只报一个布尔量的话，
+    # 「阈值调高了」与「语料真没有」又分不出来了
+    assert outcome.best_rerank_score == 0.1
+    assert outcome.rerank_pruned == 3
+
+
+async def test_reranking_can_overrule_the_unseen_topic_criterion(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """重排生效时，**未登录词不再单独拒答**（这是本次切换的核心语义）。
+
+    「报备」在语料里一次都没出现（制度写的是「备案」），词表里自然没有它，
+    于是旧的词汇判据把一条余弦 0.74 的真问题判成了"语料没见过"
+    （CLAUDE.md 约定 30 记的漏网类，金标 rag-06）。纯词汇规则区分不了
+    "语料没讲过这件事"与"语料用了另一个说法"——而 cross-encoder 能。
+
+    词表与余弦**仍然是诊断信息**，所以这里一并断言它们还在。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert([_point(0, text="制度要求事前备案，未备案不得开展", dense=[1.0, 0, 0, 0])])
+    gateway = _rerank_gateway(settings, "报备流程怎么规定", [1.0, 0, 0, 0], [0.85])
+
+    outcome = await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="报备流程怎么规定"), scope=_scope()
+    )
+
+    assert "报备" in outcome.unseen_topics, "这条用例的前提是词汇判据会触发"
+    assert outcome.no_relevant_knowledge is False
+    assert [c.chunk_id for c in outcome.candidates] == ["chk_0000"]
+
+
+async def test_reranker_sends_the_original_question_not_the_rewrite(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """11.7 第 ⑥ 步：对**原问题**与候选重排。
+
+    改写是为了召回（它可能把「碳积分」换成更通用的说法），而"这条候选
+    到底回没回答用户问的那件事"要以原问题为准。送错一个，排序会整体偏向
+    改写后的措辞，而且没有任何报错。
+    """
+    store = await _three_candidates()
+    gateway = FakeModelGateway(
+        responses=[QueryRewrite(queries=("华东区域渠道折扣政策", "华东渠道折扣上限"))],
+        embedding_dim=DIM,
+        embeddings=[[1.0, 0, 0, 0], [1.0, 0, 0, 0]],
+        rerank_scores=[[0.5, 0.5, 0.5]],
+    )
+
+    await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert gateway.rerank_calls[0][0] == "华东区域渠道折扣政策"
+    # 候选**先全部交给重排**（≤ 30 条），不是先截到 Top 8 再排
+    assert len(gateway.rerank_calls[0][1]) == 3
+
+
+async def test_rerank_passage_is_truncated_to_the_configured_limit(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """超长块按 `rerank_max_chars` 截断。**它是护栏不是调参项**：
+    超长输入只会让 cross-encoder 变慢，而超出模型窗口的部分本来也会被丢弃。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert([_point(0, text="华东" * 500, dense=[1.0, 0, 0, 0])])
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.9])
+    tiny = _with_reranker(settings).model_copy(
+        update={"rag": settings.rag.model_copy(update={"rerank_max_chars": 120})}
+    )
+
+    await _retriever(tiny, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert len(gateway.rerank_calls[0][1][0]) == 120
+
+
+async def test_reranker_outage_falls_back_to_the_rrf_order(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """重排服务不可用时**照常出证据**，只是顺序退回 RRF，并留下原因。
+
+    把一次重排超时升级成检索失败，代价与收益完全不相称：重排是增强步骤，
+    它不在的时候系统必须照常工作——而"照常"的那条路径与"没开重排"是同一条。
+    """
+    store = await _three_candidates()
+    gateway = _RerankUnavailable(
+        responses=[QueryRewrite(queries=("华东区域渠道折扣政策",))],
+        embedding_dim=DIM,
+        embeddings=[[1.0, 0, 0, 0]],
+    )
+
+    outcome = await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert outcome.rerank_applied is False
+    assert outcome.rerank_skipped_reason == f"{SKIP_UNAVAILABLE}:UPSTREAM_UNAVAILABLE"
+    assert [c.chunk_id for c in outcome.candidates] == ["chk_0000", "chk_0001", "chk_0002"]
+    # **失败时不写 `rerank_score`**：那是"模型给的分数"，没算过就没有值。
+    # 填一个假的进去，读的人会把 RRF 名次当成模型的判断
+    assert all(c.rerank_score is None for c in outcome.candidates)
+    assert outcome.no_relevant_knowledge is False
+
+
+async def test_disabled_reranker_keeps_the_rrf_order(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """默认关闭：不调重排服务、不写分数，原因与"调用失败"**必须不同**。
+
+    "召回质量下降了"是排查时的第一类问题，而"没开"与"打了服务但失败了"
+    是两条完全不同的路径，合成一个"没生效"就分不出来了。
+    """
+    store = await _three_candidates()
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.9, 0.9, 0.9])
+
+    outcome = await _retriever(settings, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert outcome.rerank_applied is False
+    assert outcome.rerank_skipped_reason == SKIP_DISABLED
+    assert outcome.rerank_threshold is None
+    assert gateway.rerank_calls == [], "没开重排就不该调它"
+
+
+class _ShortRerank(FakeModelGateway):
+    """只返回一条分数的重排替身，用来验"条数不符"这条路径。
+
+    真实网关会在这里之前就报错（`_scores_by_index` 见缺条即抛），这条兜底是
+    给替身与将来的实现留的：**长度对不上时按顺序硬配是最危险的做法**——
+    每个候选会拿到别人的分数，而排序看起来完全正常。
+    """
+
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
+        return [0.9]
+
+
+async def test_incomplete_rerank_scores_fall_back_instead_of_misaligning(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    store = await _three_candidates()
+    gateway = _ShortRerank(
+        responses=[QueryRewrite(queries=("华东区域渠道折扣政策",))],
+        embedding_dim=DIM,
+        embeddings=[[1.0, 0, 0, 0]],
+    )
+
+    outcome = await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert outcome.rerank_applied is False
+    assert outcome.rerank_skipped_reason == SKIP_INCOMPLETE
+    assert [c.chunk_id for c in outcome.candidates] == ["chk_0000", "chk_0001", "chk_0002"]
+
+
+async def test_reranker_takes_top_k_only_after_reordering(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """先重排、再取 Top-K。**顺序反过来就等于把重排器的判断范围预先砍掉**：
+    RRF 排在第 9 位的候选若其实是唯一真正相关的，先截断就没有它了。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [
+            _point(index, text=f"华东渠道折扣第{index}条", dense=[1.0, 0, 0, 0])
+            for index in range(15)
+        ]
+    )
+    # 分数与"RRF 顺序"完全相反：0 号最高、14 号最低
+    scores = [1.0 - index * 0.05 for index in range(15)]
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], scores)
+
+    outcome = await _retriever(_with_reranker(settings), store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert len(gateway.rerank_calls[0][1]) == 15, "候选要先全部交给重排"
+    assert len(outcome.candidates) == settings.rag.rerank_top_k
+    assert [c.chunk_id for c in outcome.candidates] == [
+        f"chk_{index:04d}" for index in range(settings.rag.rerank_top_k)
+    ]
+    assert [c.rank for c in outcome.candidates] == list(range(1, settings.rag.rerank_top_k + 1))
+
+
+async def test_tool_reports_the_rerank_criterion_in_safe_detail(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """重排生效时拒答，`safe_detail` 要能看出**是它判的**。
+
+    三条判据的处置完全不同：「语料没见过这个词」要去确认是不是问错了，
+    「余弦太低」要去查阈值，「重排分都不够」要去查重排阈值或语料。
+    只报前两条的话，读的人会去查一个这次根本没参与判定的数。
+    """
+    store = await _three_candidates()
+    gateway = _rerank_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0], [0.02, 0.01, 0.03])
+    tool = RagRetrieveTool(
+        settings=settings,
+        retriever=_retriever(_with_reranker(settings, threshold=0.5), store, gateway, vocabulary),
+    )
+
+    result = await tool.execute(RagQueryArgs(question="华东区域渠道折扣政策"), _context())
+
+    assert result.status == "FAILED"
+    detail = (result.error.safe_detail if result.error else "") or ""
+    assert "判据三" in detail
+    assert "重排分最高 0.0300" in detail

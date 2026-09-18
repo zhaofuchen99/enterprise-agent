@@ -44,6 +44,7 @@ from app.infrastructure.vector_store import VectorStore
 from app.repositories.vocab_repo import VocabRepository
 from app.tools.base import ToolContext, ToolError, ToolName, ToolResult
 from app.tools.rag.evidence import build_document_evidence
+from app.tools.rag.reranker import SKIP_DISABLED, Reranker
 from app.tools.rag.retriever import Retriever
 from app.tools.rag.schemas import (
     TOOL_NAME,
@@ -123,6 +124,14 @@ def _result_payload(outcome: RetrievalOutcome, call_id: str) -> RagToolResult:
         relevance_threshold=outcome.relevance_threshold,
         best_dense_score=outcome.best_dense_score,
         unseen_topics=outcome.unseen_topics,
+        # 重排那一组**必须逐个带出去**：`safe_detail`、`make retrieve` 的打印
+        # 与"这次拒答到底是谁判的"都读它们（逐字段对应，漏一个的症状是
+        # 详情里写着"重排未生效（None）"——而那是把装配缺陷说成了配置问题）
+        rerank_applied=outcome.rerank_applied,
+        rerank_skipped_reason=outcome.rerank_skipped_reason,
+        rerank_threshold=outcome.rerank_threshold,
+        best_rerank_score=outcome.best_rerank_score,
+        rerank_pruned=outcome.rerank_pruned,
         duration_ms=outcome.duration_ms,
         warnings=_warnings(outcome),
     )
@@ -133,10 +142,29 @@ def _warnings(outcome: RetrievalOutcome) -> tuple[str, ...]:
 
     改写降级尤其需要：检索结果变差时，第一件要排除的就是
     "这次用的是原问题还是改写后的查询"，而它在结果里看不出来。
+
+    重排同理，但**「没开」不算警告**：那是配置的选择（也是默认值），
+    每次检索都带一条警告会让警告本身变成噪声，于是真的降级也没人看。
+    只有"开了却没用上"才是要报的——那说明服务或配置出了问题。
     """
-    if not outcome.rewrite_degraded:
-        return ()
-    return ("查询改写未生效（模型不可用或输出不合规），已退化为原问题检索",)
+    warnings: list[str] = []
+    if outcome.rewrite_degraded:
+        warnings.append("查询改写未生效（模型不可用或输出不合规），已退化为原问题检索")
+    if outcome.rerank_skipped_reason and outcome.rerank_skipped_reason != SKIP_DISABLED:
+        warnings.append(f"重排未生效（{outcome.rerank_skipped_reason}），本次证据按 RRF 顺序取")
+    return tuple(warnings)
+
+
+def _rerank_detail(payload: RagToolResult) -> str:
+    """拒答时第三条判据：重排分。
+
+    **重排生效时，真正决定拒答的就是它**（见 `Retriever.retrieve` 的说明）。
+    没生效时如实说"这次不是它判的"——否则读这段详情的人会以为重排跑过。
+    """
+    if not payload.rerank_applied:
+        return f"重排未生效（{payload.rerank_skipped_reason}），本次由前两条判据决定"
+    best = f"{payload.best_rerank_score:.4f}" if payload.best_rerank_score is not None else "—"
+    return f"重排分最高 {best} (阈值 {payload.rerank_threshold})，剔除 {payload.rerank_pruned} 条"
 
 
 def _success_result(
@@ -174,7 +202,11 @@ def _no_knowledge_result(
         started_at=started_at,
         finished_at=datetime.now(UTC),
         summary=(
-            f"知识库中没有与问题相关的制度或报告（最高相似度 {payload.best_dense_score:.4f}）"
+            # 摘要报的是**实际生效的那条判据的分数**：重排生效时拿余弦当门面，
+            # 会让读摘要的人去查一个这次根本没参与判定的数
+            f"知识库中没有与问题相关的制度或报告（最高重排分 {payload.best_rerank_score:.4f}）"
+            if payload.rerank_applied and payload.best_rerank_score is not None
+            else f"知识库中没有与问题相关的制度或报告（最高相似度 {payload.best_dense_score:.4f}）"
         ),
         payload=payload.as_payload(),
         error=ToolError(
@@ -184,14 +216,16 @@ def _no_knowledge_result(
             # 不可重试：换个说法再查一次得到的还是同一批候选，
             # 该做的是澄清或让 Reviewer 去补证据源（9.4 的 EMPTY_RESULT 一行）
             retryable=False,
-            # `safe_detail` 面向排查且必须已脱敏（9.2）。**两个判据都要报**：
+            # `safe_detail` 面向排查且必须已脱敏（9.2）。**三条判据都要报**：
             # 它们的处置完全不同——"语料没见过这个词"要去确认是不是问错了，
-            # "余弦太低"要去查阈值是不是调高了
+            # "余弦太低"要去查阈值是不是调高了，而重排生效时**真正决定拒答的
+            # 是它**，前两条那时已经退化成诊断信息了
             safe_detail=(
                 f"判据一｜主题词未登录："
                 f"{'、'.join(payload.unseen_topics) if payload.unseen_topics else '无'}；"
                 f"判据二｜最高余弦 {payload.best_dense_score:.4f} "
                 f"(阈值 {payload.relevance_threshold})；"
+                f"判据三｜{_rerank_detail(payload)}；"
                 f"实际使用的查询：{'|'.join(payload.queries)}"
             ),
         ),
@@ -251,6 +285,9 @@ async def build_retriever(
         vector_store=vector_store,
         tokenizer=Tokenizer.from_settings(settings),
         vocabulary=vocabulary,
+        # 重排器与检索器分开构造：它自己只依赖配置与网关，而"要不要重排"
+        # 是配置说了算（`RERANKER_ENABLED`），不是装配点临时决定的
+        reranker=Reranker(settings=settings, gateway=gateway),
     )
 
 

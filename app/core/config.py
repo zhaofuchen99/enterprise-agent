@@ -153,8 +153,27 @@ class RagTuning(BaseModel):
     sparse_top_k: int = Field(default=20, ge=1, le=200)
     #: RRF 合并后的候选上限（11.7 第 5 步），不超过 30
     max_candidates: int = Field(default=30, ge=1, le=200)
-    #: 最终进入证据的条数（11.7 第 7 步）
+    #: 最终进入证据的条数（11.7 第 7 步）。**名字里的 rerank 指的是这一步，
+    #: 不是"重排模型的参数"**——重排关闭时它同样生效（RRF 序取前 8）。
+    #: 评测脚本的 K 取的也是它：评测口径必须与线上一致。
     rerank_top_k: int = Field(default=8, ge=1, le=100)
+    #: 重排分的剔除阈值（11.7 第 7 步的「低于校准阈值的候选剔除」）。
+    #:
+    #: **它挂的是 cross-encoder 的相关性分**（[0,1]），与 `score_threshold`
+    #: 挂的稠密余弦不是同一个量——后者是双塔模型的相似度，前者是
+    #: 问题与候选**一起**过一遍模型得到的相关性。这正是前者能逐候选判定、
+    #: 而后者只能做整体门禁的原因（11.7 的落地记录：稀疏路候选取不到稠密分）。
+    #:
+    #: ⚠️ **当前值是按同族模型的量级取的保守初值，尚未在金标上校准**。
+    #: 校准口径：20 条有答案的用例都要留下候选（不能误剔），
+    #: 3 条语料中不存在的用例要被剔空（否则就是编造）。改它必须重跑
+    #: `make eval-rag` 与 `make verify-corpus`，并把实测值写回这里。
+    rerank_score_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
+    #: 送进重排器的单条候选文本上限（字符）。**它是护栏不是调参项**：
+    #: 本语料的正文块中位 85 字、最长 881 字，这个上限从不生效；
+    #: 留它是防将来出现超长块把请求体撑大（cross-encoder 的输入越长越慢，
+    #: 而超出模型窗口的部分本来也会被截掉，不如我们自己截得有边界）。
+    rerank_max_chars: int = Field(default=1000, ge=100, le=4000)
     #: 相关度阈值（11.7 第 7 步）。**挂在稠密路的余弦相似度上，不是 RRF 融合分。**
     #:
     #: RRF 分是 `Σ 1/(k+rank)`，值域只有约 0.016–0.033，把 0.35 挂上去会把结果
@@ -290,8 +309,24 @@ class Settings(BaseSettings):
     embedding_base_url: str | None = None
     embedding_dim: int = Field(default=1024, ge=64, le=8192)
 
-    reranker_model: str | None = None
+    #: 重排模型（cross-encoder）。**它不是 OpenAI 的 chat / embeddings 形状**：
+    #: 检索侧的 cross-encoder 事实上通用 Cohere 那一套 `POST /rerank`
+    #: （`{model, query, documents[]}` → `results[].index / relevance_score`），
+    #: Jina、硅基流动都兼容它，所以网关里仍然只有一个实现，换服务商只改配置。
+    #:
+    #: **默认关闭**：关掉时检索走 RRF 序（11.7 第 ⑤ 步的直接结果），
+    #: 那也是重排失败时的降级路径——两条路径必须是同一段代码。
     reranker_enabled: bool = False
+    reranker_model: str | None = None
+    #: 重排服务的地址与密钥。**与 embedding 同理必须单独配**：
+    #: 它是另一个服务商，回落到 `model_base_url`（deepseek）只会得到 404，
+    #: 而那个报错指向的是"服务商不支持 rerank"。
+    reranker_base_url: str | None = None
+    reranker_api_key: str | None = None
+    #: 单次重排调用的超时。**比模型调用的 45s 短**：重排是检索链路上的
+    #: 增强步骤而非必须成功的依赖，失败会立刻降级回 RRF 序——让它挂满 45s
+    #: 等于把一个可以忽略的故障拖成任务级的慢。20s 对 30 条候选绰绰有余。
+    reranker_timeout_seconds: int = Field(default=20, ge=5, le=120)
 
     #: **默认关闭思考**（`MODEL__THINKING_ENABLED=false`）。DeepSeek V4 的思考模式
     #: 默认开启且 effort=high，而本项目是**节点密集调用 + 全是结构化输出**：
@@ -388,8 +423,21 @@ class Settings(BaseSettings):
         if self.search_enabled and not self.search_provider:
             raise ValueError("SEARCH_ENABLED=true 时必须提供 SEARCH_PROVIDER")
 
-        if self.reranker_enabled and not self.reranker_model:
-            raise ValueError("RERANKER_ENABLED=true 时必须提供 RERANKER_MODEL")
+        if self.reranker_enabled:
+            # **三项都校验**，缺一样就启动失败：重排是"少一个配置就静默失效"的
+            # 典型位置——base_url 缺了会打到聊天服务商上（404）、密钥缺了会 401，
+            # 而两者的处置都是降级回 RRF 序，于是**重排永远不生效却没有任何报错**。
+            missing_rerank = [
+                name
+                for name, value in (
+                    ("RERANKER_MODEL", self.reranker_model),
+                    ("RERANKER_BASE_URL", self.reranker_base_url),
+                    ("RERANKER_API_KEY", self.reranker_api_key),
+                )
+                if not value
+            ]
+            if missing_rerank:
+                raise ValueError(f"RERANKER_ENABLED=true 时必须提供：{', '.join(missing_rerank)}")
 
         # 心跳 TTL 必须留出「漏掉一拍」的余量。判死的判据是
         # `heartbeat_at < now - ttl`，与扫描周期无关，所以这里约束的是

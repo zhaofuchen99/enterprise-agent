@@ -170,6 +170,9 @@ class FakeModelGateway:
         embedding_dim: `embed` 返回的向量维度，同时也是维度不匹配用例的开关。
         embeddings: 显式指定的向量表；为空时按文本长度生成**确定性**占位向量。
         embed_calls: 每次 `embed` 收到的文本批次。
+        rerank_scores: 按序弹出的重排分脚本（每项与候选**同序同长**）。
+            **必须显式给**——见 `rerank` 的说明。
+        rerank_calls: 每次 `rerank` 收到的 (query, documents)。
         closed: 是否已被 `aclose()` 关闭。
     """
 
@@ -179,8 +182,11 @@ class FakeModelGateway:
     embedding_dim: int = 8
     embeddings: list[list[float]] = field(default_factory=list)
     embed_calls: list[list[str]] = field(default_factory=list)
+    rerank_scores: list[list[float]] = field(default_factory=list)
+    rerank_calls: list[tuple[str, list[str]]] = field(default_factory=list)
     closed: bool = False
     _cursor: int = 0
+    _rerank_cursor: int = 0
 
     async def invoke_structured[T: BaseModel](
         self, prompt: PromptSource, schema: type[T], /, **variables: Any
@@ -222,6 +228,29 @@ class FakeModelGateway:
             duration_ms=0,
             attempts=1,
         )
+
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
+        """按脚本返回重排分（**与 `documents` 同序同长**）。
+
+        `rerank_scores` 每一项对应一次调用；用尽后重复最后一项（与
+        `responses` 同规矩）。**不给默认分数**：默认返回"全都一样相关"
+        会让"忘了配脚本"表现为一个看起来通过的重排用例——
+        那正是这个替身存在的意义所在。
+        """
+        self.rerank_calls.append((query, list(documents)))
+        if self.failure is not None:
+            raise _failure_error(self.failure)
+        if not self.rerank_scores:
+            raise AssertionError(
+                "FakeModelGateway 没有重排脚本可返回：请在用例里显式设置 rerank_scores。"
+            )
+        scores = self.rerank_scores[min(self._rerank_cursor, len(self.rerank_scores) - 1)]
+        self._rerank_cursor += 1
+        if len(scores) != len(documents):
+            # 真实网关不允许这种事（`_scores_by_index` 会报缺条），
+            # 替身也不许——长度对不上时用例断言的是别的东西。
+            raise AssertionError(f"重排脚本长度与候选数不符：{len(scores)} != {len(documents)}")
+        return list(scores)
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         self.embed_calls.append(list(texts))

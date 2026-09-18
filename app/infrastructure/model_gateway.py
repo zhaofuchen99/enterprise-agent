@@ -19,6 +19,12 @@ fastapi 的模块」，所以这条纪律得靠这里自觉。
 差别只是 `base_url` / `model` / `api_key` 三个配置值。
 `model_provider` 保留为标签进 Trace，不作为分支条件。
 
+**重排是这条纪律的一个例外，但例外只在协议形状上**：cross-encoder 没有
+OpenAI 兼容端点（业界事实标准是 Cohere 的 `POST /rerank`），所以
+`rerank` 的请求体与 chat / embeddings 不同。**「一个实现」本身没有被破坏**——
+Jina、硅基流动、Cohere 都兼容那一套形状，换服务商仍然只改三个配置值，
+调用方看到的也只是 `rerank(query, documents) -> list[float]`。
+
 ## 两条独立的失败预算
 
 详细设计 9.4 的错误分类表把可重试错误分成两类，这里逐类实现：
@@ -160,13 +166,22 @@ class PromptSource(Protocol):
 
 
 class ModelGateway(Protocol):
-    """模型出口契约。生产实现见 `HttpModelGateway`，测试替身见 `app/tests/fakes.py`。"""
+    """模型出口契约。生产实现见 `HttpModelGateway`，测试替身见 `app/tests/fakes.py`。
+
+    三个方法对应三类**形状完全不同**的服务：`invoke_structured` 走 OpenAI 兼容的
+    chat（JSON 模式 + 两条重试预算），`embed` 走 OpenAI 兼容的 embeddings，
+    `rerank` 走 Cohere 那套 `/rerank`（检索侧 cross-encoder 的事实标准）。
+    它们共处一个 Protocol 是因为**调用方不该知道服务商是谁**——
+    换服务商的成本必须落在这一个文件里。
+    """
 
     async def invoke_structured[T: BaseModel](
         self, prompt: PromptSource, schema: type[T], /, **variables: Any
     ) -> StructuredResult[T]: ...
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]: ...
 
     async def aclose(self) -> None: ...
 
@@ -271,6 +286,19 @@ class HttpModelGateway:
             timeout=timeout,
             transport=transport,
         )
+        # 重排器：**没开就不建客户端**。建一个 base_url 指向聊天服务商的客户端
+        # 不会有任何症状，直到开关被打开而 base_url 忘了填——那时报的是 404，
+        # 排查方向会跑到"这个服务商不支持 rerank"上去。
+        # 配置校验（`Settings` 的交叉校验）已经把"开了却没配齐"挡在启动时，
+        # 这里的 `None` 是"没开"的正常态。
+        self._reranker: httpx.AsyncClient | None = None
+        if settings.reranker_enabled and settings.reranker_base_url:
+            self._reranker = httpx.AsyncClient(
+                base_url=settings.reranker_base_url,
+                headers={"Authorization": f"Bearer {settings.reranker_api_key or ''}"},
+                timeout=float(settings.reranker_timeout_seconds),
+                transport=transport,
+            )
 
     # -------------------------------------------------------------- 结构化调用
     async def invoke_structured[T: BaseModel](
@@ -417,9 +445,87 @@ class HttpModelGateway:
             )
         return vectors
 
+    # -------------------------------------------------------------------- 重排
+    async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
+        """逐条给 `documents` 打相关性分，**返回与输入同序同长**的分数。
+
+        契约取「同序同长」而不是"直接给出排好序的下标"：排序与剔除是**策略**
+        （阈值、Top-K、并列怎么破），属于 `tools/rag/reranker.py`；
+        网关只负责把模型说的话原样带回来。返回排好序的结果会把策略的一半
+        塞进基础设施层，而那一半恰恰是评测要调的东西。
+
+        **失败一律抛 `AgentError`，不在这里降级**：降级成"保留原顺序"是检索侧
+        的决定（那条路径与"没开重排"共用同一段代码），网关把它吞掉会让
+        「重排这次没生效」变成一件不可观测的事。
+
+        **不重试**（与 `embed` 同形）。重排是增强步骤，失败的处置是退回 RRF 序
+        ——那本来就是一个正确的结果；重试只会把一次可以忽略的故障拖长。
+        9.4 的两条重试预算管的是 chat（那是任务的必经路径）。
+        """
+        if not documents:
+            return []
+        client = self._reranker
+        if client is None:
+            # 走到这里说明调用方没看 `RERANKER_ENABLED` 就调了重排。
+            # **报错而不是静默返回**：静默返回一个"全都相关"的假分数，
+            # 会让错误的排序看起来是重排器的判断结果。
+            raise AgentError(
+                ErrorCode.UPSTREAM_UNAVAILABLE,
+                "重排服务未配置（RERANKER_ENABLED=false）",
+                details={"model": self._settings.reranker_model},
+            )
+
+        with span(
+            "llm.rerank",
+            **{
+                "llm.provider": self._settings.model_provider,
+                "llm.model": self._settings.reranker_model,
+                "llm.input_count": len(documents),
+            },
+        ) as current:
+            try:
+                response = await client.post(
+                    "/rerank",
+                    json={
+                        "model": self._settings.reranker_model,
+                        "query": query,
+                        "documents": list(documents),
+                        # **要全部候选的分数**：`top_n` 不传时部分服务端只回前若干条，
+                        # 而少掉的那些会被读成"没有分"——那与我们没算过它长得一样。
+                        "top_n": len(documents),
+                    },
+                )
+            except httpx.TransportError as exc:
+                raise AgentError(
+                    ErrorCode.UPSTREAM_UNAVAILABLE,
+                    "重排服务暂时不可用，请稍后重试",
+                    details={
+                        "model": self._settings.reranker_model,
+                        "reason": type(exc).__name__,
+                    },
+                ) from exc
+
+            if response.status_code >= 400:
+                # 同 `embed`：不记响应体，避免服务端回显把 Authorization 带进日志
+                raise AgentError(
+                    ErrorCode.UPSTREAM_UNAVAILABLE,
+                    "重排服务返回错误，请稍后重试",
+                    details={
+                        "model": self._settings.reranker_model,
+                        "status_code": response.status_code,
+                    },
+                )
+
+            results = response.json().get("results")
+            scores = _scores_by_index(results, expected=len(documents))
+            current.set_attribute("llm.outcome", "ok")
+        return scores
+
     async def aclose(self) -> None:
         await self._chat.aclose()
         await self._embeddings.aclose()
+        if self._reranker is not None:
+            await self._reranker.aclose()
 
     # ---------------------------------------------------------------- 内部实现
     async def _post_chat(self, content: str) -> dict[str, Any]:
@@ -483,6 +589,43 @@ class HttpModelGateway:
 
 
 # ------------------------------------------------------------------ 契约构造
+def _scores_by_index(results: Any, *, expected: int) -> list[float]:
+    """把 `/rerank` 的 `results` 摊成与输入同序的分数列表。
+
+    **按 `index` 归位，不依赖返回顺序**（同 `embed` 的理由）：服务端把结果
+    按分数降序返回，直接取用会让「第 1 条候选」拿到「最相关那条」的分数——
+    分数全对、配对全错，而且不报任何错。
+
+    **少一条就报错，不补 0**：补 0 等于断言"这条与问题无关"，那是个我们
+    并不知道的结论（它压根没被评分）。缺条只能说明服务端没按 `top_n` 返回，
+    处置是整次降级回 RRF 序——那由调用方决定，这里只把事实说清楚。
+    """
+    if not isinstance(results, list):
+        raise AgentError(
+            ErrorCode.UPSTREAM_UNAVAILABLE,
+            "重排服务的返回里没有 results 字段",
+            details={"expected": expected},
+        )
+    scores: list[float | None] = [None] * expected
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        score = item.get("relevance_score")
+        if not isinstance(index, int) or not isinstance(score, (int, float)):
+            continue
+        if 0 <= index < expected:
+            scores[index] = float(score)
+    missing = [index for index, score in enumerate(scores) if score is None]
+    if missing:
+        raise AgentError(
+            ErrorCode.UPSTREAM_UNAVAILABLE,
+            f"重排服务返回的候选数不足：应有 {expected} 条，缺 {len(missing)} 条",
+            details={"expected": expected, "returned": len(results)},
+        )
+    return [float(score) for score in scores if score is not None]
+
+
 def build_json_contract(schema: type[BaseModel]) -> str:
     """由 Schema 生成 JSON 输出契约（含格式示例）。
 

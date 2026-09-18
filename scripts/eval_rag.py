@@ -148,6 +148,21 @@ async def run(settings: Settings, cases: Sequence[GoldenCase]) -> list[CaseOutco
     return outcomes
 
 
+def _rerank_summary(settings: Settings) -> str:
+    """重排配置的一行摘要。**评测口径的一部分**（11.7 第 ⑥⑦ 步是否在跑）。
+
+    开与关跑出来的 Recall@8 是两个不同的数，而两行输出长得一模一样——
+    不印这一行的话，"昨天 95% 今天 88%"会变成一件查不清的事。
+    """
+    if not settings.reranker_enabled:
+        return "未启用（证据按 RRF 顺序取 Top-K）"
+    return (
+        f"{settings.reranker_model}"
+        f"｜剔除阈值 {settings.rag.rerank_score_threshold}"
+        f"｜单条上限 {settings.rag.rerank_max_chars} 字"
+    )
+
+
 def render(outcome: CaseOutcome) -> str:
     mark = "✓" if outcome.hit else "✗"
     detail = "、".join(outcome.hit_docs) if outcome.hit_docs else "未命中"
@@ -181,6 +196,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"金标 {golden.version}｜{len(outcomes)} 条｜Top {settings.rag.rerank_top_k}")
     print(f"相关性阈值 {settings.rag.score_threshold}（⑫ 之前是保守地板，见 config.py）")
+    # **重排的开关与阈值必须印在头部**：同一个 Recall@8 在两个配置下的含义
+    # 完全不同，而前后两次跑的数字看起来可以一样
+    print(f"重排：{_rerank_summary(settings)}")
     print()
     for outcome in outcomes:
         print(render(outcome))

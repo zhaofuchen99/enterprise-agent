@@ -6,47 +6,44 @@
 ③ 权限 / ACTIVE / 有效期标量过滤 → ChunkFilter
 ④ Dense TopK=20 + Sparse TopK=20
 ⑤ RRF 合并，候选 ≤ 30
-⑥ 重排                        → **按 TBC-04 后置**
-⑦ 取 Top 8，低于阈值的候选剔除
-⑧ 邻近块扩展                  → **随重排器后置**，见下
+⑥ 重排                        → `tools/rag/reranker.py`（可关、失败降级）
+⑦ 取 Top 8，低于阈值的候选剔除 → 同左
+⑧ 邻近块扩展                  → **仍然后置**，见下
 ⑨ 输出证据                    → `tools/rag/evidence.py`
 ```
 
-## 第 ⑥⑧ 步为什么不在这一版里（这是时序调整，不是砍需求）
+## 第 ⑧ 步为什么仍然不在这一版里
 
-**第 ⑥ 步（重排）** 的后置依据是详设 TBC-04 的决议记录，不是冲刺期的裁剪——
-它需要另选一个 cross-encoder 模型，而本机 7.6GB 内存下再跑一个模型
-会挤压已经跑着的 `bge-m3`（见 CLAUDE.md 的「本机环境事实」）。
-11.7 第 5 步到第 7 步之间因此是直接的：RRF 的 Top 30 → 取 Top 8。
+它的条件原文是「同文档、同章节且**确有上下文缺口**时」。现在重排分已经有了，
+"缺口"终于可以判了，但这一步还要**存储层的新能力**：按 payload 取同一文档
+同一章节的相邻块（`VectorStore` 现在只有向量检索，没有按定位取块）。
+它是一次独立的工作量，登记为【后续扩展】——**不是**能力不够，是范围没排进来。
 
-**第 ⑧ 步（邻近块扩展）** 的条件原文是「同文档、同章节且**确有上下文缺口**时」。
-缺口判定要的正是重排器给出的相关性信号——没有它，只能退化成
-「块长小于 `chunk_min_chars` 就扩」，而这条在本语料上**几乎恒真**
-（正文块中位仅 85 字，见 CLAUDE.md 临时约定 15），等于无条件把候选翻倍，
-在 Recall@8 上引入的全是噪声。所以它跟着重排器一起后置，理由与它同源。
+## 相关性判据：重排在时由它判，不在时回到那两条代偿规则
 
-## 第 ⑦ 步的阈值挂在哪一路分数上（这一条是本实现自己决定的）
+11.7 说「低于**校准阈值**的候选剔除」，而那条阈值**挂不到 RRF 分上**：
+RRF 分是 `Σ 1/(k+rank)`，k=60 时整个值域只有约 0.016–0.033，挂绝对阈值会把结果
+全部剔光。11.6.5 也正是靠「RRF 只依赖排名、不依赖分数绝对值」论证固定 IDF
+方案成立的——在一个被刻意做成无量纲的分数上挂阈值，与那条论证直接冲突。
 
-11.7 说「低于**校准阈值**的候选剔除」，而 `RAG__SCORE_THRESHOLD` 的默认值是 0.35。
-**把 0.35 挂在 RRF 融合分上会把结果全部剔光**：RRF 分是 `Σ 1/(k+rank)`，
-k=60 时整个值域只有约 0.016–0.033。11.6.5 也正是靠「RRF 只依赖排名、
-不依赖分数绝对值」来论证固定 IDF 方案成立的——在一个被刻意做成无量纲的
-分数上挂绝对阈值，与那条论证直接冲突。
+系统里唯一**量纲可比**的分数原本只有稠密余弦（[0,1]），而它**做不了逐候选判定**：
+稀疏路独有的候选压根没被稠密路评估过，没有余弦可分（补 0.0 等于断言
+"语义完全不相关"）。于是这一版分两种情况：
 
-系统里唯一**量纲可比**的分数是稠密路的余弦相似度（bge-m3 + COSINE，落在 [0,1]）。
-因此这里的做法是：
+| 重排 | 拒答判据 |
+|---|---|
+| **生效** | 逐候选的重排分低于 `rag.rerank_score_threshold` 全被剔 → `NO_RELEVANT_KNOWLEDGE` |
+| **没生效**（没开 / 调用失败） | 稠密余弦地板（`rag.score_threshold`）**或**未登录词 |
 
-- **融合仍然只按排名**（RRF，量纲不变）；
-- **相关性判定整体做一次**：所有查询的稠密结果里最高的那个余弦就是
-  「这一问在语料里到底有没有东西」的度量，低于阈值即
-  `NO_RELEVANT_KNOWLEDGE`（11.8 第 1 条 / 详设 9.4 的 `EMPTY_RESULT`）。
+第二种是为"没有重排器"设计的代偿规则，**判得动就继续用**——它是唯一的信号。
+第一种是语义判据，它同时也解掉了那两条规则解不了的那类误拒
+（「报备」vs 语料里的「备案」，纯词汇规则区分不了"没讲过"与"用了另一个说法"，
+见 `_unseen_topics` 的说明）。
 
-**为什么是"整体判定"而不是"逐候选剔除"**：逐候选需要每个候选的语义分，
-而稀疏路独有的候选**没有**稠密分（它压根没被稠密路评估过）。给它们补 0.0
-等于断言"语义完全不相关"，那是个我们并不知道的结论。逐候选的语义过滤
-是重排器的职责——它给每个候选一个可比的分数。这一版把阈值用在它唯一
-站得住的位置上，并在 `RetrievalOutcome` 里把**阈值与实测最好余弦都留下**：
-「阈值调错了」与「语料真没有」症状相同，处置完全不同。
+⚠️ **切到语义判据之后，词表与余弦不再单独拒答**，它们降级为诊断信息——
+仍然进 `unseen_topics` / `best_dense_score`，排查时照旧看得到。
+这个切换的代价与收益必须用金标量化（20 条真问题不能误拒、3 条
+语料中不存在的必须剔空），`make eval-rag` 的开/关两组数字就是它的依据。
 """
 
 from __future__ import annotations
@@ -64,6 +61,7 @@ from app.infrastructure.model_gateway import ModelGateway
 from app.infrastructure.vector_store import ChunkFilter, ScoredPoint, VectorStore
 from app.tools.rag.metadata import ChunkMetadata
 from app.tools.rag.prompts import QUERY_REWRITE_PROMPT
+from app.tools.rag.reranker import Reranker
 from app.tools.rag.schemas import QueryRewrite, RagQueryArgs, RetrievalOutcome, RetrievedChunk
 from app.tools.rag.tokenizer import (
     Tokenizer,
@@ -184,12 +182,17 @@ class Retriever:
         vector_store: VectorStore,
         tokenizer: Tokenizer,
         vocabulary: Vocabulary,
+        reranker: Reranker,
     ) -> None:
         self._settings = settings
         self._gateway = gateway
         self._store = vector_store
         self._tokenizer = tokenizer
         self._vocabulary = vocabulary
+        #: 第 ⑥⑦ 步。**必填**：给它默认值会让"装配点忘了接"表现为
+        #: "重排永远不生效"，而那正是 `DISABLED` 这个原因串要负责区分的事——
+        #: 用一个默认实现盖住装配缺陷，等于把两种原因混成一种。
+        self._reranker = reranker
 
     async def retrieve(self, args: RagQueryArgs, *, scope: PermissionScope) -> RetrievalOutcome:
         """跑完 11.7 的第 2–7 步。
@@ -224,26 +227,49 @@ class Retriever:
         # 用户问的就是那个词。
         unseen = self._unseen_topics(args.question)
 
+        # ⑥⑦ 重排、取 Top-K、低分剔除。**候选先全部转成 `RetrievedChunk`**
+        # （而不是让重排器直接吃融合结果）：payload 反解失败的块要在这里被丢掉，
+        # 否则重排会浪费一次调用去评一条注定进不了证据的候选。
+        all_candidates = _to_chunks(fused, dense_scores)
+        ranked = await self._reranker.rerank(question=args.question, candidates=all_candidates)
+
+        # **拒答判据随重排是否生效而切换**，这是本实现自己决定的一处语义：
+        #
+        # - 重排生效时，逐候选的相关性分是**语义判据**，它说了算：一条都没留下
+        #   就是"语料里没有"。词表与余弦两路此时降级为**诊断信息**（仍然进
+        #   `unseen_topics` / `best_dense_score`，排查时照旧看得到）。
+        #   这是 11.7 第 ⑦ 步的原意——「低于校准阈值的候选剔除」，
+        #   而它们的分数来自唯一能逐候选比较的那一路信号。
+        # - 重排没生效（没开或失败）时回到原来的两判据：稠密余弦地板 + 未登录词。
+        #   那两条是为"没有重排器"设计的代偿规则，判得动就继续用它们——
+        #   此时**没有**任何逐候选的语义分可用，拿 RRF 分当判据是错的（无量纲）。
+        no_relevant = (
+            not ranked.chunks
+            if ranked.applied
+            else best_dense < tuning.score_threshold or bool(unseen)
+        )
+
         outcome = RetrievalOutcome(
             queries=queries,
             rewrite_degraded=degraded,
             candidate_count=len(fused),
-            candidates=(),
-            relevance_threshold=tuning.score_threshold,
-            best_dense_score=best_dense,
-            unseen_topics=unseen,
-            no_relevant_knowledge=best_dense < tuning.score_threshold or bool(unseen),
-            duration_ms=_elapsed_ms(started),
-        )
-        if outcome.no_relevant_knowledge:
-            # **不返回任何候选**，而不是"返回候选但打个标记"：11.8 要求
+            # **拒答时不返回任何候选**，而不是"返回候选但打个标记"：11.8 要求
             # 「检索为空时显式返回 NO_RELEVANT_KNOWLEDGE」，而只要候选还在，
             # 下游就有机会把它当成证据用——"不让生成节点补写制度"这条纪律
             # 靠的是**没有东西可写**，不是靠调用方自觉。
-            return outcome
-        return outcome.model_copy(
-            update={"candidates": _to_chunks(fused, dense_scores, tuning.rerank_top_k)}
+            candidates=() if no_relevant else ranked.chunks,
+            relevance_threshold=tuning.score_threshold,
+            best_dense_score=best_dense,
+            unseen_topics=unseen,
+            rerank_applied=ranked.applied,
+            rerank_skipped_reason=ranked.skipped_reason,
+            rerank_threshold=ranked.threshold,
+            best_rerank_score=ranked.best_score,
+            rerank_pruned=ranked.pruned,
+            no_relevant_knowledge=no_relevant,
+            duration_ms=_elapsed_ms(started),
         )
+        return outcome
 
     # ------------------------------------------------------------------ ② 改写
     async def _rewrite(self, args: RagQueryArgs) -> tuple[tuple[str, ...], bool]:
@@ -416,9 +442,13 @@ def _fuse(
 def _to_chunks(
     fused: Sequence[tuple[str, float, dict[str, Any]]],
     dense_scores: dict[str, float],
-    top_k: int,
+    top_k: int | None = None,
 ) -> tuple[RetrievedChunk, ...]:
-    """融合结果 → Top K 条候选（11.7 第 7 步）。
+    """融合结果 → 候选（11.7 第 6 步的输入 / 第 7 步的输出）。
+
+    `top_k=None` 表示**全部留下**：重排要看到整条 RRF 队列（≤30 条）才能
+    决定谁进 Top 8，先截断再重排等于把重排器的判断范围预先砍掉。
+    不传时由重排器截断，`rank` 也由它重编（见 `reranker._renumber`）。
 
     payload 反解失败的分块**整条跳过**：`ChunkMetadata` 的字段都是证据定位
     必需的（没有 `checksum` 就说不清引用的是哪一份文件），
@@ -426,7 +456,9 @@ def _to_chunks(
     跳过的同时不静默——条数差会反映在 `candidate_count` 与 `len(candidates)` 上。
     """
     chunks: list[RetrievedChunk] = []
-    for rank, (chunk_id, score, payload) in enumerate(fused[:top_k], start=1):
+    for rank, (chunk_id, score, payload) in enumerate(
+        fused if top_k is None else fused[:top_k], start=1
+    ):
         try:
             metadata = ChunkMetadata.from_payload(payload)
         except ValueError:

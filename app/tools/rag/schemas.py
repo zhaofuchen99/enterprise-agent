@@ -89,6 +89,10 @@ class RetrievedChunk(BaseModel):
     #: 补 0.0 会让它看起来像"语义完全不相关"，那是个我们并不知道的结论，
     #: 而下游（Reviewer、冲突检测）一旦读到就会把它当成事实。
     dense_score: float | None = None
+    #: cross-encoder 给的相关性分（[0,1]）。**同样可空**，理由不同：
+    #: 重排没开、或这次调用失败时它**没有值**。补一个假的进去，
+    #: 读的人会把 RRF 的名次当成模型的判断——而它看起来完全正常。
+    rerank_score: float | None = None
     #: 融合后的名次，1 起
     rank: int
     metadata: ChunkMetadata
@@ -122,6 +126,20 @@ class RetrievalOutcome(BaseModel):
     #: 两个判据是「或」的关系，所以**两个都要留下**：
     #: 「阈值调高了」与「语料真没见过这个词」症状相同，处置完全不同。
     unseen_topics: tuple[str, ...] = ()
+    #: 重排（11.7 第 ⑥⑦ 步）是否真的生效。**它是「拒答由谁判定」的开关**：
+    #: 生效时逐候选的重排分说了算，没生效时退回稠密余弦 + 未登录词那两判据
+    #: （见 `Retriever.retrieve`）。
+    rerank_applied: bool = False
+    #: 没生效的原因（`DISABLED` / `UNAVAILABLE:<错误码>` / `INCOMPLETE`）。
+    #: 与 `rewrite_degraded` 同一条纪律：**改变过行为的事必须能被看到**。
+    rerank_skipped_reason: str | None = None
+    #: 本次生效的剔除阈值与实测最高重排分。与 `relevance_threshold` /
+    #: `best_dense_score` 同理，**两个都要留下**：剔空了到底是阈值高了
+    #: 还是真的都不相关，只看一个数分不出来。
+    rerank_threshold: float | None = None
+    best_rerank_score: float | None = None
+    #: 被剔除阈值筛掉的候选数
+    rerank_pruned: int = 0
     no_relevant_knowledge: bool
     duration_ms: int
 
@@ -140,6 +158,12 @@ class RagToolResult(BaseModel):
     best_dense_score: float
     #: 见 `RetrievalOutcome.unseen_topics`
     unseen_topics: tuple[str, ...] = ()
+    #: 见 `RetrievalOutcome` 的同名字段（重排是否生效、原因、阈值与实测最高分）
+    rerank_applied: bool = False
+    rerank_skipped_reason: str | None = None
+    rerank_threshold: float | None = None
+    best_rerank_score: float | None = None
+    rerank_pruned: int = 0
     duration_ms: int
     warnings: tuple[str, ...] = ()
 

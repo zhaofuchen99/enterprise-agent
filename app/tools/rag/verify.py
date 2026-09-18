@@ -38,7 +38,7 @@ from app.domain.knowledge import DocumentStatus, KnowledgeDocumentRecord
 from app.domain.user import PermissionScope, UserRole
 from app.tools.rag.golden import AbsentCase
 from app.tools.rag.retriever import Retriever
-from app.tools.rag.schemas import RagQueryArgs
+from app.tools.rag.schemas import RagQueryArgs, RetrievalOutcome
 
 MANIFEST_PATH = Path("configs/corpus_manifest.yaml")
 HANDWRITTEN_DIR = Path("configs/corpus_handwritten")
@@ -488,6 +488,20 @@ async def check_version_pair(
     )
 
 
+def _judged_by(outcome: RetrievalOutcome) -> str:
+    """拒答判据的可读描述。
+
+    **两条路径报的不是同一个量**：重排生效时给的是重排分（它是这次真正的判据），
+    没生效时才是稠密余弦。混着报的话，"为什么没拒答"会指向一个这次根本没
+    参与判定的数。
+    """
+    if outcome.rerank_applied:
+        if outcome.best_rerank_score is None:
+            return "无候选可排"
+        return f"重排分最高 {outcome.best_rerank_score:.4f}（阈值 {outcome.rerank_threshold}）"
+    return f"最高余弦 {outcome.best_dense_score:.4f}"
+
+
 async def check_absent(
     cases: Sequence[AbsentCase],
     corpus_text: str,
@@ -513,7 +527,7 @@ async def check_absent(
             RagQueryArgs(question=case.question), scope=PermissionScope(role=UserRole.ADMIN)
         )
         if not outcome.no_relevant_knowledge:
-            problems.append(f"{case.id}：检索没有拒答（最高余弦 {outcome.best_dense_score:.4f}）")
+            problems.append(f"{case.id}：检索没有拒答（{_judged_by(outcome)}）")
     return CheckResult(
         name="无答案提问",
         expected=f"{len(cases)} 处",

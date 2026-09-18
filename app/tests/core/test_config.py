@@ -85,9 +85,36 @@ def test_search_enabled_requires_provider(monkeypatch: pytest.MonkeyPatch) -> No
         _load(monkeypatch, SEARCH_ENABLED="true")
 
 
-def test_reranker_enabled_requires_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reranker_enabled_requires_the_whole_model_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开了重排就必须给齐三项，**缺一项都是启动失败**。
+
+    只校验模型名是不够的：少了 `RERANKER_BASE_URL` 会打到聊天服务商上（404）、
+    少了密钥会 401，而两种失败的处置都是"降级回 RRF 序"——
+    于是**重排永远不生效却没有任何报错**，那正是这里要挡住的那种故障。
+    """
     with pytest.raises(ValidationError, match="RERANKER_MODEL"):
         _load(monkeypatch, RERANKER_ENABLED="true")
+
+    with pytest.raises(ValidationError, match="RERANKER_BASE_URL"):
+        _load(monkeypatch, RERANKER_ENABLED="true", RERANKER_MODEL="rerank-m")
+
+    with pytest.raises(ValidationError, match="RERANKER_API_KEY"):
+        _load(
+            monkeypatch,
+            RERANKER_ENABLED="true",
+            RERANKER_MODEL="rerank-m",
+            RERANKER_BASE_URL="https://rerank.example/v1",
+        )
+
+
+def test_reranker_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认关闭：检索走 RRF 序（11.7 第 ⑤ 步的直接结果），不依赖任何外部服务。
+
+    这条也是"重排失败时的降级路径与它同一条"的前提——两条路径必须是同一段代码。
+    """
+    assert _load(monkeypatch).reranker_enabled is False
 
 
 def test_model_timeout_follows_design_doc(monkeypatch: pytest.MonkeyPatch) -> None:

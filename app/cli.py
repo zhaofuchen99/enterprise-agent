@@ -782,6 +782,9 @@ def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolR
         f"｜候选 {payload.get('candidate_count')} 条"
         f"｜耗时 {result.duration_ms}ms"
     )
+    # 重排那一行**只在它生效时打**，但要打清楚：没生效时"召回变差了"的
+    # 第一嫌疑就是它（开没开、还是打了服务但失败了），而结果里本来看不出来
+    print(f"重排：{_rerank_line(payload)}")
     print()
 
     if result.status == "FAILED":
@@ -801,7 +804,10 @@ def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolR
         print(
             f"[{chunk['rank']}] {chunk['chunk_id']}"
             f"｜融合 {chunk['fusion_score']:.4f}"
-            f"｜余弦 {'—' if dense is None else f'{dense:.4f}'}"
+            f"｜余弦 {_score_text(dense)}"
+            # 重排分**逐条打出来**：它是"为什么这条排在前面"的直接答案，
+            # 而候选顺序变了却看不出原因时，第一件要查的就是它
+            f"｜重排 {_score_text(chunk.get('rerank_score'))}"
         )
         meta = chunk.get("metadata") or {}
         path = " > ".join(meta.get("section_path") or [])
@@ -818,6 +824,31 @@ def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolR
 
 def _evidence_sources(result: ToolResult) -> str:
     return "、".join(sorted({item.source_type for item in result.evidence})) or "—"
+
+
+def _score_text(value: float | None) -> str:
+    """分数列的可空打印。**空值与 0 必须长得不一样**：0 表示"模型判它不相关"，
+    空表示"这次没有这个分数"（重排没开或失败）——那是两件事。"""
+    return "—" if value is None else f"{value:.4f}"
+
+
+def _rerank_line(payload: dict[str, Any]) -> str:
+    """重排那一行的文案。**"没开"与"打了但失败了"要一眼分得开**：
+
+    - 没开：证据按 RRF 顺序取，这是一条**正确**的路径（11.7 第 ⑤ 步的直接结果）；
+    - 开了但失败：说明服务或配置出了问题，而候选顺序已经悄悄退回去了。
+
+    两者在结果里都表现为"没有重排分"，只看分数分不出来——所以原因串要打出来。
+    """
+    if payload.get("rerank_applied"):
+        best = payload.get("best_rerank_score")
+        return (
+            f"已生效｜最高分 {'—' if best is None else f'{best:.4f}'}"
+            f"｜阈值 {payload.get('rerank_threshold')}"
+            f"｜剔除 {payload.get('rerank_pruned')} 条"
+        )
+    reason = payload.get("rerank_skipped_reason") or "—"
+    return f"未生效（{reason}）｜证据按 RRF 顺序取"
 
 
 def _parse_date_arg(value: str) -> date | None:

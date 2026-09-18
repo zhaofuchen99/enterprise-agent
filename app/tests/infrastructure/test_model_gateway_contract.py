@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx
@@ -266,6 +266,167 @@ async def test_embed_empty_input_makes_no_call(gateway: ModelGateway) -> None:
 async def test_aclose_is_idempotent(gateway: ModelGateway) -> None:
     await gateway.aclose()
     await gateway.aclose()
+
+
+# --------------------------------------------------------------------- 重排
+#
+# 重排的**服务形状与 chat / embeddings 不是同一套**：cross-encoder 没有
+# OpenAI 兼容端点，业界事实标准是 Cohere 那套 `POST /rerank`
+# （`{model, query, documents[], top_n}` → `results[].index / relevance_score`）。
+# 因此这一段的断言逐条对着那个形状写，而不是套用上面的 chat 用例。
+#
+# **两个实现都跑**：替身脚本与 MockTransport 的返回由同一份 `_RERANK_SCORES`
+# 驱动，于是"替身与真实实现不一致"不会拖到线上才暴露。
+
+#: 服务端"真相"：三条候选的分数。
+_RERANK_SCORES = [0.9, 0.1, 0.5]
+
+#: 打开重排所需的配置。**三项都必填**（`Settings` 的交叉校验要求），
+#: 少一项的报错由 `app/tests/core/test_config.py` 覆盖。
+_RERANK_ON: dict[str, Any] = {
+    "reranker_enabled": True,
+    "reranker_model": "contract-reranker",
+    "reranker_base_url": "https://rerank.invalid/v1",
+    "reranker_api_key": "test-key",
+}
+
+
+def _rerank_handler(
+    scores: list[float], *, order: Sequence[int] | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    """按 Cohere 形状返回结果。`order` 用来模拟"服务端按分数降序返回"。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        count = len(json.loads(request.content)["documents"])
+        indices = list(order) if order is not None else list(range(count))
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"index": index, "relevance_score": scores[index]} for index in indices]
+            },
+        )
+
+    return handler
+
+
+async def test_rerank_returns_scores_aligned_to_the_input(
+    make_gateway: Callable[..., ModelGateway], handler_box: dict[str, Any]
+) -> None:
+    """返回与输入**同序同长**的分数。
+
+    网关不排序也不剔除：那是 `tools/rag/reranker.py` 的策略（阈值、Top-K、
+    并列怎么破恰恰是评测要调的东西）。网关给排好序的结果，等于把策略的一半
+    塞进基础设施层。
+    """
+    gateway = make_gateway("http", **_RERANK_ON)
+    _set_handler(handler_box, _rerank_handler(_RERANK_SCORES))
+
+    scores = await gateway.rerank("华东渠道折扣上限", ["甲", "乙", "丙"])
+
+    assert scores == _RERANK_SCORES
+
+    fake = FakeModelGateway(rerank_scores=[_RERANK_SCORES])
+    assert await fake.rerank("华东渠道折扣上限", ["甲", "乙", "丙"]) == _RERANK_SCORES
+
+
+async def test_rerank_follows_returned_index_order(
+    make_gateway: Callable[..., ModelGateway], handler_box: dict[str, Any]
+) -> None:
+    """`results` 按分数降序返回（`index` 是乱序的），必须**按 `index` 归位**。
+
+    直接按返回顺序取用会让「第 1 条候选」拿到「最相关那条」的分数——
+    分数全对、配对全错，而且不报任何错。
+    """
+    gateway = make_gateway("http", **_RERANK_ON)
+    _set_handler(handler_box, _rerank_handler(_RERANK_SCORES, order=[1, 2, 0]))
+
+    assert await gateway.rerank("q", ["甲", "乙", "丙"]) == _RERANK_SCORES
+
+
+async def test_rerank_posts_the_documented_request(
+    make_gateway: Callable[..., ModelGateway], handler_box: dict[str, Any]
+) -> None:
+    """请求体：`{model, query, documents, top_n}`，路径 `/rerank`，带 Bearer 头。
+
+    **`top_n` 必须等于候选数**：不传时部分服务端只回前若干条，而"没回来的"
+    与"没算过的"在 `results` 里长得一样。
+
+    路径断言写全 `/v1/rerank`：`base_url` 里带着 `/v1`（硅基流动等厂商都是
+    这个形状），`rerank` 才是这里拼上去的那一段。
+    """
+    sent: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        sent["path"] = request.url.path
+        sent["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.5}]})
+
+    gateway = make_gateway("http", **_RERANK_ON)
+    _set_handler(handler_box, handler)
+    await gateway.rerank("华东渠道折扣上限", ["甲"])
+
+    assert sent["path"] == "/v1/rerank"
+    assert sent["model"] == "contract-reranker"
+    assert sent["query"] == "华东渠道折扣上限"
+    assert sent["documents"] == ["甲"]
+    assert sent["top_n"] == 1
+    assert sent["authorization"] == "Bearer test-key"
+
+
+async def test_rerank_missing_scores_is_loud(
+    make_gateway: Callable[..., ModelGateway], handler_box: dict[str, Any]
+) -> None:
+    """少一条就报错，**绝不补 0**。
+
+    补 0 等于断言"这条与问题无关"——那是个我们并不知道的结论（它压根没被评分）。
+    报错之后调用方会整次降级回 RRF 序，那是个正确的结果。
+    """
+    gateway = make_gateway("http", **_RERANK_ON)
+    _set_handler(
+        handler_box,
+        lambda request: httpx.Response(
+            200, json={"results": [{"index": 0, "relevance_score": 0.9}]}
+        ),
+    )
+
+    with pytest.raises(AgentError) as failure:
+        await gateway.rerank("q", ["甲", "乙"])
+
+    assert failure.value.code is ErrorCode.UPSTREAM_UNAVAILABLE
+    assert "不足" in failure.value.message
+
+
+async def test_rerank_server_error_is_upstream_unavailable(
+    make_gateway: Callable[..., ModelGateway], handler_box: dict[str, Any]
+) -> None:
+    """5xx 与 429 都归 `UPSTREAM_UNAVAILABLE`，且**不带响应体**。
+
+    不带体是脱敏纪律：服务端报错时经常把请求回显在 body 里，而请求头上有
+    `Authorization`。
+    """
+    gateway = make_gateway("http", **_RERANK_ON)
+    _set_handler(handler_box, lambda request: httpx.Response(503, json={"echo": "secret-key"}))
+
+    with pytest.raises(AgentError) as failure:
+        await gateway.rerank("q", ["甲"])
+
+    assert failure.value.code is ErrorCode.UPSTREAM_UNAVAILABLE
+    assert "secret-key" not in str(failure.value.details)
+
+
+async def test_rerank_without_configuration_is_loud(gateway: ModelGateway) -> None:
+    """`RERANKER_ENABLED=false` 时调用重排直接报错，**不静默返回假分数**。
+
+    静默返回一个"全都相关"的分数，会让一次错误的排序看起来像是重排器的判断结果。
+    """
+    with pytest.raises(AgentError, match="未配置"):
+        await gateway.rerank("q", ["甲"])
+
+
+async def test_rerank_empty_input_makes_no_call(gateway: ModelGateway) -> None:
+    """空输入不打服务（与 `embed` 同）：没有候选就没有可排的东西。"""
+    assert await gateway.rerank("q", []) == []
 
 
 # ================================================================ 越界防护
