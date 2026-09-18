@@ -36,7 +36,7 @@ import redis.asyncio as aioredis
 
 from app.core.config import Settings
 from app.core.errors import DEFAULT_RETRYABLE, ErrorCode
-from app.domain.task import Task, TaskStatus
+from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.logging import bind_context
 from app.infrastructure.observability import capture_trace_context, span
 from app.infrastructure.queue import JobQueue
@@ -46,11 +46,15 @@ from app.services.event_bus import EventBus, TaskEventType
 
 logger = logging.getLogger(__name__)
 
-#: 任务体的签名：给定任务，返回最终答案（Markdown）或 None。
+#: 任务体的签名：给定任务，返回 `TaskOutcome`（答案 + 计划摘要 + 结构化结果）。
 #:
 #: **只传 `Task` 而不是整个上下文**：任务体需要的用户权限范围由它自己去装载，
 #: 而"装载权限"这一步必须紧贴着执行发生（见 `_run_body` 的说明）。
-TaskBody = Callable[["Task"], Awaitable[str | None]]
+#:
+#: 返回 `TaskOutcome` 而不是 `str | None`：**答案之外还要落计划与结构化结果**
+#: （16.5 的 `plan_json` / `result_json`）。这三个是同一件事的三个侧面，
+#: 分两次调用让任务体写两遍只会让它们有机会不一致。
+TaskBody = Callable[["Task"], Awaitable["TaskOutcome"]]
 
 #: 单次扫描最多处理多少个任务。设上限是为了让扫描本身有界——
 #: 一次性处理积压的十万条任务会把 Worker 卡死，而扫描是定时跑的，
@@ -240,7 +244,7 @@ class TaskRunner:
         try:
             async with self.heartbeat_while(task.id):
                 with span("worker.task_body", task_id=task.id, worker_id=worker_id):
-                    answer = await self._run_body(task)
+                    outcome = await self._run_body(task)
         except asyncio.CancelledError:
             # 停机中断：不要把 CancelledError 吞成任务失败，交给 arq 处理重投。
             # 任务停在 RUNNING，由孤儿回收接手——这正是回收存在的意义。
@@ -258,9 +262,9 @@ class TaskRunner:
             # 任务体跑完才发现取消（底层调用不可中断，17.5 第 5 条）
             return await self._finish_cancelled(task, worker_id=worker_id)
 
-        return await self._finish_succeeded(task, answer=answer)
+        return await self._finish_succeeded(task, outcome=outcome)
 
-    async def _run_body(self, task: Task) -> str | None:
+    async def _run_body(self, task: Task) -> TaskOutcome:
         """任务体。**装配点没给 `body` 时是空实现**——任务以 `SUCCEEDED` 且
         `final_answer_md` 为 None 结束。Phase 1.5 起一直如此，
         而这条路径仍然被 `test_worker_stack.py` 的用例覆盖着。
@@ -272,17 +276,23 @@ class TaskRunner:
         """
         if self._body is None:
             logger.info("任务体为空实现，直接完成", extra={"task_id": task.id})
-            return None
+            return TaskOutcome()
         return await self._body(task)
 
     # ------------------------------------------------------------------ 收尾
-    async def _finish_succeeded(self, task: Task, *, answer: str | None) -> Task | None:
+    async def _finish_succeeded(self, task: Task, *, outcome: TaskOutcome) -> Task | None:
         updated = await self._transition(
             task,
             TaskPatch(
                 status=TaskStatus.SUCCEEDED,
                 finished_at=self._clock(),
-                final_answer_md=answer,
+                # **三个字段一起落**（16.5 的 final_answer_md / plan_json /
+                # result_json）：它们是同一次执行的三个侧面，
+                # 分两处写就会出现"答案更新了、结构化结果还是上一次的"。
+                final_answer_md=outcome.answer,
+                intent=outcome.intent,
+                plan_json=outcome.plan,
+                result_json=outcome.payload,
             ),
             expected=TaskStatus.RUNNING,
         )
@@ -290,7 +300,13 @@ class TaskRunner:
             await self._emit_final(
                 updated,
                 TaskEventType.TASK_COMPLETED,
-                {"answer_available": answer is not None, "evidence_count": 0},
+                {
+                    "answer_available": outcome.answer is not None,
+                    # **证据条数进事件**：SSE 的订阅方靠它决定
+                    # "要不要拉详情看证据"，所以它得是真的。
+                    # Phase 1.5 写死 0 是因为那时还没有证据。
+                    "evidence_count": len((outcome.payload or {}).get("evidence") or []),
+                },
             )
         return updated
 

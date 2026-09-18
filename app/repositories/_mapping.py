@@ -89,6 +89,8 @@ _TASK_FIELDS: tuple[str, ...] = (
     "intent",
     "worker_id",
     "heartbeat_at",
+    "plan_json",
+    "result_json",
     "final_answer_md",
     "error_code",
     "error_message",

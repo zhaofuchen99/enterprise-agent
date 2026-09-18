@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.agent.graph import TaskGraph, build_graph
 from app.agent.runner import build_task_body
 from app.core.config import Settings, get_settings
-from app.domain.task import Task
+from app.domain.task import Task, TaskOutcome
 from app.infrastructure.cache import VersionedCache
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import (
@@ -141,7 +141,7 @@ def _build_runner(
 
 async def _build_task_graph(
     settings: Settings, redis: aioredis.Redis, gateway: ModelGateway, engine: AsyncEngine
-) -> tuple[TaskGraph, Callable[[Task], Awaitable[str | None]]]:
+) -> tuple[TaskGraph, Callable[[Task], Awaitable[TaskOutcome]]]:
     """装配最小 Graph 与它的任务体。
 
     **只在 Worker 进程里装配**：`app/main.py`（API 进程）不得 import

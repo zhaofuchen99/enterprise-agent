@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 
 from app.agent.graph import TaskGraph
 from app.core.errors import AgentError, ErrorCode
-from app.domain.task import Task
+from app.domain.task import Task, TaskOutcome
 from app.repositories.user_repo import UserRepository
 
 logger = logging.getLogger(__name__)
@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 
 def build_task_body(
     graph: TaskGraph, users: UserRepository
-) -> Callable[[Task], Awaitable[str | None]]:
+) -> Callable[[Task], Awaitable[TaskOutcome]]:
     """构造 `TaskRunner` 要的任务体。"""
 
-    async def run_task(task: Task) -> str | None:
+    async def run_task(task: Task) -> TaskOutcome:
         user = await users.get_by_id(task.user_id)
         if user is None:
             # **显式失败，不兜底成"不限"**，见模块 docstring

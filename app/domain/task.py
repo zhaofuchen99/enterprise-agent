@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -61,6 +62,12 @@ class Task(BaseModel):
     intent: str | None = None
     worker_id: str | None = None
     heartbeat_at: datetime | None = None
+    #: 已校验的计划摘要（16.5）。**审阅一份答案时第一个要看的东西**：
+    #: "它查了哪几步、每步成没成"比答案本身更能说明结论有多硬。
+    plan_json: dict[str, Any] | None = None
+    #: 结构化结果（16.5）。审查结论、证据、冲突、限制都在这里——
+    #: 它们是**可追溯性的载体**，只留在进程内等于没记。
+    result_json: dict[str, Any] | None = None
     final_answer_md: str | None = None
     error_code: ErrorCode | None = None
     error_message: str | None = None
@@ -74,3 +81,26 @@ class Task(BaseModel):
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+
+class TaskOutcome(BaseModel):
+    """任务体的产出（16.5 的 `plan_json` / `result_json` + 答案）。
+
+    **放在 `domain/` 而不是 `services/` 或 `agent/`**：两边都要用它——
+    `agent.runner` 产出它、`services.task_runner` 收下并落库——
+    而依赖方向是单向的（`services → agent`），放进任一侧都会让另一侧反向依赖。
+
+    三个字段分开而不是塞进一个 `payload`：`answer` 要落 `final_answer_md`
+    （MEDIUMTEXT，给人读），`plan` 与 `payload` 落两个 JSON 列（给程序读）。
+    合成一个的话，"这条任务的答案"与"这条任务的结构化结果"就开始互相污染。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    answer: str | None = None
+    #: Supervisor 判出的意图（8.1 的 `IntentResult.intent`）。
+    #: 落 `agent_task.intent`——16.5 有这个列，而它回答的是
+    #: "这条任务是当查询问的、还是当制度问的"，排查误答时第一个要看的东西。
+    intent: str | None = None
+    plan: dict[str, Any] | None = None
+    payload: dict[str, Any] | None = None

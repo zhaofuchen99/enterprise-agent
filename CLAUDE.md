@@ -279,6 +279,14 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     `api_key` / `bearer …`），**不认中文关键词**：语料里出现「密码」是正常的
     （制度会讲口令管理），按中文判会大面积误报，而误报会让这条检查被关掉。
 
+45. **计划与结构化结果落 `agent_task` 的两列 JSON**（16.5 的 `plan_json` /
+    `result_json`），入口是 `TaskOutcome`——**它放在 `domain/` 而不是
+    `services/` 或 `agent/`**：两边都要用（agent 产出、services 落库），
+    而依赖方向是单向的（`services → agent`），放任一侧都会让另一侧反向依赖。
+46. **`intent` 也要落**（`agent_task.intent`）：它回答"这条任务是当查询问的
+    还是当制度问的"，排查误答时第一个要看的字段。之前一直是空的——
+    supervisor 判出来放进 State，而没有人把它写进那一列。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -295,7 +303,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | `WAITING_CLARIFICATION` 的**状态位**：澄清现在在答案文本里表达，任务终态仍是 SUCCEEDED。真正停在澄清态要 API/SSE 侧的配套 | Phase 6 收尾 |
 | 图上的 `plan_extend` 与**模型的 EXPAND 判定**：现在由 `reflect` 确定性演进，`plan_deltas` 因此恒空、`investigation_chain.triggered_step_id` 恒为 None | Phase 7 |
 | LangGraph **checkpointer**（断点续跑）：与"整任务重跑"是两种重试语义，并存会出"重投了一个跑了一半的任务" | 需要时 |
-| 任务详情的步骤进度、证据、冲突、限制（等各自 Schema 产出后增补） | Phase 6 / 9 |
+| ~~任务详情的步骤进度、证据、冲突、限制~~ **已完成**：`agent_task.plan_json` / `result_json` 两列（Phase 2 就建好了，一直没人写）+ 17.2 的返回字段 | ✅ Phase 6 收尾 |
 | ~~对象存储 `s3` 实现~~ **已完成**（`make ingest` 起会真的用到它归档原文与报告） | ✅ Phase 5 |
 | **11.7 第 ⑧ 步「邻近块扩展」**：原文条件是「同文档、同章节且**确有上下文缺口**时」，而缺口判定依赖重排器的相关性信号。没有它只能退化成「块短就扩」，在本语料上几乎恒真（正文块中位 85 字），等于无条件把候选翻倍。**随重排器一起后置**——这是时序调整，不是砍需求 | 与 Reranker 同批 |
 | 文档侧的 `metric_code` / `definition_version` / `scope` 暂时留空（分块不带指标 code，按 `logical_key` 反推是把自由文本约定当语义用）。**13.4 的 DEFINITION / SCOPE 冲突因此暂时只覆盖 SQL 侧**，要等文档与指标目录挂钩 | Phase 9 |
@@ -304,7 +312,6 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **冲突检测的另外四类**（DEFINITION / TIME / SCOPE / SOURCE）：前提分别是文档侧 `metric_code`+`scope`、文档统计期间、方向判定，见 `nodes/conflict.py` 的清单 | Phase 9 |
 | **表格合计行与分项行的区分**：现在两者都会被当成"该指标在该范围的值"去比，实测产生过误报 | Phase 9 |
 | `agent_conflict` 表落库（现在冲突只在 State 与 `answer_payload` 里） | Phase 9 |
-| **`answer_payload` 整个没有落库**：`final` 把它写进 State，而 `agent_task` 没有对应列、API 也不返回——**审查结论、证据、冲突、限制因此都只在进程内可见**。17.2 的任务详情要能展示它们，需要一列 JSON 或一张表 | Phase 6/9 收尾 |
 | **Reviewer 第二阶段（模型审查）**：是否回答问题、证据是否足够、推断是否越界（14.1 后半），以及 14.4 的 `retry_router` 与四类预算 | Phase 8 完整版 |
 | `reindex` 接口：**原文件已归档、collection 已是可重建的派生数据，只差一条命令**。注意重建前要比对行的 `checksum` 与归档原文（`FORCE=1` 失败重建时两者会分叉，见详设 11.9 的落地记录） | Phase 5 收尾 |
 | 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |

@@ -21,7 +21,7 @@ import pytest
 
 from app.core.config import Settings
 from app.core.errors import ErrorCode
-from app.domain.task import Task, TaskStatus
+from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.redis import RedisKey
 from app.repositories.task_repo import InMemoryTaskRepository, TaskPatch, TaskRepository
 from app.services.event_bus import RedisStreamEventBus, TaskEventType
@@ -80,7 +80,7 @@ class _Clock:
 class ExplodingRunner(TaskRunner):
     """任务体抛异常，用来验证失败路径。"""
 
-    async def _run_body(self, task: Task) -> str | None:
+    async def _run_body(self, task: Task) -> TaskOutcome:
         raise RuntimeError("模型超时了")
 
 
@@ -88,8 +88,8 @@ class AnsweringRunner(TaskRunner):
     """任务体正常返回答案。默认实现返回 None，这里给一个非空值，
     以便区分「跑完了但没答案」与「跑完并拿到了答案」。"""
 
-    async def _run_body(self, task: Task) -> str | None:
-        return "# 分析结果"
+    async def _run_body(self, task: Task) -> TaskOutcome:
+        return TaskOutcome(answer="# 分析结果")
 
 
 @pytest.fixture
@@ -294,9 +294,9 @@ async def test_execute_cancelled_mid_flight_is_recorded_as_cancelled(
     """17.5 第 5 条：底层调用不可中断时，等它返回后再转 CANCELLED。"""
 
     class CancellingRunner(TaskRunner):
-        async def _run_body(self, task: Task) -> str | None:
+        async def _run_body(self, task: Task) -> TaskOutcome:
             await self.signal_cancel(task.id)
-            return "答案已经算出来了"
+            return TaskOutcome(answer="答案已经算出来了")
 
     runner, repo, _, events = build_runner(redis, clock, runner_cls=CancellingRunner)
     await repo.add(_task())
@@ -349,10 +349,10 @@ async def test_heartbeat_runs_while_the_body_is_working(
     observed: list[int] = []
 
     class SlowRunner(TaskRunner):
-        async def _run_body(self, task: Task) -> str | None:
+        async def _run_body(self, task: Task) -> TaskOutcome:
             await asyncio.sleep(1.3)
             observed.append(await self._redis.exists(RedisKey.task_heartbeat(task.id)))
-            return None
+            return TaskOutcome()
 
     runner, repo, _, _ = build_runner(
         redis,

@@ -108,9 +108,13 @@ class TaskCreatedData(BaseModel):
 class TaskDetailData(BaseModel):
     """任务详情（详细设计 17.2）。
 
-    Phase 1 只返回 `agent_task` 本身能提供的字段。需求里提到的
-    步骤进度、证据、冲突、限制要等对应阶段产出后才有内容，
-    届时按各自 Schema 增补，而不是现在先摆一堆永远为空的占位字段。
+    17.2 要求返回「任务状态、意图、步骤进度、答案、证据、冲突、限制及时间」。
+    前四样来自 `agent_task` 自己的列，后四样从 `plan_json` / `result_json`
+    两个 JSON 列里取（`TaskOutcome` 落进去的）。
+
+    **这几个字段是"可追溯"对外的唯一出口**：审查结论、证据、冲突、限制
+    如果只在进程内可见，那么"答案为什么成立"就无从查起——
+    而这正是本项目存在的理由。
     """
 
     task_id: str
@@ -130,9 +134,38 @@ class TaskDetailData(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # --- 来自 plan_json（16.5 的计划摘要）---
+    #: 步骤进度：每步的工具、目标、状态、是否"跑了但空"
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    #: `reflect` 的最终判定与理由（SUFFICIENT / EXPAND / BLOCKED…）。
+    #: 它比答案本身更能回答"这个结论有多硬"——尤其是 EXPAND 过的时候。
+    progress_decision: str | None = None
+    progress_reason: str | None = None
+    plan_revision: int = 0
+
+    # --- 来自 result_json（16.5 的结构化结果）---
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    #: 已检出的多源冲突描述（13.3）。**未判定哪一方为准**——
+    #: 判定属 Phase 9，这里的措辞不能让人以为已经判过了。
+    conflicts: list[str] = Field(default_factory=list)
+    #: 审查结论（14.2）。`None` 表示本任务没走到审查那一步
+    review: dict[str, Any] | None = None
+    #: 答案的限制：证据覆盖不到的部分、失败的数据源、未明确的前提
+    limitations: list[str] = Field(default_factory=list)
+
     @classmethod
     def from_domain(cls, task: Task) -> Self:
+        plan = task.plan_json or {}
+        payload = task.result_json or {}
         return cls(
+            steps=list(plan.get("steps") or []),
+            progress_decision=plan.get("decision"),
+            progress_reason=plan.get("reason"),
+            plan_revision=int(plan.get("revision") or 0),
+            evidence=list(payload.get("evidence") or []),
+            conflicts=list(payload.get("conflicts") or []),
+            review=payload.get("review"),
+            limitations=list(payload.get("limitations") or []),
             task_id=task.id,
             parent_task_id=task.parent_task_id,
             conversation_id=task.conversation_id,

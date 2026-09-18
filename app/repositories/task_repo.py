@@ -63,6 +63,10 @@ class TaskPatch(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     final_answer_md: str | None = None
+    #: 计划摘要与结构化结果（16.5）。**JSON 列不需要时区转换**，
+    #: 所以它们不在 `_PATCH_TIME_FIELDS` 里——那一份只管 datetime。
+    plan_json: dict[str, Any] | None = None
+    result_json: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
     intent: str | None = None

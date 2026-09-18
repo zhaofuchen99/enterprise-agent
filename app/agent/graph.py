@@ -52,7 +52,7 @@ from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
 from app.agent.state import AgentState, Route, pending_steps
 from app.core.config import Settings
-from app.domain.task import Task, TaskStatus
+from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.model_gateway import ModelGateway
 from app.infrastructure.observability import span
 
@@ -219,7 +219,7 @@ class TaskGraph:
         self._rag_tool = rag_tool
         self._gateway = gateway
 
-    async def run(self, task: Task, *, permission_scope: Any) -> str | None:
+    async def run(self, task: Task, *, permission_scope: Any) -> TaskOutcome:
         """跑一个任务，返回最终答案（Markdown）。
 
         `permission_scope` **由调用方传入**而不是在这里从 `task.user_id` 查：
@@ -247,7 +247,7 @@ class TaskGraph:
             "agent.graph",
             **{"task.id": task.id, "conversation.id": task.conversation_id or ""},
         ) as current:
-            final_state = await self._graph.ainvoke(
+            result: dict[str, Any] = await self._graph.ainvoke(
                 initial,
                 # 递归上限：图的正常路径最多 6 个节点 + 一次演进（2 步），
                 # 给 25 是留足余量又能在"回边失控"时立刻停住。
@@ -255,12 +255,21 @@ class TaskGraph:
                 # 而那时看到的是内存曲线而不是"图跑飞了"。
                 config={"recursion_limit": 25},
             )
-            current.set_attribute("agent.steps", len(final_state.get("step_results") or {}))
-            current.set_attribute("agent.evidence", len(final_state.get("evidence") or []))
-            assessment = final_state.get("progress_assessment")
+            current.set_attribute("agent.steps", len(result.get("step_results") or {}))
+            current.set_attribute("agent.evidence", len(result.get("evidence") or []))
+            assessment = result.get("progress_assessment")
             if assessment is not None:
                 current.set_attribute("agent.decision", assessment.decision)
-        return final_state.get("final_answer")
+        final_state: AgentState = result  # type: ignore[assignment]
+        return TaskOutcome(
+            answer=final_state.get("final_answer"),
+            intent=getattr(final_state.get("intent"), "intent", None),
+            # **计划摘要落库的形态**：步骤 + 修订号 + 最终判定。
+            # 不落整份 `task_list` 的 pydantic dump——那是实现细节，
+            # 而这三样才是"它是怎么查出来的"要回答的问题。
+            plan=_plan_digest(final_state),
+            payload=final_state.get("answer_payload"),
+        )
 
     async def aclose(self) -> None:
         """按依赖顺序关闭。**工具自己的 `aclose` 不关共享的网关与向量库**
@@ -268,6 +277,32 @@ class TaskGraph:
         await self._sql_tool.aclose()
         await self._rag_tool.aclose()
         await self._gateway.aclose()
+
+
+def _plan_digest(state: AgentState) -> dict[str, Any]:
+    """`task_list` + `step_results` + 判定 → 落 `plan_json` 的摘要（16.5）。
+
+    **每步的成败必须一起落**：只记"计划里有哪几步"的话，读的人看不出
+    "那一步其实没查到东西"——而结论的硬度正是由这个决定的。
+    """
+    results = state.get("step_results") or {}
+    assessment = state.get("progress_assessment")
+    return {
+        "revision": state.get("plan_revision", 0),
+        "steps": [
+            {
+                "id": step.id,
+                "tool": step.tool,
+                "objective": step.objective,
+                "status": results[step.id].status.value if step.id in results else "PENDING",
+                "empty": results[step.id].empty if step.id in results else False,
+                "summary": results[step.id].summary if step.id in results else "",
+            }
+            for step in state.get("task_list") or []
+        ],
+        "decision": assessment.decision if assessment is not None else None,
+        "reason": assessment.reason if assessment is not None else None,
+    }
 
 
 __all__ = ["TaskGraph", "build_graph", "route_dispatch"]
