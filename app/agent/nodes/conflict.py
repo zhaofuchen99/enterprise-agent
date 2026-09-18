@@ -21,7 +21,37 @@ SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
 **这份清单就是面试口径**：被问"冲突检测做了多少"时，答案是
 「一类（VALUE）做了，四类没做，各缺什么前提写在这里」，而不是"做了冲突检测"。
 
-## 为什么用指标目录做桥
+## 一个实测出来的关键约束：**两边的维度集合必须一致**
+
+第一版只把"表里的第一个维度列"当作范围，于是这样一张表会出事：
+
+    区域 | 渠道 | 产品线 | 净销售额（万元） | 退货金额（万元）
+    华东 | 电商 | 智能家居 | 764.63 | 13.57
+
+它**有三个维度列**，所以每一行是「华东/电商/智能家居」的**明细**，而不是
+华东的合计。检测器看到"区域=华东"与 SQL 的 scope 相同就比了，
+于是拿 764.63 万去对华东季度总额 1.12 亿，报出**相对差 93%** 的"冲突"——
+而两个数压根不是一回事。
+
+判据在**文档侧**：表格的维度列超过一个时，那一行是比"按一个维度汇总"更细的
+切片，而 SQL 那边的粒度**从证据上看不出来**——它是 `SELECT SUM(net_amount)
+WHERE region='华东'` 这种带 WHERE 的标量聚合时，结果集只有一个聚合列，
+`Evidence.scope` 是空的，粒度只存在于 SQL 文本里。所以：
+
+| 文档表格 | SQL 证据 | 比不比 |
+|---|---|---|
+| 单维度（区域），华东 | `scope` 含 region_name=华东 | ✅ 共有维度取值相同 |
+| 单维度（区域），华东 | `scope={}`（WHERE 里筛的华东） | ✅ 无法反驳，比 |
+| 单维度（区域），华南 | `scope` 含 region_name=华东 | ⛔ 取值不同 |
+| 三维度（区域/渠道/产品线） | 任意 | ⛔ 粒度更细，比了就是假冲突 |
+
+**用"文档侧只有一个维度列"而不是"两边维度集合相等"**：后者看着更严格，
+但它会把上面第二行那种**真冲突**也挡掉——而那条正是 `demo-cross` 的headline。
+这是实测出来的：先写成集合相等，跑一遍发现真冲突没了。
+
+这条比"识别合计行"更根本，而且不需要语料做任何改动——
+**表里没有合计标记时，"这一行跨了几个维度"就是可比的判据**。
+
 
 文档表头写的是 `净销售额（万元）`，SQL 证据带的是 `metric_code=net_sales`。
 两者能对上，靠的是 `schema_catalog.yaml` 里的**指标名与别名**。
@@ -117,7 +147,17 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
             for base in sql_points:
                 if claim.metric_code != base.metric_code:
                     continue
-                if claim.scope and base.scope and claim.scope != base.scope:
+                # 判据在文档侧，见模块 docstring 的那张表。
+                # **多维度列 = 明细行**，拿它去对任何汇总值都是假冲突。
+                if len(claim.scope) > 1:
+                    continue
+                # 共有维度上取值必须相同。SQL 的 `scope` 为空时不比这一项——
+                # 那说明它的粒度在 WHERE 里，从证据上看不出来。
+                if (
+                    claim.scope
+                    and base.scope
+                    and any(base.scope.get(key) != value for key, value in claim.scope.items())
+                ):
                     continue
                 difference = _difference(claim.value, base.value)
                 if difference is None:
@@ -130,12 +170,22 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
 
 
 class _Point:
-    """一个可比较的数值点（`(指标, 维度范围, 数值)`）。"""
+    """一个可比较的数值点（`(指标, 维度集合, 数值)`）。
+
+    `scope` 是**维度字典**而不是单个字符串：可比性取决于"两边的维度集合
+    是否相同"，而单个字符串表达不了"这一行同时被区域、渠道、产品线限定"。
+    把三个维度里最早出现的那个当成范围，正是那个 93% 假冲突的来源。
+    """
 
     __slots__ = ("evidence_id", "matched_by", "metric_code", "scope", "value")
 
     def __init__(
-        self, evidence_id: str, metric_code: str, scope: str | None, value: float, matched_by: str
+        self,
+        evidence_id: str,
+        metric_code: str,
+        scope: dict[str, str],
+        value: float,
+        matched_by: str,
     ) -> None:
         self.evidence_id = evidence_id
         self.metric_code = metric_code
@@ -168,8 +218,18 @@ def _sql_point(item: Evidence) -> _Point | None:
     value = _to_float(raw)
     if value is None:
         return None
-    scope = item.scope.get("region") if item.scope else None
-    return _Point(item.id, item.metric_code, str(scope) if scope else None, value, "exact")
+    return _Point(item.id, item.metric_code, _sql_dimensions(item), value, "exact")
+
+
+def _sql_dimensions(item: Evidence) -> dict[str, str]:
+    """SQL 证据的粒度：`scope` 里除 `data_scope` 之外的键值。
+
+    **`data_scope` 要排除**：它不是维度，而是"这次查询受过的限制"标注
+    （见 `tools/sql/evidence._scope_of`）。把它算进去会让每个受限用户的
+    证据都多出一个"维度"，于是与任何文档表格都对不上——全部跳过，
+    而那表现为"冲突检测突然不工作了"，不指向这里。
+    """
+    return {key: str(value) for key, value in item.scope.items() if key != "data_scope"}
 
 
 def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
@@ -184,7 +244,7 @@ def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
     if len(lines) < 2:  # 表头 + 至少一行数据
         return []
     header = [cell.strip() for cell in lines[0].split(_COLUMN_SEPARATOR)]
-    dimension_index = _dimension_index(header)
+    dimension_indexes = _dimension_indexes(header)
     columns = [_column_of(name, catalog=catalog) for name in header]
     if all(column is None for column in columns):
         return []
@@ -193,11 +253,10 @@ def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
     points: list[_Point] = []
     for line in lines[1:]:
         cells = [cell.strip() for cell in line.split(_COLUMN_SEPARATOR)]
-        scope = (
-            cells[dimension_index]
-            if dimension_index is not None and dimension_index < len(cells)
-            else None
-        )
+        # **整行的维度一起取**，不只是第一个：见模块 docstring
+        scope = {
+            key: cells[index] for index, key in dimension_indexes.items() if index < len(cells)
+        }
         for position, column in enumerate(columns):
             if column is None or position >= len(cells):
                 continue
@@ -269,11 +328,17 @@ _DIMENSION_COLUMNS: dict[str, str] = {
 }
 
 
-def _dimension_index(header: Sequence[str]) -> int | None:
-    for index, name in enumerate(header):
-        if name.strip() in _DIMENSION_COLUMNS:
-            return index
-    return None
+def _dimension_indexes(header: Sequence[str]) -> dict[int, str]:
+    """表头里的**全部**维度列：`{列下标: scope 键}`。
+
+    返回全部而不是第一个，理由见模块 docstring——第一版只取第一个，
+    于是「区域 | 渠道 | 产品线 | …」的明细行被当成了区域合计。
+    """
+    return {
+        index: _DIMENSION_COLUMNS[name.strip()]
+        for index, name in enumerate(header)
+        if name.strip() in _DIMENSION_COLUMNS
+    }
 
 
 def _to_float(text: str) -> float | None:
@@ -307,7 +372,9 @@ def _build_conflict(
     *,
     difference_ratio: float,
 ) -> Conflict:
-    scope = f"，范围 {claim.scope}" if claim.scope else ""
+    scope = (
+        ("，范围 " + "、".join(f"{k}={v}" for k, v in claim.scope.items())) if claim.scope else ""
+    )
     matched = (
         "表头与指标名精确相同"
         if claim.matched_by == "exact"

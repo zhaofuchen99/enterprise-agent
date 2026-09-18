@@ -148,6 +148,82 @@ def test_no_conflict_when_the_scope_differs() -> None:
     assert conflicts == ()
 
 
+def test_a_multi_dimension_table_is_not_compared_to_a_region_total() -> None:
+    """**三个维度列的表，每一行是明细，不是区域合计。**
+
+    实测踩到的假冲突：语料里这张表
+
+        区域 | 渠道 | 产品线 | 净销售额（万元） | 退货金额（万元）
+        华东 | 电商 | 智能家居 | 764.63 | 13.57
+
+    第一版只把"第一个维度列"（区域=华东）当成范围，看到与 SQL 的 scope 相同
+    就比了，于是拿 764.63 万去对华东季度总额 1.12 亿，报出**相对差 93%** 的
+    "冲突"——而两个数压根不是一回事。
+
+    判据是**维度集合相等**：SQL 证据的 `scope` 键就是它的粒度，
+    文档表格的维度列给出另一份。这条比"识别合计行"更根本，
+    而且不需要语料做任何改动。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    detail = _document_evidence(
+        """2025年第三季度经营分析 > 五、风险提示
+表：分区域分渠道分产品线净销售额明细
+区域 | 渠道 | 产品线 | 净销售额（万元） | 退货金额（万元）
+华东 | 电商 | 智能家居 | 764.63 | 13.57"""
+    )
+
+    # SQL 只按区域聚合 → 粒度 {region}；文档行是 {region, channel, product_line}
+    assert detect_value_conflicts([detail, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+
+
+def test_a_single_dimension_table_is_still_compared() -> None:
+    """对照：单维度列的表**仍然要比**——那条是真冲突（`demo-cross` 就是它）。
+
+    只加约束不加对照的话，一次"全都不比了"的改动也能让上一条通过。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    single = _document_evidence(_TABLE)  # 表头只有「区域」一个维度列
+
+    conflicts = detect_value_conflicts([single, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert len(conflicts) == 1
+
+
+def test_an_unscoped_sql_aggregate_still_compares() -> None:
+    """SQL 的 `scope` 为空**不代表它是全量**，这条要照比。
+
+    `SELECT SUM(net_amount) WHERE region='华东'` 这种带 WHERE 的标量聚合，
+    结果集只有一个聚合列，`_scope_of` 从列名里提取不到 `region`——
+    粒度只存在于 SQL 文本里。
+
+    这是实测踩到的：第一版把判据写成"两边维度集合相等"，跑一遍发现
+    `demo-cross` 的真冲突没了——因为它正是这条路径。**只看文档侧的维度列数
+    才既拦得住明细行的假冲突、又留得住这一条。**
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    unscoped = _sql_evidence(111_967_031.73).model_copy(update={"scope": {}})
+
+    conflicts = detect_value_conflicts([_document_evidence(_TABLE), unscoped], catalog=catalog)
+
+    assert len(conflicts) == 1
+
+
+def test_data_scope_is_not_a_dimension() -> None:
+    """受限用户的证据多一个 `data_scope` 标注，而**它不是维度**。
+
+    把它算进粒度的话，受限用户的证据与任何文档表格都对不上——
+    全部跳过，而那表现为"冲突检测对某些用户突然不工作了"，不指向这里。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    scoped = _sql_evidence(111_967_031.73).model_copy(
+        update={"scope": {"region": "华东", "data_scope": ["华东"]}}
+    )
+
+    conflicts = detect_value_conflicts([_document_evidence(_TABLE), scoped], catalog=catalog)
+
+    assert len(conflicts) == 1
+
+
 def test_no_conflict_when_the_metric_differs() -> None:
     """指标不同不报。`销售额` 那一列（含税口径）不该与净销售额比。"""
     catalog = _catalog(_metric("net_sales", "净销售额"))

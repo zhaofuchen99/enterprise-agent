@@ -191,6 +191,12 @@ def _payload(
     """
     return {
         "direct_answer": analysis.direct_answer if analysis else None,
+        # **`conflicts` 必须在这里**：它已经渲染进 Markdown（人读），
+        # 也落进了 `agent_conflict` 表（程序读），而 API 的任务详情读的
+        # **正是这个 payload**。漏了它，前端与 `make demo` 的判据都看到空列表——
+        # 而答案里明明写着「数据不一致」。
+        # 实测踩到：`make demo` 因此把一条**检出了冲突**的任务报成"没有检出冲突"。
+        "conflicts": list(analysis.conflicts) if analysis else [],
         "claims": [
             claim.model_dump(mode="json") for claim in (analysis.claims if analysis else ())
         ],
