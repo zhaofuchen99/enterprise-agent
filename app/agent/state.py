@@ -45,6 +45,7 @@ from app.agent.schemas.plan import Finding, IntentResult, ProgressAssessment, St
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
 from app.domain.task import TaskStatus, ToolCallRecord
+from app.domain.trace import NodeTrace
 
 #: 单值字段（后写覆盖）不需要 `Annotated`，直接写类型即可；
 #: 这里给它起个名字只是为了让下面的字段表读起来一致。
@@ -134,6 +135,11 @@ class AgentState(TypedDict, total=False):
     #: 【Phase 6 未接】演进预算与修订记录，属 plan_extend（后置）
     plan_revision: int
     plan_deltas: list[Scalar]
+
+    #: 每个节点的进入/离开事件（16.7 的 `agent_trace_event`）。
+    #: **图的节点是串行的，所以列表顺序就是执行顺序**——`sequence` 在落库时
+    #: 按这个顺序分配（见 `domain/trace.py`）。
+    trace_events: Annotated[list[NodeTrace], merge_by_id]
 
     #: 每一次工具**尝试**（SQL 的自修复会产生多条）。落 `agent_tool_call`。
     #: 与 `evidence` 同样用按 id 去重的追加 reducer——`id` 是每条独立的行键。

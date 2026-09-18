@@ -23,7 +23,7 @@ from app.core.config import Settings
 from app.core.errors import ErrorCode
 from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.redis import RedisKey
-from app.repositories.agent_repo import InMemoryAgentArtifactRepository
+from app.repositories.agent_repo import AgentArtifactRepository, InMemoryAgentArtifactRepository
 from app.repositories.task_repo import InMemoryTaskRepository, TaskPatch, TaskRepository
 from app.services.event_bus import RedisStreamEventBus, TaskEventType
 from app.services.task_runner import TaskRunner
@@ -111,6 +111,7 @@ def build_runner(
     *,
     queue: FakeJobQueue | None = None,
     runner_cls: type[TaskRunner] = TaskRunner,
+    artifacts: AgentArtifactRepository | None = None,
     **worker: object,
 ) -> tuple[TaskRunner, TaskRepository, FakeJobQueue, RedisStreamEventBus]:
     settings = _settings(**worker)
@@ -129,7 +130,8 @@ def build_runner(
         redis=redis,
         # 产出落库的替身：这几个用例验证的是**编排逻辑**，不是那五张表的写入
         # （仓储行为由 `app/tests/repositories/test_agent_repo.py` 覆盖）。
-        artifacts=InMemoryAgentArtifactRepository(),
+        # 需要模拟"写不进去"的用例自己传一个进来。
+        artifacts=artifacts or InMemoryAgentArtifactRepository(),
         clock=clock,
     )
     return runner, repo, job_queue, events
@@ -295,6 +297,70 @@ async def test_execute_marks_failed_when_the_body_raises(
     assert published[-1].data["code"] == ErrorCode.INTERNAL_ERROR.value
     # 失败也要释放并发配额，否则用户再也创建不了任务
     assert await repo.count_active("usr_1") == 0
+
+
+async def test_a_clean_run_leaves_a_complete_trace(
+    redis: fakeredis.aioredis.FakeRedis, clock: _Clock
+) -> None:
+    """正常跑完的任务 `trace_incomplete` 为假——**这个位要有区分力**。
+
+    处处为真等于没有：读 `/trace` 的人一旦发现它总在，就会忽略它。
+    """
+    runner, repo, _, _ = build_runner(redis, clock, runner_cls=AnsweringRunner)
+    await repo.add(_task())
+
+    finished = await runner.execute("tsk_0000000001AAAAAAAAAAAA", worker_id="w1")
+
+    assert finished is not None
+    assert finished.status is TaskStatus.SUCCEEDED
+    assert finished.trace_incomplete is False
+
+
+async def test_a_failed_artifacts_write_does_not_break_the_task(
+    redis: fakeredis.aioredis.FakeRedis, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-TRACE-001 的异常情况：**轨迹写入失败不得破坏主任务**。
+
+    两个判据缺一不可：任务照常 SUCCEEDED（答案对用户是有效的），
+    同时 `trace_incomplete` 置位（读 `/trace` 的人据此知道"看到的不是全部"）。
+    只吞异常不置位的话，一份缺了几段的轨迹看起来是完整的——
+    而缺的正好是最该看的那几段。
+    """
+    artifacts = InMemoryAgentArtifactRepository()
+
+    async def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("库连不上")
+
+    # 落库必失败。**不换仓储实现**：这里要验的是收尾路径对失败的反应，
+    # 而 `save` 的契约由 `app/tests/repositories/test_agent_repo.py` 覆盖。
+    monkeypatch.setattr(artifacts, "save", boom)
+    runner, repo, _, _ = build_runner(redis, clock, runner_cls=AnsweringRunner, artifacts=artifacts)
+    await repo.add(_task())
+
+    finished = await runner.execute("tsk_0000000001AAAAAAAAAAAA", worker_id="w1")
+
+    assert finished is not None
+    assert finished.status is TaskStatus.SUCCEEDED
+    assert finished.final_answer_md == "# 分析结果"
+    assert finished.trace_incomplete is True
+
+
+async def test_a_crashed_body_marks_the_trace_incomplete(
+    redis: fakeredis.aioredis.FakeRedis, clock: _Clock
+) -> None:
+    """图在跑到一半时中止 → 一条轨迹都没有，因此置位。
+
+    **置位比留空诚实**：读 `/trace` 的人会知道"看不到"是任务真的没留下，
+    而不是他查错了地方——那时任务已经跑过几步了，而轨迹上什么都没有。
+    """
+    runner, repo, _, _ = build_runner(redis, clock, runner_cls=ExplodingRunner)
+    await repo.add(_task())
+
+    finished = await runner.execute("tsk_0000000001AAAAAAAAAAAA", worker_id="w1")
+
+    assert finished is not None
+    assert finished.status is TaskStatus.FAILED
+    assert finished.trace_incomplete is True
 
 
 async def test_execute_cancelled_mid_flight_is_recorded_as_cancelled(

@@ -56,6 +56,10 @@ class IdPrefix(StrEnum):
     #: 而两个来源各生成一个 id 比"按 statement 文本去重"可靠——
     #: 后者在模型换一种措辞重述同一条时就不去重了。
     FINDING = "fnd"
+    #: 执行轨迹事件（Phase 11 的 `agent_trace_event`，16.7）。
+    #: `tre_` 与 `trc_`（业务 trace）是两个东西：前者是**一条事件**，
+    #: 后者是贯穿 API / 队列 / Worker 的追踪 ID，日志里不能混。
+    TRACE_EVENT = "tre"
     #: 多源冲突（Phase 6 的 `Conflict`，13.3）。与 `Finding` 同理：
     #: `agent_conflict` 表属 Phase 9，但 id 现在就要有——冲突是
     #: "答案为什么这么写"的追溯入口之一，`cft_` 与 `evd_` 在日志里要能一眼分开。

@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.errors import ErrorCode
 from app.core.ids import IdPrefix, new_id
 from app.domain.evidence import Conflict, Evidence
+from app.domain.trace import NodeTrace
 
 
 class TaskStatus(StrEnum):
@@ -129,6 +130,10 @@ class TaskOutcome(BaseModel):
     evidence: tuple[Evidence, ...] = ()
     conflicts: tuple[Conflict, ...] = ()
     review: ReviewRecord | None = None
+    #: 每个节点的进入/离开事件（16.7 的 `agent_trace_event`）。
+    #: **它是「可重放」的载体**：18.3 规定客户端断线重连补历史要回到这张表，
+    #: 因为 Redis Stream 会被 MAXLEN 裁掉。
+    trace_events: tuple[NodeTrace, ...] = ()
 
 
 class StepRecord(BaseModel):

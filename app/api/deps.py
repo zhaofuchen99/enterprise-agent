@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.core.config import Settings, get_settings
 from app.core.errors import AgentError, ErrorCode
 from app.domain.user import User
+from app.repositories.agent_repo import AgentArtifactRepository
 from app.services.auth_service import AuthService
 from app.services.rate_limit import RateLimiter
 from app.services.task_service import TaskService
@@ -58,6 +59,19 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 TaskServiceDep = Annotated[TaskService, Depends(get_task_service)]
 RateLimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
+
+
+def get_artifacts(request: Request) -> AgentArtifactRepository:
+    """执行产出仓储（16.6 / 16.7）。
+
+    17.4 的轨迹接口直接读表而不是读 `result_json`——**那张表是权威重放来源**
+    （18.3），而 `result_json` 只是给任务详情的一个快照。
+    """
+    artifacts: AgentArtifactRepository = request.app.state.artifacts
+    return artifacts
+
+
+ArtifactsDep = Annotated[AgentArtifactRepository, Depends(get_artifacts)]
 TraceIdDep = Annotated[str, Depends(get_trace_id)]
 
 

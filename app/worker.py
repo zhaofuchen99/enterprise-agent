@@ -55,7 +55,6 @@ from app.infrastructure.redis import RedisKey, create_client
 from app.infrastructure.storage import build_object_storage
 from app.infrastructure.vector_store import build_vector_store
 from app.repositories import build_sql_repositories
-from app.repositories.agent_repo import SqlAgentArtifactRepository
 from app.repositories.user_repo import SqlUserRepository
 from app.repositories.vocab_repo import SqlVocabRepository
 from app.services.event_bus import RedisStreamEventBus
@@ -126,8 +125,10 @@ def _build_runner(
     """装配 Worker 侧的任务仓储与任务体。
 
     与 `app/main.py` 走**同一份** SQL 装配（`build_sql_repositories`），
-    只取其中的任务仓储——不共用一个函数的话，API 与 Worker 的仓储实现
-    可能在某次改动中分家，而症状是「任务建得出来但 Worker 领不到」。
+    仓储全部从那里取——不共用一个函数的话，API 与 Worker 的仓储实现
+    可能在某次改动中分家：任务仓储分家的症状是「任务建得出来但 Worker 领不到」，
+    执行产出仓储分家的症状是「任务跑完了但 `/trace` 查出来是空的」。
+    后者更隐蔽，因为两条链路都"成功"了。
     """
     repos = build_sql_repositories(create_session_factory(engine))
     return TaskRunner(
@@ -136,7 +137,7 @@ def _build_runner(
         events=RedisStreamEventBus(redis, settings),
         settings=settings,
         redis=redis,
-        artifacts=SqlAgentArtifactRepository(create_session_factory(engine)),
+        artifacts=repos.artifacts,
         body=body,
     )
 

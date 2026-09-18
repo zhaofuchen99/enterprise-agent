@@ -49,9 +49,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.evidence import Conflict, Evidence
 from app.domain.task import ReviewRecord, StepRecord, ToolCallRecord
+from app.domain.trace import NodeTrace
 from app.infrastructure.db import session_scope
-from app.infrastructure.models.evidence import AgentConflict, AgentEvidence, AgentReview
+from app.infrastructure.models.evidence import (
+    AgentConflict,
+    AgentEvidence,
+    AgentReview,
+    AgentTraceEvent,
+)
 from app.infrastructure.models.task import AgentTaskStep, AgentToolCall
+from app.repositories._mapping import to_db_time
 
 
 class AgentArtifactRepository:
@@ -61,13 +68,25 @@ class AgentArtifactRepository:
         self,
         task_id: str,
         *,
+        trace_id: str = "",
         steps: Sequence[StepRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
         review: ReviewRecord | None = None,
+        trace_events: Sequence[NodeTrace] = (),
     ) -> None:
         """整体替换一个任务的执行产出。见模块 docstring 的说明。"""
+        raise NotImplementedError
+
+    async def list_trace_events(
+        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+    ) -> list[NodeTrace]:
+        """按 `sequence` 升序取轨迹（17.4 的 `after_sequence` / `limit`）。
+
+        **排序是语义的一部分**：`(task_id, sequence)` 的唯一索引就是顺序保证
+        （18.3），重放时按它排出来的就是真实执行顺序。
+        """
         raise NotImplementedError
 
     async def list_evidence(self, task_id: str) -> list[Evidence]:
@@ -85,11 +104,13 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
         self,
         task_id: str,
         *,
+        trace_id: str = "",
         steps: Sequence[StepRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
         review: ReviewRecord | None = None,
+        trace_events: Sequence[NodeTrace] = (),
     ) -> None:
         now = datetime.now(UTC).replace(tzinfo=None)
         async with session_scope(self._sessions) as session:
@@ -107,6 +128,13 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
                 session.add_all([_conflict_row(task_id, item, now) for item in conflicts])
             if review is not None:
                 session.add(_review_row(task_id, review, now))
+            if trace_events:
+                session.add_all(
+                    [
+                        _trace_row(task_id, trace_id, index, item)
+                        for index, item in enumerate(trace_events, start=1)
+                    ]
+                )
 
     async def list_evidence(self, task_id: str) -> list[Evidence]:
         async with session_scope(self._sessions) as session:
@@ -123,6 +151,22 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
             )
         return [_evidence_of(row) for row in rows]
 
+    async def list_trace_events(
+        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+    ) -> list[NodeTrace]:
+        """SQL 实现。**按 `sequence` 升序**——那是 18.3 的顺序保证本身。"""
+        statement = select(AgentTraceEvent).where(AgentTraceEvent.task_id == task_id)
+        if after_sequence is not None:
+            # **严格大于**：`after_sequence` 的语义是"我已经有的最后一条"，
+            # 用 `>=` 会让客户端每次重连都重复拿到同一条。
+            statement = statement.where(AgentTraceEvent.sequence > after_sequence)
+        statement = statement.order_by(AgentTraceEvent.sequence)
+        if limit is not None:
+            statement = statement.limit(limit)
+        async with session_scope(self._sessions) as session:
+            rows = (await session.execute(statement)).scalars().all()
+        return [_trace_of(row) for row in rows]
+
 
 class InMemoryAgentArtifactRepository(AgentArtifactRepository):
     """进程内实现，供不连 MySQL 的单元测试使用。
@@ -137,17 +181,24 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
         self.evidence: dict[str, list[Evidence]] = {}
         self.conflicts: dict[str, list[Conflict]] = {}
         self.reviews: dict[str, ReviewRecord] = {}
+        self._trace: dict[str, list[NodeTrace]] = {}
 
     async def save(
         self,
         task_id: str,
         *,
+        trace_id: str = "",
         steps: Sequence[StepRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
         review: ReviewRecord | None = None,
+        trace_events: Sequence[NodeTrace] = (),
     ) -> None:
+        self._trace[task_id] = [
+            item.model_copy(update={"sequence": index})
+            for index, item in enumerate(trace_events, start=1)
+        ]
         self.steps[task_id] = list(steps)
         self.tool_calls[task_id] = list(tool_calls)
         self.evidence[task_id] = list(evidence)
@@ -158,12 +209,29 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
     async def list_evidence(self, task_id: str) -> list[Evidence]:
         return list(self.evidence.get(task_id, ()))
 
+    async def list_trace_events(
+        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+    ) -> list[NodeTrace]:
+        rows = [
+            item
+            for item in sorted(self._trace.get(task_id, ()), key=lambda x: x.sequence)
+            if after_sequence is None or item.sequence > after_sequence
+        ]
+        return rows[:limit] if limit is not None else rows
+
 
 # ------------------------------------------------------------------ 行构造
 
 
 async def _clear(session: AsyncSession, task_id: str) -> None:
-    for model in (AgentTaskStep, AgentToolCall, AgentEvidence, AgentConflict, AgentReview):
+    for model in (
+        AgentTaskStep,
+        AgentToolCall,
+        AgentEvidence,
+        AgentConflict,
+        AgentReview,
+        AgentTraceEvent,
+    ):
         await session.execute(delete(model).where(model.task_id == task_id))
 
 
@@ -260,10 +328,64 @@ def _review_row(task_id: str, item: ReviewRecord, now: datetime) -> AgentReview:
     )
 
 
+def _trace_row(task_id: str, trace_id: str, sequence: int, item: NodeTrace) -> AgentTraceEvent:
+    """轨迹行。
+
+    **`sequence` 由调用方按列表顺序分配**，不读 `item.sequence`：
+    后者是给读回来用的，写入侧的顺序真相是列表顺序（图是串行的，
+    见 `domain/trace.py`）。
+
+    **`trace_id` 是参数而不是从 `NodeTrace` 上取**：它是任务级属性
+    （API / 队列 / Worker 全程沿用的那个 ID），而一条节点事件不该背一个
+    任务级的字段。表里这一列是 NOT NULL——SSE 侧要靠它把事件与链路对上。
+
+    **`created_at` 取事件自己的时刻，不取落库时刻**：与另外几张表相反。
+    轨迹要回答的是"哪一步慢、隔了多久"，八条事件都写成收尾那一刻之后，
+    时间轴上就只剩顺序、没有间隔了——而顺序本来已经由 `sequence` 表达。
+    """
+    return AgentTraceEvent(
+        id=item.id,
+        task_id=task_id,
+        trace_id=trace_id,
+        sequence=sequence,
+        node=item.node,
+        tool=None,
+        event_type=item.event_type,
+        status=item.status,
+        payload_json=None,
+        duration_ms=item.duration_ms,
+        error_code=item.error_code,
+        created_at=to_db_time(item.created_at),
+    )
+
+
+def _trace_of(row: AgentTraceEvent) -> NodeTrace:
+    """读回来。`tool` / `payload_json` 不进 `NodeTrace`——前者是工具事件的字段、
+    后者留给需要携带结构化负载的事件；节点级事件两者都不用。"""
+    return NodeTrace(
+        id=row.id,
+        sequence=row.sequence,
+        node=row.node,
+        event_type=row.event_type,
+        status=row.status,
+        duration_ms=row.duration_ms,
+        error_code=row.error_code,
+        created_at=row.created_at.replace(tzinfo=UTC),
+    )
+
+
 def _evidence_of(row: AgentEvidence) -> Evidence:
     """读回来。**与 `_evidence_row` 逐字段对称**——不对称的话，
     "落库的证据"与"答案里引用的证据"会给出两个不同的对象，
-    而它们本该是同一条。"""
+    而它们本该是同一条。
+
+    **`retrieved_at` 用 `created_at` 顶替，这是一处如实记下的偏离**：
+    13.1 的 `Evidence.retrieved_at` 是必填，而 16.7 给的列清单里**没有这一列**
+    （设计只列了 `created_at`）。两者相差的是"工具返回的时刻"与"任务收尾落库的
+    时刻"——对 `retrieved_at` 的用途（13.1 明写它与 `event_time` 必须分开，
+    回答的是"这份报告是 11 月 3 日读到的，而它统计的是 9 月 30 日截止的数据"）
+    而言，几十秒的差别不构成影响。真要精确就得给表加一列，已登记。
+    """
     payload: dict[str, object] = {
         "id": row.id,
         "source_type": row.source_type,
@@ -275,6 +397,8 @@ def _evidence_of(row: AgentEvidence) -> Evidence:
         "scope": dict(row.scope_json or {}),
         "reliability": row.reliability or "MEDIUM",
         "content_hash": row.content_hash or "0" * 64,
+        # 见 docstring：表里没有这一列，用 `created_at` 顶替
+        "retrieved_at": row.created_at.replace(tzinfo=UTC),
     }
     if row.event_time_start is not None and row.event_time_end is not None:
         payload["event_time"] = {

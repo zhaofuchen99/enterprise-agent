@@ -27,6 +27,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite | ✅ 完成（第一阶段） | **只做 14.1 的确定性检查**（六条：必需步骤是否跑过、claim 有无引用、引用是否存在、BLOCKING 冲突是否披露、敏感字段是否泄露、未解决问题是否列出）。**能 FAIL 任务**——14.3 的一票否决意味着"结论没有依据"时 `final` 输出"审查未通过"而不是把原答案放出去。`RETRY`/`CLARIFY` 不产出（要 retry_router 与状态位，属 Phase 8 完整版） |
+| 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -316,17 +317,53 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     `TaskStep` + `StepResult` 由 `services/` 合成 `StepRecord` 再传下来，
     `ReviewResult` 同理合成为 `ReviewRecord`。这个约束逼着仓储的入参只描述**行**。
 
+### 轨迹与埋点期间新立的临时约定（Phase 10/11 切片）
+
+52. **`sequence` 由写入侧按列表顺序分配，不读 `NodeTrace.sequence`**。
+    图的节点是串行的，所以 `trace_events` 的列表顺序**就是**执行顺序；
+    那个字段是给"读回来"用的。写入侧若改成读 `item.sequence`，
+    同一条轨迹会被两处赋值，而它们不一致时没有任何报错——
+    只有**重放时的顺序悄悄变了**（18.3 说这条唯一约束就是顺序保证本身）。
+53. **`trace_incomplete` 的判据是「本该留下轨迹的执行没留下」**：图跑到一半
+    中止、产出落库失败（五张表与轨迹在同一个事务里，因此"证据没落上"
+    与"轨迹没落上"必然同时发生，一个布尔量足够表达）。
+    **领取时就被取消的任务不置位**——它压根没执行，空轨迹是它的预期形态；
+    把它也标上会让这个位失去区分力，而读 `/trace` 的人一旦发现它总在就会忽略它。
+54. **节点埋点用包装器，不是每个节点里写一遍**（`graph._add_node` 里 `traced(name, node)`）。
+    八个节点各写一遍「记开始、记结束、算耗时」，漏掉一处不会有任何症状——
+    那个节点在轨迹里只是"不存在"，而轨迹本来就不完整，看不出少了什么。
+    ⚠️ **节点抛异常时这条埋点记不下来**：LangGraph 不写中止节点的更新，
+    因此进程内那份 `node.failed` 就丢了。这是本层的能力边界，
+    不假装它管用——异常路径的线索是 `error_code` 与 `trace_incomplete`。
+    节点**返回**错误（不抛异常，supervisor 走的就是这条）才是它管得住的路径。
+55. **`artifacts` 仓储进了 `Repositories` 单入口**。原先它在 `main.py` /
+    `worker.py` 各自 new 一个——17.4 的轨迹接口要读它之后，这个位置就不成立了：
+    单元测试不连 MySQL，从单入口注入不了就只能测 403/404，
+    "事件按序返回"这条主路径永远没有用例。**同时消掉一类静默故障**：
+    API 与 Worker 的产出仓储分家时，任务照跑照成功，只有 `/trace` 是空的。
+56. **集成用例的模型是替身，工具与数据库是真的**。`app/tests/conftest.py` 把
+    `MODEL_BASE_URL` 钉在不可解析的 `model.invalid`（刻意：测试不该打真实服务、
+    也不该花真钱），因此 `test_worker_stack` 里那条真 Worker 用例**只可能**
+    在模型调用上失败。它自 Phase 6（任务体换成图）起就一直是红的，
+    而 `make check` 不跑 integration——**没人发现**。现在改成
+    monkeypatch `app.worker.build_model_gateway`：脚本给「只查 SQL」的意图、
+    一条真实可跑的候选 SQL、一条分析结论，于是 SQL 走**真校验器、真只读执行、
+    真业务库**，轨迹真的落进 MySQL（用例断言了顺序、成对与证据）。
+    **新增这类用例时照这个办**：要替身的是"外部不可控且要花钱"的那一段。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
 |---|---|
 | ~~任务仓储换 MySQL~~ **已完成**（`RedisTaskRepository` 与 5 个索引键已删） | ✅ Phase 2 |
 | ~~`agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_conflict` / `agent_review` 的仓储实现~~ **已完成**（`repositories/agent_repo.py`，任务收尾时一次写齐五张表） | ✅ Phase 6 收尾 |
-| `agent_trace_event` 的仓储实现（表已建，仓储待写；它是事件流的**权威重放**来源，属 Phase 10） | Phase 10 |
+| ~~`agent_trace_event` 的仓储实现~~ **已完成**（`agent_repo.py`，随五张表一起写；17.4 的 `/trace` 读它） | ✅ Phase 11 切片 |
+| **工具级轨迹事件**（`tool.completed` 与 17.4 的 `include_tools`）：现在只记**节点**级事件，`agent_trace_event.tool` 恒为 NULL。工具事件要带脱敏后的参数摘要（19.4 的脱敏纪律），而 `ToolCallRecord` 里已经有这份形状，接上去是把两处对齐而不是新增采集 | Phase 10（与 SSE 同批） |
+| **异常路径的轨迹**：节点抛异常时那条事件留不下来（LangGraph 不写中止节点的更新）。要留就得在节点入口直接投递给事件总线，而不是等 State 合并——那正是 SSE 侧要做的事 | Phase 10 |
 | **跨重投的执行轨迹会丢**：五张表在重投时整体替换（见 `agent_repo.py` 的说明），上几次失败的过程没有留痕。要留就得加 `attempt_no` 或一张执行流水表 | 需要时 |
 | `schema_catalog` / `agent_config` 建表（切片内目录是 `configs/schema_catalog.yaml`，SQL Tool 已按它的形状写好 `SchemaCatalog`；接表只需换 `SchemaProvider` 的加载实现） | 后置 |
 | `make cleanup` 的保留期策略与实现（详细设计 16.12） | Phase 2 收尾 |
-| 事件流的 MySQL 权威重放（`agent_trace_event`）+ `sequence` 改由该表提供 | Phase 2 / 10 |
+| 事件流的 MySQL 权威重放：**节点轨迹已经落库并按序可查**（17.4 已交付），但 SSE / Redis Stream 那一路的 `sequence` 仍由 Stream ID 派生，两者尚未合并成一条 | Phase 10 |
 | `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
 | 用户消息落库（FR-CHAT-001 处理流程的「保存用户消息」，`agent_message` 表） | Phase 2 |
 | ~~任务体换成 LangGraph~~ **已完成**（`TaskRunner` 收 `body=` 注入） | ✅ Phase 6 |
@@ -363,7 +400,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | `agent_conflict` / `agent_review` 表与完整 5 类 Conflict 检测 | 切片内只做「报告数字 vs DB 数字」一类，且先不建表 |
 | `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
 | SSE 订阅端点与订阅令牌（Phase 1.5 已完成事件流，剩余是暴露端点） | |
-| `/trace` 接口与节点埋点（OTel 已接入，只差业务侧） | |
+| ~~`/trace` 接口与节点埋点~~ | **已完成（2026-09-18，提前）**：节点级埋点 + 17.4 的接口。**工具级事件与 `include_tools` 仍未做**，见上方【后续扩展】 |
 | 评测集扩到 115 条（先 40 题；**SQL 安全类 100% 阻断率的判定标准不缩**） | |
 | `schema_catalog` / `agent_config` 建表（切片内暂用 YAML / 配置） | |
 | 生产部署（Nginx / HTTPS / 备份 / 告警 / 回滚演练） | |

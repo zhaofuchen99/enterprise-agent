@@ -32,6 +32,7 @@ from app.infrastructure.model_gateway import (
 )
 from app.infrastructure.queue import JobQueue
 from app.repositories import Repositories
+from app.repositories.agent_repo import InMemoryAgentArtifactRepository
 from app.repositories.conversation_repo import InMemoryConversationRepository
 from app.repositories.knowledge_repo import InMemoryKnowledgeDocumentRepository
 from app.repositories.task_repo import InMemoryTaskRepository
@@ -321,4 +322,5 @@ def build_memory_repositories(settings: Settings) -> Repositories:
         tasks=InMemoryTaskRepository(),
         vocab=InMemoryVocabRepository(),
         documents=InMemoryKnowledgeDocumentRepository(),
+        artifacts=InMemoryAgentArtifactRepository(),
     )

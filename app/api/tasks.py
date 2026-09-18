@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query
 
 from app.api.deps import (
+    ArtifactsDep,
     CurrentUser,
     TaskServiceDep,
     TraceIdDep,
     require_task_status_rate_limit,
 )
-from app.api.schemas import ApiResponse, SuccessCode, TaskDetailData, error_responses
+from app.api.schemas import (
+    ApiResponse,
+    SuccessCode,
+    TaskDetailData,
+    TaskTraceData,
+    TraceEventData,
+    error_responses,
+)
 from app.core.errors import ErrorCode
 from app.infrastructure.logging import bind_context
 
@@ -50,6 +60,64 @@ async def get_task(
         code=SuccessCode.OK,
         message="查询成功",
         data=TaskDetailData.from_domain(task),
+        trace_id=trace_id,
+    )
+
+
+@router.get(
+    "/tasks/{task_id}/trace",
+    response_model=ApiResponse[TaskTraceData],
+    summary="查询任务的执行轨迹",
+    description=(
+        "按执行顺序返回每个节点的进入/离开事件。\n\n"
+        "**这张表是事件流的权威重放来源**（详细设计 18.3）：Redis Stream 会被 "
+        "MAXLEN 裁剪，客户端断线重连后要补历史必须回到这里。\n\n"
+        "`after_sequence` 用于增量拉取——语义是「我已经有的最后一条」，"
+        "因此是**严格大于**，用 `>=` 会让每次重连都重复拿到同一条。"
+    ),
+    dependencies=[Depends(require_task_status_rate_limit)],
+    responses=error_responses(
+        ErrorCode.AUTHENTICATION_REQUIRED,
+        ErrorCode.ACCESS_DENIED,
+        ErrorCode.TASK_NOT_FOUND,
+        ErrorCode.RATE_LIMITED,
+        ErrorCode.INTERNAL_ERROR,
+    ),
+)
+async def get_task_trace(
+    task_id: str,
+    user: CurrentUser,
+    service: TaskServiceDep,
+    artifacts: ArtifactsDep,
+    trace_id: TraceIdDep,
+    after_sequence: Annotated[int | None, Query(ge=0, description="只返回序号大于它的事件")] = None,
+    limit: Annotated[int | None, Query(ge=1, le=500, description="最多返回多少条")] = None,
+) -> ApiResponse[TaskTraceData]:
+    # **先走一次 service 拿任务**：权限判定（跨用户 403）与任务存在性都在那里，
+    # 直接用仓储读轨迹会绕过这两道检查——而轨迹里带着节点名与耗时，
+    # 是**未授权用户不该看到**的执行细节。
+    task = await service.get_task(user=user, task_id=task_id)
+    events = await artifacts.list_trace_events(task.id, after_sequence=after_sequence, limit=limit)
+    bind_context(task_id=task.id, conversation_id=task.conversation_id)
+    return ApiResponse(
+        code=SuccessCode.OK,
+        message="查询成功",
+        data=TaskTraceData(
+            task_id=task.id,
+            trace_id=task.trace_id,
+            events=[
+                TraceEventData(
+                    sequence=item.sequence,
+                    type=item.event_type,
+                    node=item.node,
+                    status=item.status,
+                    duration_ms=item.duration_ms,
+                    timestamp=item.created_at,
+                )
+                for item in events
+            ],
+            trace_incomplete=task.trace_incomplete,
+        ),
         trace_id=trace_id,
     )
 

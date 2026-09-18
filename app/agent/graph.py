@@ -52,6 +52,7 @@ from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
 from app.agent.schemas.plan import StepStatus
 from app.agent.state import AgentState, Route, pending_steps
+from app.agent.tracing import traced
 from app.core.config import Settings
 from app.domain.task import ReviewRecord, StepRecord, Task, TaskOutcome, TaskStatus
 from app.infrastructure.model_gateway import ModelGateway
@@ -134,7 +135,12 @@ def _add_node(graph: StateGraph[AgentState], name: str, node: Any) -> None:
     写成 `Any` 或加 `type: ignore` 都能让它闭嘴，但那会把这个文件里
     唯一一处能验证"节点签名与 State 对得上"的检查也一并关掉。
     """
-    graph.add_node(name, node)
+    # 包一层埋点（`tracing.traced`）。**赋给 `Any` 变量**：见本函数的 docstring，
+    # mypy 对"工厂返回的可调用对象"解不出 `NodeInputT`，而 `traced` 的返回类型
+    # 正是那样一个对象。标注成 `Any` 比再加一个 `type: ignore` 诚实——
+    # 节点本身的类型在各自的工厂函数上有精确标注。
+    wrapped: Any = traced(name, node)
+    graph.add_node(name, wrapped)
 
 
 def build_graph(
@@ -277,6 +283,7 @@ class TaskGraph:
             # 而这三样才是"它是怎么查出来的"要回答的问题。
             plan=_plan_digest(final_state),
             payload=final_state.get("answer_payload"),
+            trace_events=tuple(final_state.get("trace_events") or ()),
             # 五张表的行，一次带出去（见 `TaskOutcome` 的说明）
             steps=_step_records(final_state),
             tool_calls=tuple(final_state.get("tool_calls") or ()),

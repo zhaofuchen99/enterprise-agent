@@ -70,6 +70,13 @@ class TaskPatch(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     intent: str | None = None
+    #: 轨迹是否完整（16.5 / FR-TRACE-001 的异常情况）。**只由收尾路径置位**，
+    #: 判据是「本该留下轨迹的执行没有留下」：图跑到一半中止、产出落库失败。
+    #: 领取时就被取消的任务**不置位**——它压根没执行，空轨迹是它的预期形态，
+    #: 把它也标成不完整会让这个位失去区分力（处处为真等于没有）。
+    #: 读 `/trace` 的人据此知道"看到的不是全部"，而一份缺了几段的轨迹
+    #: 不置位时看起来是完整的——缺的正好是最该看的那几段。
+    trace_incomplete: bool | None = None
 
 
 class TaskRepository(Protocol):

@@ -431,3 +431,59 @@ async def test_agent_error_from_a_tool_becomes_a_failed_step(settings: Settings)
 
     with pytest.raises(AgentError):
         await _invoke(settings, graph)
+
+
+# ---------------------------------------------------------------- ④ 执行轨迹
+
+
+async def test_every_node_leaves_a_started_and_a_leave_event(settings: Settings) -> None:
+    """每个跑过的节点都留下一对事件，且**顺序就是执行顺序**。
+
+    这是"每个节点都有轨迹"的结构性验证：`traced` 在 `_add_node` 里包住所有
+    节点（漏包一个不会有任何症状——它在轨迹里只是"不存在"，而轨迹本来
+    就不完整，看不出少了什么）。所以断言的是**节点集合与先后关系**。
+    """
+    sql, rag = FakeTool("sql_query"), FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph)
+
+    events = state["trace_events"]
+    started = [event for event in events if event.event_type == "node.started"]
+    leaves = [event for event in events if event.event_type != "node.started"]
+    # 简单查询的路径：supervisor → sql → reflect → conflict → analysis → reviewer → final
+    # （`conflict` 与 `reviewer` 是确定性节点，同样会在轨迹里留下痕迹）
+    expected = ["supervisor", "sql", "reflect", "conflict", "analysis", "reviewer", "final"]
+    assert [event.node for event in started] == expected
+    # **事件是成对的**：只有离开事件的话，一个卡住的节点在轨迹上
+    # 表现为"什么都没发生"，与"压根没跑到"长得一样
+    assert [event.node for event in leaves] == expected
+    assert all(event.status == "RUNNING" for event in started)
+    # 进入事件没有耗时可言——给它 0 会被读成"瞬间完成"
+    assert all(event.duration_ms is None for event in started)
+    assert all(event.duration_ms is not None for event in leaves)
+
+
+async def test_a_node_reporting_failure_is_recorded_as_node_failed(settings: Settings) -> None:
+    """supervisor 判失败时，离开事件的类型是 `node.failed` 而非 `node.completed`。
+
+    订阅方按 `type` 分支（18.2 的事件清单就是这个粒度），折在 `status` 里
+    等于要求每个订阅方自己再判一次——漏判的症状是"失败被当成完成"。
+    **这条路径是"节点返回了错误"（不抛异常）**，也就是埋点管得住的那一条。
+    """
+    from app.tests.fakes import FakeFailure
+
+    sql, rag = FakeTool("sql_query"), FakeTool("rag_retrieve", source="DOCUMENT")
+    gateway = FakeModelGateway(responses=[], failure=FakeFailure.UNAVAILABLE)
+    graph = build_graph(settings, gateway=gateway, sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph)
+
+    assert state["execution_status"] is TaskStatus.FAILED
+    leaves = [event for event in state["trace_events"] if event.event_type != "node.started"]
+    supervisor = next(event for event in leaves if event.node == "supervisor")
+    assert supervisor.event_type == "node.failed"
+    assert supervisor.status == TaskStatus.FAILED.value
+    # 失败之后仍要走到 `final`（由它给出一句面向用户的说明），
+    # 因此记的是 failed 而不是"图在这里断了"
+    assert leaves[-1].node == "final"

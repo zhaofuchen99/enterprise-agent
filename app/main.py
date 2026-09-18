@@ -28,7 +28,6 @@ from app.infrastructure.observability import setup_error_tracking, setup_observa
 from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
 from app.repositories import Repositories, build_sql_repositories
-from app.repositories.agent_repo import SqlAgentArtifactRepository
 from app.services.auth_service import AuthService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.rate_limit import RedisFixedWindowLimiter
@@ -89,6 +88,10 @@ def wire_dependencies(
     redis: aioredis.Redis = app.state.redis
     repos = repositories if repositories is not None else build_sql_repositories(app.state.sessions)
 
+    # 执行产出仓储与任务仓储**同源**（同一次 `build_sql_repositories`
+    # 或同一份内存替身）：17.4 的轨迹接口读它，而 Worker 写的是同一张表——
+    # 两处装配分家时，症状是"任务跑完了但轨迹查出来是空的"，且不会有任何报错。
+    artifacts = repos.artifacts
     runner = TaskRunner(
         tasks=repos.tasks,
         queue=queue,
@@ -99,7 +102,7 @@ def wire_dependencies(
         # 对两条进程是同一份，差别只在 body（API 不传）。让 API 传 None
         # 会诱使 `_persist_artifacts` 长出"仓储不存在就跳过"的分支，
         # 而那条分支在 Worker 里永远为假——测试不出来的死代码。
-        artifacts=SqlAgentArtifactRepository(app.state.sessions),
+        artifacts=artifacts,
     )
 
     app.state.repositories = repos
@@ -109,6 +112,9 @@ def wire_dependencies(
     app.state.task_runner = runner
     app.state.job_queue = queue
     app.state.model_gateway = gateway
+    # 17.4 的轨迹接口直接读它，不经 TaskService——轨迹是**执行细节**，
+    # 而 service 层管的是任务的状态机（创建/领取/取消/查询）。
+    app.state.artifacts = artifacts
     app.state.rate_limiter = RedisFixedWindowLimiter(redis=redis, settings=settings)
     app.state.auth_service = AuthService(repos.users, settings)
     app.state.task_service = TaskService(

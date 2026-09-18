@@ -105,6 +105,34 @@ class TaskCreatedData(BaseModel):
     stream_url: str
 
 
+class TraceEventData(BaseModel):
+    """轨迹里的一条事件（详细设计 17.4）。
+
+    字段名与 17.4 的示例逐字一致（`type` / `node` / `status` / `timestamp`）。
+    **`type` 而不是 `event_type`**：这是给客户端解析的契约，
+    改名的代价是前端静默拿不到事件类型。
+    """
+
+    sequence: int
+    type: str
+    node: str
+    status: str
+    duration_ms: int | None = None
+    timestamp: datetime
+
+
+class TaskTraceData(BaseModel):
+    """任务的执行轨迹（详细设计 17.4）。"""
+
+    task_id: str
+    trace_id: str
+    events: list[TraceEventData] = Field(default_factory=list)
+    #: 轨迹是否完整。**它来自 `agent_task.trace_incomplete`**：
+    #: 落库失败时置位（FR-TRACE-001 的异常情况），客户端据此知道
+    #: "看到的不是全部"——不置位的话，一份缺了几段的轨迹看起来是完整的。
+    trace_incomplete: bool = False
+
+
 class TaskDetailData(BaseModel):
     """任务详情（详细设计 17.2）。
 

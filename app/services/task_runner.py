@@ -262,9 +262,14 @@ class TaskRunner:
                 code=ErrorCode.INTERNAL_ERROR,
                 message="任务执行过程中出现内部错误",
                 detail=type(exc).__name__,
+                # **图上中止时一条轨迹都没有**：中止节点的更新不会写进 State，
+                # 而任务体没返回就带不出 `trace_events`（见 `agent/tracing.py`）。
+                # 置位比留空诚实——读 `/trace` 的人会知道"看不到"是任务真的没留下，
+                # 而不是他查错了地方。
+                trace_incomplete=True,
             )
 
-        await self._persist_artifacts(task, outcome)
+        persisted = await self._persist_artifacts(task, outcome)
         if outcome.failed:
             # **图判成失败就按失败收尾，不写 SUCCEEDED**（见 `TaskOutcome.failed`）。
             # 混在一起的话，"模型挂了"与"分析完成了"在 API、SSE 与任务列表上
@@ -280,35 +285,48 @@ class TaskRunner:
                 ),
                 message=outcome.error_message or "任务未完成",
                 outcome=outcome,
+                trace_incomplete=not persisted,
             )
 
         if await self.is_cancel_requested(task.id):
             # 任务体跑完才发现取消（底层调用不可中断，17.5 第 5 条）
-            return await self._finish_cancelled(task, worker_id=worker_id)
+            return await self._finish_cancelled(
+                task, worker_id=worker_id, trace_incomplete=not persisted
+            )
 
-        return await self._finish_succeeded(task, outcome=outcome)
+        return await self._finish_succeeded(task, outcome=outcome, trace_incomplete=not persisted)
 
-    async def _persist_artifacts(self, task: Task, outcome: TaskOutcome) -> None:
-        """把这次执行的产出落进 16.6 / 16.7 的五张表。
+    async def _persist_artifacts(self, task: Task, outcome: TaskOutcome) -> bool:
+        """把这次执行的产出落进 16.6 / 16.7 的五张表。返回**有没有写进去**。
 
         **失败路径也要落**：模型不可用时，`plan` 与部分证据仍然有价值——
         用户看到的是"没跑完"，而排查的人要知道它跑到哪一步了。
         `TaskOutcome` 在两条路径上都带着它们，落不落是这里决定的。
 
         **异常吞掉、只记日志**：落库失败不该把一次成功的分析变成任务失败。
-        但也不能静默——它是"复盘时发现表里没有这条任务的产出"的唯一线索。
+        但也不能静默——它是"复盘时发现表里没有这条任务的产出"的唯一线索，
+        而返回值给了第二个线索：收尾时据此置 `trace_incomplete`
+        （FR-TRACE-001 的异常情况）。**五张表与轨迹在同一个事务里**
+        （`save` 只有一个 `session_scope`），因此"证据没落上"与"轨迹没落上"
+        必然同时发生，一个布尔量足以表达。
         """
         try:
             await self._artifacts.save(
                 task.id,
+                # `trace_id` 是任务级属性，由这里传——`NodeTrace` 上不带它
+                # （见 `agent_repo._trace_row` 的说明）
+                trace_id=task.trace_id,
                 steps=outcome.steps,
                 tool_calls=outcome.tool_calls,
                 evidence=outcome.evidence,
                 conflicts=outcome.conflicts,
                 review=outcome.review,
+                trace_events=outcome.trace_events,
             )
         except Exception:
             logger.exception("执行产出落库失败", extra={"task_id": task.id})
+            return False
+        return True
 
     async def _run_body(self, task: Task) -> TaskOutcome:
         """任务体。**装配点没给 `body` 时是空实现**——任务以 `SUCCEEDED` 且
@@ -326,7 +344,9 @@ class TaskRunner:
         return await self._body(task)
 
     # ------------------------------------------------------------------ 收尾
-    async def _finish_succeeded(self, task: Task, *, outcome: TaskOutcome) -> Task | None:
+    async def _finish_succeeded(
+        self, task: Task, *, outcome: TaskOutcome, trace_incomplete: bool = False
+    ) -> Task | None:
         updated = await self._transition(
             task,
             TaskPatch(
@@ -339,6 +359,7 @@ class TaskRunner:
                 intent=outcome.intent,
                 plan_json=outcome.plan if outcome is not None else None,
                 result_json=outcome.payload if outcome is not None else None,
+                trace_incomplete=trace_incomplete,
             ),
             expected=TaskStatus.RUNNING,
         )
@@ -364,6 +385,7 @@ class TaskRunner:
         message: str,
         detail: str | None = None,
         outcome: TaskOutcome | None = None,
+        trace_incomplete: bool = False,
     ) -> Task | None:
         updated = await self._transition(
             task,
@@ -372,6 +394,7 @@ class TaskRunner:
                 finished_at=self._clock(),
                 error_code=code.value,
                 error_message=message,
+                trace_incomplete=trace_incomplete,
                 # **失败也要留结构化结果**：答案文本解释了"为什么没完成"，
                 # 而计划与部分证据仍然有价值——用户看到的是"没跑完"，
                 # 但排查的人要知道它跑到哪一步了。
@@ -397,7 +420,9 @@ class TaskRunner:
             )
         return updated
 
-    async def _finish_cancelled(self, task: Task, *, worker_id: str) -> Task | None:
+    async def _finish_cancelled(
+        self, task: Task, *, worker_id: str, trace_incomplete: bool = False
+    ) -> Task | None:
         now = self._clock()
         updated = await self._tasks.update(
             task.id,
@@ -405,6 +430,7 @@ class TaskRunner:
                 status=TaskStatus.CANCELLED,
                 finished_at=now,
                 worker_id=worker_id,
+                trace_incomplete=trace_incomplete,
             ),
             at=now,
         )
