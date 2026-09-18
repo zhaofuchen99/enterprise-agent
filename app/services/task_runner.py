@@ -258,6 +258,23 @@ class TaskRunner:
                 detail=type(exc).__name__,
             )
 
+        if outcome.failed:
+            # **图判成失败就按失败收尾，不写 SUCCEEDED**（见 `TaskOutcome.failed`）。
+            # 混在一起的话，"模型挂了"与"分析完成了"在 API、SSE 与任务列表上
+            # 完全一样——唯一的线索是答案文本里那句给人读的说明，
+            # 而程序读不出它。实测踩到：演示脚本把一次 MODEL_OUTPUT_INVALID
+            # 当成了"进入澄清"，因为两者的产物都是"没有步骤、有一句说明"。
+            return await self._finish_failed(
+                task,
+                code=(
+                    ErrorCode(outcome.error_code)
+                    if outcome.error_code
+                    else ErrorCode.INTERNAL_ERROR
+                ),
+                message=outcome.error_message or "任务未完成",
+                outcome=outcome,
+            )
+
         if await self.is_cancel_requested(task.id):
             # 任务体跑完才发现取消（底层调用不可中断，17.5 第 5 条）
             return await self._finish_cancelled(task, worker_id=worker_id)
@@ -291,8 +308,8 @@ class TaskRunner:
                 # 分两处写就会出现"答案更新了、结构化结果还是上一次的"。
                 final_answer_md=outcome.answer,
                 intent=outcome.intent,
-                plan_json=outcome.plan,
-                result_json=outcome.payload,
+                plan_json=outcome.plan if outcome is not None else None,
+                result_json=outcome.payload if outcome is not None else None,
             ),
             expected=TaskStatus.RUNNING,
         )
@@ -311,7 +328,13 @@ class TaskRunner:
         return updated
 
     async def _finish_failed(
-        self, task: Task, *, code: ErrorCode, message: str, detail: str | None = None
+        self,
+        task: Task,
+        *,
+        code: ErrorCode,
+        message: str,
+        detail: str | None = None,
+        outcome: TaskOutcome | None = None,
     ) -> Task | None:
         updated = await self._transition(
             task,
@@ -320,6 +343,11 @@ class TaskRunner:
                 finished_at=self._clock(),
                 error_code=code.value,
                 error_message=message,
+                # **失败也要留结构化结果**：答案文本解释了"为什么没完成"，
+                # 而计划与部分证据仍然有价值——用户看到的是"没跑完"，
+                # 但排查的人要知道它跑到哪一步了。
+                plan_json=outcome.plan if outcome is not None else None,
+                result_json=outcome.payload if outcome is not None else None,
             ),
             expected=TaskStatus.RUNNING,
         )

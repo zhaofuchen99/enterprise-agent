@@ -13,6 +13,83 @@
 
 ---
 
+## 现在能做什么
+
+一句话问题 → 系统自己决定查哪几路（业务库 / 知识库）→ 拿证据 → 交叉核对 → 给出带引用的答案。
+
+```bash
+make run       # 一个终端：api + worker
+make demo      # 另一个终端：跑固化下来的六条问题
+```
+
+六条问题覆盖了四条验收标准，**每条都有可断言的判据**（`configs/demo_questions.yaml`），
+而不是打出来让人自己看：
+
+| 用例 | 问题 | 证明什么 |
+|---|---|---|
+| `demo-sql` | 2025年Q3华东地区的净销售额是多少？ | 简单指标查询**只走 SQL**（FR-PLAN-002 规则 1） |
+| `demo-rag` | 华东区域渠道折扣政策对直营渠道的折扣上限？ | 制度问法**只走 RAG**，不去查库 |
+| `demo-cross` | …专项分析表里华东的净销售额是多少？与库里一致吗？ | 双源并列 + **检出数值冲突并披露** |
+| `demo-expand` | 2026年1月华南地区的净销售额是多少？ | SQL 查不到时**补一路 RAG**（「能根据工具结果继续分析」） |
+| `demo-absent` | 跨境出海业务管理办法怎么规定？ | 语料里没有 → **拒答**，不编 |
+| `demo-clarify` | 上个季度卖得怎么样？ | 缺时间与指标 → **澄清**，且一次问全 |
+
+> 后两条依赖模型的意图判定与检索排序，**同一个问题两次跑可能不一样**。
+> 演示脚本把它们单列成「观察用例」，不混进通过率——那会把
+> "模型这次判歪了"说成"系统坏了"。
+
+## 实测数据（这些是跑出来的，不是目标值）
+
+| 门禁 | 命令 | 实测 |
+|---|---|---|
+| SQL 安全与越权 | `make check` | **28 条 100% 阻断**（含绕开模型、直接喂危险 SQL） |
+| 金标 SQL 正确率 | `make eval-sql` | **10/10**（结果集等价） |
+| RAG Recall@8 | `make eval-rag` | **19/20 = 95%**（门禁 ≥85%） |
+| RAG 定位一致率 | `make eval-rag` | 17/20 = 85% |
+| 语料缺陷注入 | `make verify-corpus` | **10/10 类**（其中 2 类只验证了语料侧，见下） |
+| 全量检查 | `make check` | 658 单测 + 95 集成 |
+
+---
+
+## 架构总览
+
+```mermaid
+flowchart LR
+    A[HTTP /api/agent/chat] --> B[(Redis 队列)]
+    B --> C[Worker]
+    C --> D{{最小 Graph}}
+
+    subgraph D [八节点任务循环]
+        direction TB
+        S[supervisor<br/>意图 + 计划] --> T1[sql]
+        S --> T2[rag]
+        T1 --> R[reflect<br/>确定性]
+        T2 --> R
+        R -->|还有待执行| T1
+        R -->|收敛| F[conflict<br/>数值冲突检测]
+        F --> AN[analysis<br/>模型组织证据]
+        AN --> RV[reviewer<br/>落地检查]
+        RV --> FI[final<br/>代码渲染引用]
+    end
+
+    T1 --> M[(MySQL<br/>业务演示库·只读)]
+    T2 --> Q[(Qdrant<br/>1871 chunk 混合检索)]
+    T2 --> O[Ollama<br/>bge-m3 本地向量化]
+    D --> G[云模型<br/>意图/改写/分析]
+    FI --> E[(agent_task<br/>答案 + 计划 + 结构化结果)]
+```
+
+**三条边界是硬约束，由 `scripts/check_layering.py` 在 CI 里强制**：
+API 进程不得加载 LangGraph 与 Tool（启动变慢、内存翻倍）；
+Worker 不得依赖 FastAPI（无法独立扩缩容）；`domain/` 不依赖任何基础设施。
+分层表与目录结构见下方「架构」一节。
+
+**`reflect` 是确定性的**（不调模型）：它只看 State 里的事实——还有没有待执行
+步骤、哪条路跑了但空、演进预算还剩多少。「SQL 空了就补一路 RAG」这条链路
+因此不依赖云模型连通性，而它正是验收标准第③条的核心。
+
+---
+
 ## 快速开始（30 分钟内）
 
 ### 0. 前置条件
@@ -82,10 +159,12 @@ curl -s localhost:8000/api/agent/tasks/<task_id> -H "Authorization: Bearer $TOKE
 所有响应（含错误）都是统一外壳 `{code, message, data, trace_id, retryable}`；
 `trace_id` 与响应头 `X-Trace-Id` 一致，可直接拿去日志里检索。
 
-> **Phase 1.5 起任务会真的被执行**：`make run` 之后建的任务由 Worker 领取，
-> 任务体目前是空实现，因此会以 `SUCCEEDED` 且 `answer` 为 `null` 结束——
-> 本阶段验证的是执行链路（投递/领取/心跳/写回/事件），分析能力在 Phase 7。
-> 只起 API 不起 Worker 的话，任务会停在 `QUEUED`。
+> 建完任务后由 Worker 领取并跑完整张图，答案写回 `agent_task`。**只起 API
+> 不起 Worker 的话，任务会停在 `QUEUED`**——这是本项目最常见的自伤方式。
+>
+> 任务详情（`GET /api/agent/tasks/{id}`）除答案外还返回**步骤进度、证据、
+> 冲突、审查结论与限制**，它们落在 `agent_task` 的两个 JSON 列里。
+> "答案为什么成立"就是从那里查的。
 
 ---
 
@@ -99,6 +178,11 @@ make redis-cli  进入 Redis 排查         make layering   仅分层约束检�
 make api        只起 API 进程           make test       仅单元测试
 make worker     只起 Worker 进程        make test-integration  需要真实 Redis 的用例
 make run        同时起两个进程          make fmt        格式化并自动修复
+
+make demo       端到端演示六条固化问题   make eval-sql   金标 SQL 评测
+make eval-rag   RAG Recall@8 评测        make verify-corpus  语料缺陷注入门禁
+make ingest     语料入库并发布            make retrieve   单次混合检索（调试用）
+make sql        单次自然语言 → SQL 证据   make tokenize   中文分词逐条核对
 ```
 
 多实例验收用 `make api PORT=8001`。
@@ -192,11 +276,12 @@ LOOP__MAX_TOTAL_STEPS=30
 |---|---|---|
 | 本机 WSL 内存 7.6GB | Milvus Standalone 需 8GB 起，跑不起来 | **已由 TBC-05 结案解决**：向量库改判 Qdrant（实测 300MB、多进程并发正常），见详细设计 23.1.1 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
-| `MODEL_*` / `EMBEDDING_*` 未选型（TBC-04） | Phase 3 起才真正需要 | 见开发流程 12.2 |
-| **用户与会话**仓储仍是进程内实现 | 重启丢数据、多实例互不可见 | Phase 2 换 MySQL；替换面收敛在 `app/main.py` 的 `wire_dependencies()` |
-| **任务仓储是 Redis 临时实现** | Redis 挂掉时创建任务返回 503；Redis 里存着任务状态（与「MySQL 唯一权威」冲突） | Phase 2 换 MySQL，并删除 4.4.1 的 6 个临时键 |
-| **任务体是空实现** | 任务 `SUCCEEDED` 但 `answer` 为 `null` | 预期行为，Phase 7 接入 LangGraph |
+| **Reranker 未做**（TBC-04 后置） | 检索用 RRF 融合后的 Top-8 直接出证据，没有 cross-encoder 重排 | 本机 7.6GB 内存下再跑一个模型会挤占 `bge-m3`；11.7 的「邻近块扩展」随它同批后置 |
+| **冲突检测只做 VALUE 一类** | 口径 / 时点 / 范围 / 来源四类没做，各有各的缺前提（见 `app/agent/nodes/conflict.py` 的清单） | Phase 9 |
+| **已知误报：表格的合计行与分项行不分** | 实测里一张表的分项行被当成区域合计去比，报出过 92% 的"差异" | 需要表格的合计标记或指标口径的 `grain`；模型能在 `claims` 里自己纠正，检测器这一层还不能 |
+| **Reviewer 只做确定性检查** | 14.1 的第二阶段（模型审查）与 `RETRY` / `CLARIFY` 两个状态没做 | Phase 8 完整版 |
 | 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |
+| 同义词会导致误拒 | `报备` vs 语料里的 `备案`，余弦 0.74 仍被拒答（金标 rag-06） | 纯词汇规则解决不了，要靠重排器给语义信号 |
 | 跨进程 trace 用内存 exporter 断言 | 未接真实追踪后端，线上看不到链路 | 本机无 Jaeger/Grafana；OTLP 开关已就绪，Phase 11 接后端 |
 
 ---

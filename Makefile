@@ -144,6 +144,8 @@ eval-sql:  ## 跑金标 SQL 评测集，产出正确率（前置：make up + 业
 	uv run python scripts/eval_sql.py $(if $(ONLY),--only $(ONLY),)
 eval-rag:  ## 跑 RAG 金标 20 条，产出 Recall@8 与定位一致率（前置：make ingest + Ollama）
 	uv run python scripts/eval_rag.py $(if $(ONLY),--only $(ONLY),)
+demo:  ## 端到端演示六条固化问题（前置：另一个终端跑 make run）
+	uv run python scripts/demo.py $(if $(ONLY),--only $(ONLY),) $(if $(BASE),--base $(BASE),)
 verify-corpus:  ## 断言 10 类缺陷真的注入了产物（不是清单标注），任一失败即非零（前置：make ingest）
 	uv run python -m app.cli verify-corpus
 

@@ -62,13 +62,20 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
                 SUPERVISOR_PROMPT, IntentResult, question=question
             )
         except AgentError as exc:
-            # **不降级为"两路都查"**，见模块 docstring
-            return {
-                "errors": [exc],
-                "next_route": Route.FAIL,
-                "execution_status": TaskStatus.FAILED,
-                "final_answer": f"无法理解该问题：{exc.message}",
-            }
+            # **重建一次**（详设 8.3：「校验失败可让 Supervisor 重建一次，
+            # 第二次失败返回 `PLAN_INVALID`」）。网关内部已经按 VALIDATION 类
+            # 重试过一次，但那一次用的是**同一段 prompt**；
+            # 再打一次有机会拿到另一段输出，而这一步失败会让任务直接结束。
+            # 实测：演示里 6 条问题有 1 条撞上过这个——
+            # 不重试的话，一次模型抖动就等于一次演示失败。
+            if exc.code is not ErrorCode.MODEL_OUTPUT_INVALID:
+                return _fail(exc)
+            try:
+                result = await gateway.invoke_structured(
+                    SUPERVISOR_PROMPT, IntentResult, question=question
+                )
+            except AgentError as retry_exc:
+                return _fail(retry_exc)
 
         intent = result.value
         try:
@@ -105,6 +112,21 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
         }
 
     return supervisor
+
+
+def _fail(exc: AgentError) -> dict[str, Any]:
+    """意图判定失败 → 任务直接结束。
+
+    **不降级为"两路都查"**，见模块 docstring：降级看起来更稳，
+    但它会在故障期间把 FR-PLAN-002 那条验收悄悄作废，
+    而结果看起来完全正常（确实拿到了数据）。
+    """
+    return {
+        "errors": [exc],
+        "next_route": Route.FAIL,
+        "execution_status": TaskStatus.FAILED,
+        "final_answer": f"无法理解该问题：{exc.message}",
+    }
 
 
 def _explain(intent: IntentResult) -> AnalysisResult:

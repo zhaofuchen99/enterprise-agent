@@ -98,6 +98,17 @@ class TaskOutcome(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     answer: str | None = None
+    #: 图里判定的终态是不是失败（supervisor 模型不可用、计划非法…）。
+    #:
+    #: **任务级状态必须跟着它走**：不跟的话，一次"模型挂了"会被记成
+    #: `SUCCEEDED`，而 API、SSE 与用户都看不出区别——答案文本里那句
+    #: "本次任务未能完成"是唯一线索，而它是给人读的，不是给程序读的。
+    #: 实测踩到：演示脚本把一次 `MODEL_OUTPUT_INVALID` 当成了"进入澄清"，
+    #: 因为两者的产物都是"没有步骤、有一句说明"。
+    failed: bool = False
+    #: 失败时的错误码与文案（进 `agent_task.error_code` / `error_message`）
+    error_code: str | None = None
+    error_message: str | None = None
     #: Supervisor 判出的意图（8.1 的 `IntentResult.intent`）。
     #: 落 `agent_task.intent`——16.5 有这个列，而它回答的是
     #: "这条任务是当查询问的、还是当制度问的"，排查误答时第一个要看的东西。

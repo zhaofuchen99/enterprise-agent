@@ -261,7 +261,14 @@ class TaskGraph:
             if assessment is not None:
                 current.set_attribute("agent.decision", assessment.decision)
         final_state: AgentState = result  # type: ignore[assignment]
+        errors = final_state.get("errors") or []
+        failed = final_state.get("execution_status") is TaskStatus.FAILED
         return TaskOutcome(
+            # **图判成失败时，任务级状态也要失败**（见 `TaskOutcome.failed`）。
+            # 取第一条错误进 `error_code`——多条并列时第一条通常是根因。
+            failed=failed,
+            error_code=errors[0].code.value if failed and errors else None,
+            error_message=errors[0].message if failed and errors else None,
             answer=final_state.get("final_answer"),
             intent=getattr(final_state.get("intent"), "intent", None),
             # **计划摘要落库的形态**：步骤 + 修订号 + 最终判定。

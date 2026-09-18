@@ -161,13 +161,15 @@ def _pipeline_limitations(state: AgentState) -> tuple[str, ...]:
     """
     limits: list[str] = []
     for result in (state.get("step_results") or {}).values():
+        # **没有错误码时不要写「（None）」**：SQL 的空结果走的是
+        # `SUCCEEDED` + `payload.is_empty`（9.4 明写「SQL 空集不算失败」），
+        # 它压根没有错误码。印出「（None）」会让读者以为哪里漏填了字段，
+        # 而这只是两条"跑了但空"的路径载体不同。
+        reason = f"（{result.error_code}）" if result.error_code else ""
         if result.empty:
-            limits.append(
-                f"{result.step_id}（{result.error_code}）按当前条件未取得结果，"
-                "相应结论缺少该来源的支撑"
-            )
+            limits.append(f"{result.step_id}{reason}按当前条件未取得结果，相应结论缺少该来源的支撑")
         elif result.status.value == "FAILED":
-            limits.append(f"{result.step_id} 执行失败（{result.error_code}），该来源未纳入分析")
+            limits.append(f"{result.step_id}{reason}执行失败，该来源未纳入分析")
     for question in state.get("open_questions") or []:
         limits.append(f"未解决的问题：{question}")
     for error in state.get("errors") or []:

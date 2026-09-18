@@ -171,13 +171,15 @@ def _open_questions(state: AgentState, assessment: ProgressAssessment) -> tuple[
         # 一并勾销，而 B 路其实还开着。
         proposed = {step.tool for step in assessment.proposed_steps}
         questions = [
-            f"{result.step_id}：{'、'.join(sorted(proposed))} 也未能覆盖（{result.error_code}）"
+            f"{result.step_id}：{'、'.join(sorted(proposed))} 也未能覆盖"
+            + (f"（{result.error_code}）" if result.error_code else "")
             for result in (state.get("step_results") or {}).values()
             if result.empty
         ]
         return tuple(questions)
     return tuple(
-        f"{result.step_id}：按当前条件未取得结果（{result.error_code}）"
+        f"{result.step_id}：按当前条件未取得结果"
+        + (f"（{result.error_code}）" if result.error_code else "")
         for result in (state.get("step_results") or {}).values()
         if result.empty
     )
