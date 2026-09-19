@@ -133,6 +133,20 @@ class TaskTraceData(BaseModel):
     trace_incomplete: bool = False
 
 
+class StreamTokenData(BaseModel):
+    """SSE 订阅令牌（详细设计 17.3.1）。
+
+    字段名与 17.3.1 的响应体逐字一致（`stream_token` / `expires_in` / `stream_url`）。
+    **`stream_url` 由服务端拼**：它带着令牌，前端自己拼的话，"参数名叫什么"
+    就成了一个没有文档的约定——改一次客户端就静默连不上（401），
+    而那个症状指向的是"权限问题"，不是"URL 拼错了"。
+    """
+
+    stream_token: str
+    expires_in: int
+    stream_url: str
+
+
 class TaskDetailData(BaseModel):
     """任务详情（详细设计 17.2）。
 

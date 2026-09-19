@@ -44,10 +44,17 @@ make demo      # 另一个终端：跑固化下来的六条问题
 |---|---|---|
 | SQL 安全与越权 | `make check` | **28 条 100% 阻断**（含绕开模型、直接喂危险 SQL） |
 | 金标 SQL 正确率 | `make eval-sql` | **10/10**（结果集等价） |
-| RAG Recall@8 | `make eval-rag` | **19/20 = 95%**（门禁 ≥85%） |
-| RAG 定位一致率 | `make eval-rag` | 17/20 = 85% |
+| RAG Recall@8（重排关闭） | `make eval-rag` | 19/20 = 95%（门禁 ≥85%） |
+| RAG Recall@8（重排开启） | `make eval-rag` | **20/20 = 100%**，定位一致率 17/20 → **19/20** |
+| 重排阈值 | `make calibrate-rerank` | 有答案 0.1364–0.9989 vs 不存在 0.0008–0.0125 → 取 **0.07** |
 | 语料缺陷注入 | `make verify-corpus` | **10/10 类**（其中 2 类只验证了语料侧，见下） |
-| 全量检查 | `make check` | 658 单测 + 95 集成 |
+| 全量检查 | `make check` | **753 单测 + 104 集成** |
+
+> **重排是默认关闭的**（`.env` 里 `RERANKER_ENABLED`），上表两行 Recall@8 是同一份
+> 语料与金标下的开/关对比：提升全部来自 `rag-06` 那条**同义词误拒**
+> （「报备」vs 语料里的「备案」）——纯词汇规则救不回来，语义判据能。
+> 样本 20 条，一条就是 5 个百分点，所以这里如实写成"那一条被救回来了"，
+> 而不是"提升了 5 个点"。
 
 ---
 
@@ -277,6 +284,7 @@ LOOP__MAX_TOTAL_STEPS=30
 | 本机 WSL 内存 7.6GB | Milvus Standalone 需 8GB 起，跑不起来 | **已由 TBC-05 结案解决**：向量库改判 Qdrant（实测 300MB、多进程并发正常），见详细设计 23.1.1 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
 | **Reranker 默认关闭**（已实现，需配置启用） | 关闭时检索用 RRF 融合后的 Top-8 直接出证据；打开才走 cross-encoder 重排 | 已实现 11.7 第 ⑥⑦ 步（`app/tools/rag/reranker.py`，`BAAI/bge-reranker-v2-m3` 云服务）。**本机跑不了本地重排**：Ollama 无 rerank 端点（实测 404），本地 cross-encoder 与 7.6GB 内存不相称；11.7 第 ⑧ 步「邻近块扩展」仍后置 |
+| **SSE 重放暂走 Redis Stream** | 断线重连在流保留期（1 小时）内可完整补齐，超出窗口只能拿到 `snapshot` + `replay_lost=true` | 18.3 的「MySQL 权威重放」要先把 Worker 的每条事件**先落 `agent_trace_event` 取 sequence 再 XADD**，而现在的轨迹是收尾时批量落的（两批事件不是同一批）；合并已登记 |
 | **冲突检测只做 VALUE 一类** | 口径 / 时点 / 范围 / 来源四类没做，各有各的缺前提（见 `app/agent/nodes/conflict.py` 的清单） | Phase 9 |
 | **已知误报：表格的合计行与分项行不分** | 实测里一张表的分项行被当成区域合计去比，报出过 92% 的"差异" | 需要表格的合计标记或指标口径的 `grain`；模型能在 `claims` 里自己纠正，检测器这一层还不能 |
 | **Reviewer 只做确定性检查** | 14.1 的第二阶段（模型审查）与 `RETRY` / `CLARIFY` 两个状态没做 | Phase 8 完整版 |

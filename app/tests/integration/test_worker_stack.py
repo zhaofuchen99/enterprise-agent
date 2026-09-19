@@ -240,10 +240,16 @@ async def test_full_loop_through_a_real_worker(
     assert finished.trace_incomplete is False
 
     events = await RedisStreamEventBus(redis, settings).read(task.id)
-    assert [event.type for event in events] == [
-        TaskEventType.TASK_STARTED,
-        TaskEventType.TASK_COMPLETED,
-    ]
+    kinds = [event.type for event in events]
+    # 流的两端是任务级的开始与结束；**中间夹着节点级事件**——
+    # 那是 Phase 10 起图里的节点直接发进同一条流的（`agent/tracing.py`），
+    # 客户端因此能看到任务一步步在跑，而不是几十秒静默后突然出答案
+    assert kinds[0] is TaskEventType.TASK_STARTED
+    assert kinds[-1] is TaskEventType.TASK_COMPLETED
+    assert TaskEventType.NODE_STARTED in kinds
+    assert TaskEventType.PROGRESS_ASSESSED in kinds
+    # 顺序由流本身保证：客户端据此去重与排序（18.4）
+    assert [event.sequence for event in events] == sorted(event.sequence for event in events)
 
     # 执行产出真的落了库：轨迹按执行顺序取回，且与任务同 trace_id。
     # **这一条只能在真库上验**：单元测试里的仓储是内存替身，
@@ -402,3 +408,94 @@ async def test_worker_settings_job_name_matches_the_dispatch_constant() -> None:
     assert WorkerSettings.queue_name == RedisKey.queue()
     registered = {func.__name__ for func in WorkerSettings.functions}
     assert registered == {TASK_JOB_NAME}
+
+
+async def test_events_from_a_real_worker_reach_a_subscriber_on_another_instance(
+    redis: aioredis.Redis,
+    repo: SqlTaskRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """端到端：**真 Worker 跑任务，另一个"实例"订阅到完整事件流**。
+
+    这条用例验的是 FR-SSE-001 业务规则 4：「订阅请求必须能落在任意一个 API
+    实例上并拿到完整事件流，客户端不得被要求重连到特定实例」。做法是让
+    订阅方用**另一个事件总线对象**（模拟另一个进程里的那份）去读——
+    它只能经过 Redis 拿到事件，进程内没有任何共享状态。
+
+    事件清单是这一段工作的**验收依据**：`node.started/completed` 让客户端
+    看到一个任务一步步在跑（而不是几十秒静默后突然出答案），
+    `progress.assessed` 是"任务循环对用户可见的载体"（18.2 明写不许省略），
+    `done` 由订阅端发出并终止流。
+    """
+    import asyncio
+
+    from app.agent.schemas.analysis import AnalysisResult
+    from app.agent.schemas.plan import IntentResult
+    from app.api.stream import stream_frames
+    from app.tests.fakes import FakeModelGateway
+    from app.tools.sql.schemas import SqlCandidate
+
+    scripts = [
+        IntentResult(intent="QUERY", required_sources=("sql",), confidence=0.9),
+        SqlCandidate(
+            sql=(
+                "SELECT SUM(net_amount) AS net_sales FROM fact_sales_order_item "
+                "WHERE order_date >= :start AND order_date < :end"
+            ),
+            parameters={"start": "2025-07-01", "end": "2025-10-01"},
+            selected_tables=("fact_sales_order_item",),
+            selected_columns=("net_amount", "order_date"),
+            expected_columns=("net_sales",),
+            explanation="按季度汇总净销售额",
+        ),
+        AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。"),
+    ]
+    monkeypatch.setattr(
+        "app.worker.build_model_gateway", lambda _settings: FakeModelGateway(scripts)
+    )
+
+    settings = get_settings()
+    task = _task("tsk_0000000000000000000003")
+    await repo.add(task)
+    queue = await ArqJobQueue.create(settings)
+    assert await queue.enqueue(task_id=task.id, trace_id=task.trace_id, trace_context={})
+    await queue.aclose()
+
+    # 订阅方：**另一个总线对象**，除 Redis 之外与 Worker 没有任何共享
+    bus = RedisStreamEventBus(redis, settings)
+    frames: list[str] = []
+
+    async def consume() -> None:
+        async for frame in stream_frames(task=task, bus=bus, settings=settings):
+            frames.append(frame.event_type)
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.sleep(0.2)  # 让订阅先建立（否则第一段事件只在重放里出现）
+
+    worker = Worker(
+        functions=WorkerSettings.functions,
+        queue_name=RedisKey.queue(),
+        redis_settings=WorkerSettings.redis_settings,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        burst=True,
+        max_jobs=1,
+        job_timeout=30,
+    )
+    await worker.async_run()
+    await asyncio.wait_for(consumer, timeout=15)
+
+    # 流的形状：以任务开始，以 `done` 终止（18.2 的"流终止"由订阅端发出）
+    assert frames[0] == "snapshot"
+    assert frames[1] == TaskEventType.TASK_STARTED.value
+    assert frames[-1] == "done"
+    assert TaskEventType.TASK_COMPLETED.value in frames
+
+    # 节点级事件成对出现，且覆盖图里跑过的每一步——
+    # 这是"任务一步步在跑"对客户端可见的那个承诺
+    started = [kind for kind in frames if kind == TaskEventType.NODE_STARTED.value]
+    completed = [kind for kind in frames if kind == TaskEventType.NODE_COMPLETED.value]
+    assert len(started) >= 7 and len(started) == len(completed)
+    # 任务循环的判定必须在流里（18.2：`progress.assessed` 不允许省略）
+    assert TaskEventType.PROGRESS_ASSESSED.value in frames
+    assert TaskEventType.REVIEW_COMPLETED.value in frames

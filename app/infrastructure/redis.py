@@ -171,6 +171,17 @@ class RedisKey:
         return f"task:{task_id}:events"
 
     @staticmethod
+    def stream_token(jti: str) -> str:
+        """SSE 订阅令牌的一次性消费标记（详设 17.3.1）。
+
+        **值里存的是 task_id**：令牌本身已经用签名绑定了任务，
+        这一份是"给排查用"的——查 `stk_xxx` 时能直接看出它属于哪个任务，
+        不必先去解 JWT。TTL 与令牌有效期一致，过期即自动消失
+        （"一次性"因此不需要额外的清理任务）。
+        """
+        return f"stk:{jti}"
+
+    @staticmethod
     def rate_limit(scope: str, subject: str) -> str:
         return f"rl:{scope}:{subject}"
 

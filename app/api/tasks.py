@@ -1,27 +1,35 @@
-"""任务查询（详细设计 17.2）。"""
+"""任务查询、轨迹与事件流（详细设计 17.2 / 17.3 / 17.4）。"""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import (
     ArtifactsDep,
     CurrentUser,
+    EventBusDep,
+    SettingsDep,
+    StreamPrincipalDep,
+    StreamTokenDep,
     TaskServiceDep,
     TraceIdDep,
     require_task_status_rate_limit,
 )
 from app.api.schemas import (
     ApiResponse,
+    StreamTokenData,
     SuccessCode,
     TaskDetailData,
     TaskTraceData,
     TraceEventData,
     error_responses,
 )
-from app.core.errors import ErrorCode
+from app.api.stream import SseFrame, format_frame, stream_frames
+from app.core.errors import AgentError, ErrorCode
 from app.infrastructure.logging import bind_context
 
 router = APIRouter(prefix="/api/agent", tags=["任务"])
@@ -158,3 +166,122 @@ async def cancel_task(
         data=TaskDetailData.from_domain(task),
         trace_id=trace_id,
     )
+
+
+@router.post(
+    "/tasks/{task_id}/stream-token",
+    response_model=ApiResponse[StreamTokenData],
+    summary="签发 SSE 订阅令牌",
+    description=(
+        "用请求头里的 Access Token 换一个**短时效、一次性、只对该任务有效**的令牌。\n\n"
+        "为什么需要它：浏览器的 `EventSource` 设不了请求头，事件流只能靠查询参数认证；"
+        "而把长期有效的 Access Token 放进 URL 会泄露给访问日志与浏览器历史"
+        "（详细设计 17.3.1）。"
+    ),
+    dependencies=[Depends(require_task_status_rate_limit)],
+    responses=error_responses(
+        ErrorCode.AUTHENTICATION_REQUIRED,
+        ErrorCode.ACCESS_DENIED,
+        ErrorCode.TASK_NOT_FOUND,
+        ErrorCode.RATE_LIMITED,
+        ErrorCode.INTERNAL_ERROR,
+    ),
+)
+async def create_stream_token(
+    task_id: str,
+    user: CurrentUser,
+    service: TaskServiceDep,
+    tokens: StreamTokenDep,
+    trace_id: TraceIdDep,
+) -> ApiResponse[StreamTokenData]:
+    # **先判归属再签发**：令牌等于一条"只读这条流"的通行证，
+    # 发给非所有者就等于把别人的执行细节交出去
+    task = await service.get_task(user=user, task_id=task_id)
+    issued = await tokens.issue(user_id=user.id, task_id=task.id)
+    bind_context(task_id=task.id, conversation_id=task.conversation_id)
+    return ApiResponse(
+        code=SuccessCode.OK,
+        message="签发成功",
+        data=StreamTokenData(
+            stream_token=issued.token,
+            expires_in=issued.expires_in,
+            stream_url=issued.stream_url,
+        ),
+        trace_id=trace_id,
+    )
+
+
+@router.get(
+    "/tasks/{task_id}/stream",
+    summary="订阅任务事件流（SSE）",
+    description=(
+        "以 `text/event-stream` 持续推送一个任务的事件（详细设计 17.3 / 18.2）。\n\n"
+        "**鉴权两条来路**：`Authorization` 请求头，或 `?token=<stream_token>`"
+        "（浏览器 `EventSource` 只能走后者，令牌由 `stream-token` 接口签发）。\n\n"
+        "**断线重连**：把最后一条事件的 `id` 通过 `Last-Event-ID` 请求头带回来，"
+        "服务端从它之后补齐。流已被清理时先发一条 `snapshot` 并标 `replay_lost=true`。\n\n"
+        "事件顺序与终止事件由 `done` 界定；`heartbeat` 只在空闲时出现。"
+    ),
+    response_class=StreamingResponse,
+    responses=error_responses(
+        ErrorCode.AUTHENTICATION_REQUIRED,
+        ErrorCode.ACCESS_DENIED,
+        ErrorCode.TASK_NOT_FOUND,
+        ErrorCode.RATE_LIMITED,
+        ErrorCode.INTERNAL_ERROR,
+    ),
+)
+async def stream_task_events(
+    task_id: str,
+    request: Request,
+    principal: StreamPrincipalDep,
+    service: TaskServiceDep,
+    bus: EventBusDep,
+    settings: SettingsDep,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+) -> StreamingResponse:
+    # **归属校验与限流都在建连之前**：一旦开始返回流，HTTP 状态码就已经发出去了，
+    # 之后再报 403 只能表现为"流里出现一条错误事件"——那与"任务跑失败了"长得一样
+    if principal.token_task_id is not None and principal.token_task_id != task_id:
+        raise AgentError(
+            ErrorCode.ACCESS_DENIED,
+            "订阅令牌与任务不匹配",
+            details={"token_task_id": principal.token_task_id},
+        )
+    task = await service.get_task(user=principal.user, task_id=task_id)
+    # 限流**在这里显式调用**而不是走 `dependencies=[...]`：那个依赖注入的是
+    # `CurrentUser`（只认请求头），而这条端点的凭据有两条来路，
+    # 走依赖会让"带订阅令牌的请求绕过限流"——而绕过是静默的
+    limiter = request.app.state.rate_limiter
+    result = await limiter.check(
+        scope="task:stream",
+        subject=principal.user.id,
+        limit=settings.rate_limit_stream_per_minute,
+        window_seconds=60,
+    )
+    if not result.allowed:
+        raise AgentError(
+            ErrorCode.RATE_LIMITED,
+            f"订阅过于频繁，请 {result.reset_after_seconds} 秒后重试",
+        )
+
+    bind_context(task_id=task.id, conversation_id=task.conversation_id)
+    frames = stream_frames(task=task, bus=bus, settings=settings, after_id=last_event_id)
+    return StreamingResponse(
+        _framed(frames),
+        media_type="text/event-stream",
+        headers={
+            # 中间层不得缓存或缓冲：否则客户端要等到缓冲写满才看见第一批事件
+            # （Nginx 侧还要配 proxy_buffering off，见详细设计 20.2）
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+async def _framed(frames: AsyncIterator[SseFrame]) -> AsyncIterator[str]:
+    """帧对象 → SSE 文本。**格式化集中在这里**，因此它只有一处实现、
+    也只有一个地方会被测（`format_frame` 本身是纯函数）。"""
+    async for frame in frames:
+        yield format_frame(frame)

@@ -92,6 +92,43 @@ class ModelTuning(BaseModel):
     thinking_enabled: bool = False
 
 
+class SseTuning(BaseModel):
+    """SSE 订阅端参数（详细设计 19.5 的 `sse` 段 / 17.3 / 17.3.1 / 18.4）。
+
+    **段名带 `_tuning` 后缀**：与 `RedisTuning` / `ModelTuning` 同一条纪律
+    （那两个是因为已有扁平的 `REDIS_URL` / `MODEL_NAME` 才不得已加后缀）。
+    这里目前没有扁平的 `SSE_*`，但**订阅令牌那几个名字天然属于这一族**
+    （`SSE__STREAM_TOKEN_TTL_SECONDS` 与将来的 `SSE_ENABLED` 很容易被写成
+    同一个前缀下的兄弟），先按带后缀的写法定下来，免得以后再改一次键名。
+
+    **没有「订阅者队列」这一项**：18.4 的有界队列是为**推送模型**准备的
+    （Worker 直接往订阅者队列里塞）。本实现是订阅端从 Redis 拉取，
+    慢客户端只会拖慢它自己的那个循环，Worker 与其它订阅者都不受影响
+    ——背压天然成立，加一个队列只是多一份没人读的状态。
+    """
+
+    #: 空闲多久发一次心跳（17.3「心跳默认 15 秒」）。
+    #: **是空闲触发而不是无条件定时**：有业务事件时不该再插心跳，
+    #: 否则事件密集的任务会让流里一半是心跳。
+    heartbeat_seconds: int = Field(default=15, ge=1, le=300)
+    #: 订阅令牌有效期（17.3.1「默认 60 秒」）。短时效是**它敢放在查询参数里**
+    #: 的唯一理由（长期有效的 Access Token 不得进查询参数）。
+    stream_token_ttl_seconds: int = Field(default=60, ge=10, le=600)
+    #: 一次 `XREAD BLOCK` 的阻塞时长。**它决定的是心跳与终止判定的粒度**，
+    #: 不是事件延迟——有数据时阻塞读会立刻返回，新事件是"推"到订阅端上的。
+    #:
+    #: ⚠️ **必须明显小于 Redis 客户端的 `socket_timeout`**
+    #: （`REDIS_TUNING__OPERATION_TIMEOUT_SECONDS`，默认 1s）。
+    #: 阻塞读等满 block 才返回，而 socket 层在同一个时长上还有个读超时——
+    #: 两者相等时**每一次心跳判定都会撞上它**，表现为
+    #: `TimeoutError: Timeout reading from socket` 从订阅端抛出来、
+    #: 连接被掐断（实测踩到：本项默认值第一版取的就是 1000ms，
+    #: 而 fakeredis 不做 socket 超时，单元测试完全看不出来）。
+    #: 200ms 意味着空闲时每 200ms 一次 `XREAD`——在服务端是一次阻塞等待，
+    #: 代价可以忽略，而心跳的判定精度因此是 200ms 量级。
+    poll_block_ms: int = Field(default=200, ge=50, le=10_000)
+
+
 class SqlToolTuning(BaseModel):
     """SQL Tool 参数（详细设计 19.5 的 `sql_tool` 段）。
 
@@ -296,6 +333,10 @@ class Settings(BaseSettings):
     #: 固定窗口限流配额（详细设计 19.3）
     rate_limit_create_per_minute: int = Field(default=10, ge=1, le=1000)
     rate_limit_status_per_minute: int = Field(default=120, ge=1, le=10_000)
+    #: SSE 建连配额，**与状态查询分开计**：一次订阅是一条长连接，
+    #: 与"每 2 秒轮询一次状态"是两种负载——共用配额会让重度轮询的用户
+    #: 连不上流，而症状是"SSE 用不了"，看起来像功能坏了。
+    rate_limit_stream_per_minute: int = Field(default=30, ge=1, le=1000)
     rate_limit_upload_per_hour: int = Field(default=10, ge=1, le=1000)
 
     # ------------------------------------- 模型（TBC-04 已决议，见 CLAUDE.md）
@@ -368,6 +409,9 @@ class Settings(BaseSettings):
     redis_max_connections: int = Field(default=50, ge=1, le=500)
     redis_tuning: RedisTuning = Field(default_factory=RedisTuning)
 
+    #: SSE 订阅参数（详细设计 19.5 的 `sse` 段 / 17.3.1 的订阅令牌）
+    sse_tuning: SseTuning = Field(default_factory=SseTuning)
+
     # ------------------------------------------------------------------ 向量库
     #: Qdrant 服务端地址（TBC-05 已结案，2026-09-17）。
     #:
@@ -434,6 +478,19 @@ class Settings(BaseSettings):
 
         if self.search_enabled and not self.search_provider:
             raise ValueError("SEARCH_ENABLED=true 时必须提供 SEARCH_PROVIDER")
+
+        # SSE 的阻塞读必须留在 Redis 客户端的 socket 超时之内，且要留出余量。
+        # **这一条不校验的后果是"每次心跳都掐断连接"**：block 时长与 socket
+        # 超时相等时，阻塞读必然踩线（实测踩到过，见 `SseTuning.poll_block_ms`）。
+        socket_timeout_ms = self.redis_tuning.operation_timeout_seconds * 1000
+        margin_ms = 200
+        if self.sse_tuning.poll_block_ms > socket_timeout_ms - margin_ms:
+            raise ValueError(
+                f"SSE_TUNING__POLL_BLOCK_MS={self.sse_tuning.poll_block_ms} "
+                f"必须比 REDIS_TUNING__OPERATION_TIMEOUT_SECONDS"
+                f"（{self.redis_tuning.operation_timeout_seconds}s）小至少 {margin_ms}ms——"
+                "阻塞读与 socket 读超时相等时，每一次空闲判定都会以超时告终"
+            )
 
         if self.reranker_enabled:
             # **三项都校验**，缺一样就启动失败：重排是"少一个配置就静默失效"的

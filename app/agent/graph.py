@@ -52,7 +52,7 @@ from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
 from app.agent.schemas.plan import StepStatus
 from app.agent.state import AgentState, Route, pending_steps
-from app.agent.tracing import traced
+from app.agent.tracing import EventPublisher, traced
 from app.core.config import Settings
 from app.domain.task import ReviewRecord, StepRecord, Task, TaskOutcome, TaskStatus
 from app.infrastructure.model_gateway import ModelGateway
@@ -124,7 +124,12 @@ def _after_reflect(state: AgentState) -> str:
     return _TARGETS[route]
 
 
-def _add_node(graph: StateGraph[AgentState], name: str, node: Any) -> None:
+def _add_node(
+    graph: StateGraph[AgentState],
+    name: str,
+    node: Any,
+    events: EventPublisher | None = None,
+) -> None:
     """注册节点。
 
     **`graph` 的类型必须写全 `StateGraph[AgentState]`，不能省成 `StateGraph`。**
@@ -139,7 +144,7 @@ def _add_node(graph: StateGraph[AgentState], name: str, node: Any) -> None:
     # mypy 对"工厂返回的可调用对象"解不出 `NodeInputT`，而 `traced` 的返回类型
     # 正是那样一个对象。标注成 `Any` 比再加一个 `type: ignore` 诚实——
     # 节点本身的类型在各自的工厂函数上有精确标注。
-    wrapped: Any = traced(name, node)
+    wrapped: Any = traced(name, node, events)
     graph.add_node(name, wrapped)
 
 
@@ -150,6 +155,7 @@ def build_graph(
     sql_tool: Any,
     rag_tool: Any,
     catalog: Any | None = None,
+    events: EventPublisher | None = None,
 ) -> CompiledStateGraph[AgentState]:
     """组装并编译图。
 
@@ -166,14 +172,14 @@ def build_graph(
     """
     graph = StateGraph(AgentState)
 
-    _add_node(graph, _NODE_SUPERVISOR, build_supervisor_node(settings, gateway))
-    _add_node(graph, _NODE_SQL, build_sql_node(settings, sql_tool))
-    _add_node(graph, _NODE_RAG, build_rag_node(settings, rag_tool))
-    _add_node(graph, _NODE_REFLECT, build_reflect_node())
-    _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog))
-    _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway))
-    _add_node(graph, _NODE_REVIEWER, build_reviewer_node())
-    _add_node(graph, _NODE_FINAL, build_final_node())
+    _add_node(graph, _NODE_SUPERVISOR, build_supervisor_node(settings, gateway), events)
+    _add_node(graph, _NODE_SQL, build_sql_node(settings, sql_tool), events)
+    _add_node(graph, _NODE_RAG, build_rag_node(settings, rag_tool), events)
+    _add_node(graph, _NODE_REFLECT, build_reflect_node(), events)
+    _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog), events)
+    _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway), events)
+    _add_node(graph, _NODE_REVIEWER, build_reviewer_node(), events)
+    _add_node(graph, _NODE_FINAL, build_final_node(), events)
 
     graph.add_edge(START, _NODE_SUPERVISOR)
     graph.add_conditional_edges(

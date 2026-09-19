@@ -121,6 +121,7 @@ def _build_runner(
     engine: AsyncEngine,
     *,
     body: TaskBody,
+    events: RedisStreamEventBus,
 ) -> TaskRunner:
     """装配 Worker 侧的任务仓储与任务体。
 
@@ -134,7 +135,10 @@ def _build_runner(
     return TaskRunner(
         tasks=repos.tasks,
         queue=queue,
-        events=RedisStreamEventBus(redis, settings),
+        # **与图是同一个实例**（见 `_build_task_graph` 的形参）：Worker 发
+        # 任务级事件、节点发节点级事件，两者必须落在同一条流上——
+        # 各建一个也能跑（Redis 键是同一个），但"谁在发"就说不清了
+        events=events,
         settings=settings,
         redis=redis,
         artifacts=repos.artifacts,
@@ -143,7 +147,12 @@ def _build_runner(
 
 
 async def _build_task_graph(
-    settings: Settings, redis: aioredis.Redis, gateway: ModelGateway, engine: AsyncEngine
+    settings: Settings,
+    redis: aioredis.Redis,
+    gateway: ModelGateway,
+    engine: AsyncEngine,
+    *,
+    events: RedisStreamEventBus,
 ) -> tuple[TaskGraph, Callable[[Task], Awaitable[TaskOutcome]]]:
     """装配最小 Graph 与它的任务体。
 
@@ -181,6 +190,10 @@ async def _build_task_graph(
             rag_tool=rag_tool,
             # 指标目录是"文档表头 → metric_code"的桥，没有它冲突检测整条跳过
             catalog=sql_tool.catalog,
+            # 节点级事件（`node.started` / `progress.assessed` / …）经它发出。
+            # **任务级事件（`task.started` 等）由 TaskRunner 发**，
+            # 两者是同一条流上的两类事件，客户端不必知道谁发的
+            events=events,
         ),
         sql_tool=sql_tool,
         rag_tool=rag_tool,
@@ -215,12 +228,17 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["db_engine"] = engine
     ctx["model_gateway"] = gateway
     ctx["worker_id"] = _worker_id()
+    # 事件总线**只建一份**，同时交给图（节点级事件）与 TaskRunner（任务级事件）：
+    # 17.3 的 SSE 端点在 API 进程里订阅的就是这条流，所以两条路径必须落到同一个
+    # Redis 键上的同一份实现，否则"为什么流里的顺序怪怪的"会变成查不清的问题
+    events = RedisStreamEventBus(redis, settings)
+    ctx["event_bus"] = events
     # 任务体（最小 Graph）在**启动时**装配好：它的依赖里有两样会在启动时
     # 真的连一次（Qdrant 的 collection 检查、词表快照的读取），
     # 放到第一次跑任务时才连等于把那两类故障推迟到有真实请求的时候。
-    task_graph, body = await _build_task_graph(settings, redis, gateway, engine)
+    task_graph, body = await _build_task_graph(settings, redis, gateway, engine, events=events)
     ctx["task_graph"] = task_graph
-    ctx["runner"] = _build_runner(settings, redis, queue, engine, body=body)
+    ctx["runner"] = _build_runner(settings, redis, queue, engine, body=body, events=events)
     logger.info("worker 启动完成", extra={"status": ctx["worker_id"]})
 
 

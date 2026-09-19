@@ -64,6 +64,13 @@ class IdPrefix(StrEnum):
     #: `agent_conflict` 表属 Phase 9，但 id 现在就要有——冲突是
     #: "答案为什么这么写"的追溯入口之一，`cft_` 与 `evd_` 在日志里要能一眼分开。
     CONFLICT = "cft"
+    #: SSE 订阅令牌（Phase 10 / 详设 17.3.1）。**它同时是 jti**——
+    #: 一次性消费的标记就挂在这个值上（`RedisKey.stream_token`），
+    #: 所以看日志时 `stk_xxx` 能直接拿去 Redis 里查"这个令牌被用掉没有"。
+    #: ⚠️ `noqa: S105` 是**误报豁免**：这是 ID 前缀，不是密钥。
+    #: ruff 按名字里的 "token" 判定，而这里恰好是"令牌的 id 前缀"——
+    #: 真正的密钥只从环境变量加载（`Settings.jwt_secret`）。
+    STREAM_TOKEN = "stk"  # noqa: S105
     #: 知识文档版本（Phase 5 的 `knowledge_document.id`，16.8）。
     #: 与 `chunk_id` 的分工要分清：chunk 的身份是 `logical_key@version`（确定性派生，
     #: 重复入库要覆盖同一条），而这一行是**入库这一次动作**的实体，随机生成。

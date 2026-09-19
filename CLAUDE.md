@@ -27,6 +27,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite | ✅ 完成（第一阶段） | **只做 14.1 的确定性检查**（六条：必需步骤是否跑过、claim 有无引用、引用是否存在、BLOCKING 冲突是否披露、敏感字段是否泄露、未解决问题是否列出）。**能 FAIL 任务**——14.3 的一票否决意味着"结论没有依据"时 `final` 输出"审查未通过"而不是把原答案放出去。`RETRY`/`CLARIFY` 不产出（要 retry_router 与状态位，属 Phase 8 完整版） |
+| 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
@@ -406,6 +407,54 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     里显式写了 `RERANKER_ENABLED=false`。**新增任何"默认关、开发机可能开"
     的开关（`SEARCH_ENABLED` 是下一个）时照此办理。**
 
+### SSE 订阅端点期间新立的临时约定
+
+64. **阻塞订阅要产出"空闲"信号，不能自己吞掉**（`EventBus.subscribe` 产出
+    `None`）。心跳是"这段时间什么都没发生"推出来的，而把超时在总线里
+    `continue` 掉，订阅端就永远不知道自己闲了多久——只能另起一个定时器，
+    那会与事件循环抢同一份状态。`None` 不是错误，是**正常的一等信号**。
+65. **`XREAD BLOCK` 的时长必须明显小于 Redis 客户端的 `socket_timeout`**。
+    阻塞读等满 block 才返回，而 socket 层在同一时长上还有个读超时——
+    **两者相等时每一次空闲判定都会以超时告终**。实测踩到：`poll_block_ms`
+    第一版取 1000ms，而 `REDIS_TUNING__OPERATION_TIMEOUT_SECONDS` 是 1s，
+    于是订阅端抛 `TimeoutError`、连接被掐断，客户端看到的是
+    "peer closed connection without sending complete message body"。
+    ⚠️ **`fakeredis` 不做 socket 超时，单元测试全绿也看不出来**——
+    这一条只有真连才暴露，所以它现在是**启动期交叉校验**（留 200ms 余量）。
+66. **基础设施故障时结束流，但绝不发 `done`**（`stream_frames` 的兜底）。
+    `done` 的语义是"任务结束了"——而 Redis 断连时任务还在另一个进程里跑着，
+    发 `done` 等于对客户端撒谎。契约是「收到 `done` 才算正常结束」，
+    异常终止时客户端回退到轮询 `GET /tasks/{id}`（R 8.2 的降级路径），
+    而那条路径是**正确**的：事件流只负责"看得见"。
+    同时**异常不能抛出去**：此刻响应已经开始，抛出去会变成
+    `RuntimeError: Caught handled exception, but response already started`，
+    症状与"浏览器把连接断了"一模一样，指不到 Redis 上去。
+67. **订阅令牌的三条性质缺一不可**（17.3.1）：短时效 60s、**一次性**
+    （`GETDEL` 原子消费，`GET`+`DEL` 在并发下会让同一个令牌被用两次）、
+    绑定 `task_id`（不比对就是一张"能读任意任务"的通行证）。
+    拒绝时**不区分过期/已用/签名错**（都是 401）——能区分等于告诉探测者
+    "这个令牌曾经有效"；唯一例外是**任务不匹配 → 403**（令牌是好的，
+    只是用错了地方，这一条必须留下明确痕迹）。
+68. **SSE 的重放暂时走 Redis Stream，不是 18.3 写的 MySQL**——这是一处
+    如实记下的偏离：`agent_trace_event` 只在任务收尾时批量落**节点级**轨迹，
+    与流上的事件不是同一批，硬拿它当重放源比"只用流"更误导。
+    流保留 1 小时（`REDIS_TUNING__STREAM_TTL_SECONDS`），
+    超出窗口的重连走 `snapshot` + `replay_lost=true`（18.4 允许的形态）。
+    `replay_lost` 的判据是**"客户端游标早于流里最早的条目"**，不是
+    "重放返回空"——后者会把"确实没有新事件"误报成"丢了事件"。
+69. **事件模型下沉到 `app/domain/events.py`**：图里的节点要发事件，
+    而 `app/agent/**` 不能反向 import `services/event_bus.py`（依赖只能向右）。
+    放 services 里只有两条路——向上依赖，或再造一份事件类型（两份清单必然漂移）。
+    agent 侧只声明一个 `publish` 形状的 `EventPublisher` Protocol，
+    `RedisStreamEventBus` 结构上满足它（与 `PromptSource` 同一条理由）。
+70. **节点级领域事件从"节点返回值"里派生**（`tracing._derived_events`），
+    不散到八个节点里各写一遍。判据是「这次更新里有没有那个字段」
+    （`task_list` / `progress_assessment` / `review_result`），
+    它们都是 Pydantic 校验过的对象，比"哪个节点返回了它"稳定；
+    将来新节点产出同类字段时事件自动跟着有。**空计划不算"有计划"**：
+    `task_list=[]` 时报 `plan.created` 等于说"计划里有 0 步"，
+    而真相是"这次没有计划"（判据写成 truthiness 就是为了让澄清落到下一个分支）。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -418,8 +467,11 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **跨重投的执行轨迹会丢**：五张表在重投时整体替换（见 `agent_repo.py` 的说明），上几次失败的过程没有留痕。要留就得加 `attempt_no` 或一张执行流水表 | 需要时 |
 | `schema_catalog` / `agent_config` 建表（切片内目录是 `configs/schema_catalog.yaml`，SQL Tool 已按它的形状写好 `SchemaCatalog`；接表只需换 `SchemaProvider` 的加载实现） | 后置 |
 | `make cleanup` 的保留期策略与实现（详细设计 16.12） | Phase 2 收尾 |
-| 事件流的 MySQL 权威重放：**节点轨迹已经落库并按序可查**（17.4 已交付），但 SSE / Redis Stream 那一路的 `sequence` 仍由 Stream ID 派生，两者尚未合并成一条 | Phase 10 |
-| `stream_url` 指向的 SSE 订阅端点（契约已固定，事件已可订阅） | Phase 10 |
+| **事件流的 MySQL 权威重放**：SSE 的重放**已交付但从 Redis Stream 走**（见约定 68）。要按 18.3 合并成一条，得让 Worker **先落 `agent_trace_event` 取 sequence 再 XADD**，届时 `sequence` 不再由 Stream ID 派生、`/trace` 与 SSE 成为同一条流的两条腿。代价：改收尾写库路径与 `trace_incomplete` 判据 | Phase 10 收尾 |
+| ~~`stream_url` 指向的 SSE 订阅端点~~ **已完成**（2026-09-19）：端点 + 订阅令牌 + 双通道 + 心跳 + `done` + 降级 | ✅ Phase 10 |
+| **`answer.delta` 事件**（答案增量流式）：要网关支持 `stream=True` 的对话调用，而当前是"一次拿完整 JSON"（结构化输出）。它属"体验增强"，与"事件可见"是两件事 | 需要时 |
+| **`task.retrying` 事件**：要 Phase 8 的 `retry_router` 与四类预算（`RETRY` 目前不产出） | Phase 8 完整版 |
+| **Nginx 的 SSE 直通配置**（`proxy_buffering off` / `proxy_read_timeout 3600s` / `proxy_http_version 1.1`）：应用侧已发 `X-Accel-Buffering: no`，反代侧配置属 Phase 14 | Phase 14 |
 | 用户消息落库（FR-CHAT-001 处理流程的「保存用户消息」，`agent_message` 表） | Phase 2 |
 | ~~任务体换成 LangGraph~~ **已完成**（`TaskRunner` 收 `body=` 注入） | ✅ Phase 6 |
 | 节点内检查取消标记（`TaskRunner.is_cancel_requested` 目前只在领取与收尾时检查） | Phase 7 |
@@ -454,7 +506,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | ~~词表扩容机制（`token_id` 只增不改的运维面）~~ | **已移回 Phase 5**。需验证"扩容后历史 chunk 无需重算仍可召回" |
 | `agent_conflict` / `agent_review` 表与完整 5 类 Conflict 检测 | 切片内只做「报告数字 vs DB 数字」一类，且先不建表 |
 | `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
-| SSE 订阅端点与订阅令牌（Phase 1.5 已完成事件流，剩余是暴露端点） | |
+| ~~SSE 订阅端点与订阅令牌~~ | **已完成（2026-09-19，提前）**：端点 + 令牌 + 双通道 + 心跳 + `done` + 降级路径，节点级事件也进了同一条流。**注**：重放暂走 Redis Stream（约定 68），18.3 的 MySQL 权威重放仍待合并 |
 | ~~`/trace` 接口与节点埋点~~ | **已完成（2026-09-18，提前）**：节点级埋点 + 17.4 的接口。**工具级事件与 `include_tools` 仍未做**，见上方【后续扩展】 |
 | 评测集扩到 115 条（先 40 题；**SQL 安全类 100% 阻断率的判定标准不缩**） | |
 | `schema_catalog` / `agent_config` 建表（切片内暂用 YAML / 配置） | |
@@ -557,6 +609,22 @@ make retrieve Q="华东区域渠道折扣政策对直营渠道的折扣上限是
 make eval-rag    # 金标 20 条 → Recall@8（头部会印重排是否启用）
 make calibrate-rerank  # 重排阈值校准：20+3 条的分数分布与可用区间（需 RERANKER_ENABLED=true）
 ```
+
+订阅一个任务的事件流（**要 `make run` 在跑**；令牌一次性，所以每次先换一个）：
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"analyst","password":"analyst-dev-pass"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["access_token"])')
+TASK=$(curl -s -X POST localhost:8000/api/agent/chat -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"message":"2025年华东Q3净销售额是多少"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["task_id"])')
+curl -s -X POST "localhost:8000/api/agent/tasks/$TASK/stream-token" -H "Authorization: Bearer $TOKEN" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["stream_url"])'   # → 丢给 curl -N
+```
+
+> **浏览器只能用订阅令牌**（`EventSource` 设不了请求头），命令行可以直接把
+> `Authorization` 头带上 `/stream`。`snapshot` 开头、`done` 结尾；
+> 中间没有 `done` 就是**异常终止**（此时客户端应回退到轮询任务详情，见约定 66）。
 
 > **重排（11.7 第 ⑥⑦ 步）默认关闭**，`.env` 里打开时三项配置缺一不可
 > （`RERANKER_MODEL` / `RERANKER_BASE_URL` / `RERANKER_API_KEY`，启动即校验）。

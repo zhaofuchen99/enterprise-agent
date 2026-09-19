@@ -31,6 +31,7 @@ from app.repositories import Repositories, build_sql_repositories
 from app.services.auth_service import AuthService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.rate_limit import RedisFixedWindowLimiter
+from app.services.stream_token import StreamTokenService
 from app.services.task_runner import TaskRunner
 from app.services.task_service import TaskService
 
@@ -92,10 +93,14 @@ def wire_dependencies(
     # 或同一份内存替身）：17.4 的轨迹接口读它，而 Worker 写的是同一张表——
     # 两处装配分家时，症状是"任务跑完了但轨迹查出来是空的"，且不会有任何报错。
     artifacts = repos.artifacts
+    # 事件总线**只建一份**：它同时是 TaskRunner 的投递通道与 17.3 的 SSE
+    # 订阅通道。建两份不会有任何报错（两条通道各自读写同一个 Redis 键，
+    # 看起来完全正常），但"哪一份是谁的"就再也说不清了。
+    event_bus = RedisStreamEventBus(redis, settings)
     runner = TaskRunner(
         tasks=repos.tasks,
         queue=queue,
-        events=RedisStreamEventBus(redis, settings),
+        events=event_bus,
         settings=settings,
         redis=redis,
         # **API 进程也要装配它**，虽然它自己不跑任务：`TaskRunner` 的构造签名
@@ -115,6 +120,9 @@ def wire_dependencies(
     # 17.4 的轨迹接口直接读它，不经 TaskService——轨迹是**执行细节**，
     # 而 service 层管的是任务的状态机（创建/领取/取消/查询）。
     app.state.artifacts = artifacts
+    # 17.3 的 SSE 端点订阅它。与 TaskRunner 手里那份是**同一个对象**（见上）
+    app.state.event_bus = event_bus
+    app.state.stream_tokens = StreamTokenService(redis=redis, settings=settings)
     app.state.rate_limiter = RedisFixedWindowLimiter(redis=redis, settings=settings)
     app.state.auth_service = AuthService(repos.users, settings)
     app.state.task_service = TaskService(

@@ -20,53 +20,22 @@ Phase 2 接入 `agent_trace_event` 后，这个推导会被那张表的计数器
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Any, Protocol
 
 import redis.asyncio as aioredis
-from pydantic import BaseModel, Field
 
 from app.core.config import Settings
+from app.domain.events import TaskEvent, TaskEventType
 from app.infrastructure.redis import RedisKey, load_json
 
+#: 事件模型与类型定义在 `app/domain/events.py`——**图里的节点也要发事件**，
+#: 而 `app/agent/**` 不能反向依赖 services（依赖只能向右）。这里再导出一次，
+#: 让"事件总线这一侧"的调用方（`TaskRunner`、测试）不必同时记两个模块路径。
+__all__ = ["EventBus", "RedisStreamEventBus", "TaskEvent", "TaskEventType", "last_event_id"]
+
 logger = logging.getLogger(__name__)
-
-
-class TaskEventType(StrEnum):
-    """18.2 的事件清单。**只列本阶段真的会发的那几个**。
-
-    不把 18.2 里其余事件一次性声明出来：没有生产者的枚举项会成为
-    「看起来已经支持、实际永远收不到」的假契约，读代码的人无法分辨。
-    其余事件随各自阶段落地时逐个补入。
-    """
-
-    TASK_STARTED = "task.started"
-    TASK_COMPLETED = "task.completed"
-    TASK_FAILED = "task.failed"
-    #: 见模块 docstring：18.2 缺这一项
-    TASK_CANCELLED = "task.cancelled"
-
-
-class TaskEvent(BaseModel):
-    """18.1 的事件模型。字段名与顺序都对齐文档，不另起名字。
-
-    `event_id` 与 `sequence` 的默认值是空的，因为它们在**写入流之前无从得知**：
-    序号来自 Redis 分配的 Stream ID。调用方永远不该自己构造一个带这两个字段的
-    事件——用 `publish` 拿到补全后的对象，用 `read` 拿到完整的事件。
-    """
-
-    #: Redis Stream ID，同时用作 SSE 的 Last-Event-ID
-    event_id: str = Field(default="", description="由事件总线在写入后回填")
-    sequence: int = Field(default=0, description="单任务内单调递增，客户端据此去重排序")
-    type: TaskEventType
-    timestamp: datetime
-    task_id: str
-    trace_id: str
-    node: str | None = None
-    step_id: str | None = None
-    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventBus(Protocol):
@@ -84,6 +53,10 @@ class EventBus(Protocol):
     async def read(
         self, task_id: str, *, after_id: str = "0-0", count: int = 100
     ) -> list[TaskEvent]: ...
+
+    def subscribe(
+        self, task_id: str, *, after_id: str = "0-0", block_ms: int = 1000
+    ) -> AsyncIterator[TaskEvent | None]: ...
 
     async def finish(self, task_id: str) -> None: ...
 
@@ -161,6 +134,45 @@ class RedisStreamEventBus:
                 )
             )
         return events
+
+    async def subscribe(
+        self, task_id: str, *, after_id: str = "0-0", block_ms: int = 1000
+    ) -> AsyncIterator[TaskEvent | None]:
+        """阻塞订阅：从 `after_id` 之后开始，持续产出新事件。
+
+        **与 `read` 的分工**：`read` 是"按区间取一次"（重连补齐用），
+        这里是"一直等"（实时增量用）。两条通道对应 18.3 的双通道设计，
+        而它们读的是**同一条流**——这正是"Redis 只负责快"的含义：
+        实时与补齐不需要两套数据。
+
+        **超时产出 `None`，不是什么都不产出**：调用方要的正是这个
+        "这段时间什么都没发生"的信号——心跳就是靠它发的。把这个信号
+        在总线里吞掉（`continue`），订阅端就永远不知道自己闲了多久，
+        心跳只能靠另起一个定时器，而那会与事件循环抢同一份状态。
+
+        **不用 `XREADGROUP`**（消费者组）：消费者组适合"一条消息只被一个
+        消费者处理"，而 SSE 是**广播**——多个客户端订阅同一任务时每条事件
+        都要发给每一个。用消费者组会让第二个订阅者什么都收不到。
+        """
+        cursor = after_id
+        while True:
+            raw = await self._redis.xread(
+                {RedisKey.task_events(task_id): cursor}, count=100, block=block_ms
+            )
+            if not raw:
+                yield None
+                continue
+            for _key, entries in raw:
+                for stream_id, fields in entries:
+                    text_id = _as_text(stream_id)
+                    cursor = text_id
+                    payload = load_json(fields.get("payload"))
+                    if payload is None:
+                        logger.warning("事件流条目无法解析，已跳过：%s", text_id)
+                        continue
+                    yield TaskEvent.model_validate(
+                        {**payload, "event_id": text_id, "sequence": _sequence_of(text_id)}
+                    )
 
     async def finish(self, task_id: str) -> None:
         """任务结束：给流设置保留期（详细设计 4.4：结束后保留 1 小时）。

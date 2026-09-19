@@ -9,6 +9,7 @@ Phase 1.5 / Phase 2 换成 Redis 与 MySQL 时，只需要把 `app/main.py` 里�
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Request, Response
@@ -18,8 +19,11 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AgentError, ErrorCode
 from app.domain.user import User
 from app.repositories.agent_repo import AgentArtifactRepository
+from app.repositories.user_repo import UserRepository
 from app.services.auth_service import AuthService
+from app.services.event_bus import EventBus
 from app.services.rate_limit import RateLimiter
+from app.services.stream_token import StreamTokenService
 from app.services.task_service import TaskService
 
 #: `auto_error=False`：HTTPBearer 默认在缺少 Authorization 头时抛 403，
@@ -72,6 +76,25 @@ def get_artifacts(request: Request) -> AgentArtifactRepository:
 
 
 ArtifactsDep = Annotated[AgentArtifactRepository, Depends(get_artifacts)]
+
+
+def get_event_bus(request: Request) -> EventBus:
+    """任务事件总线（18.1）。**与 TaskRunner 手里那份是同一个对象**（见 main.py）。
+
+    17.3 的 SSE 端点读它；它与 Worker 写的是同一条 Redis Stream，
+    因此订阅请求落在哪个 API 实例都一样（FR-SSE-001 业务规则 4）。
+    """
+    bus: EventBus = request.app.state.event_bus
+    return bus
+
+
+def get_stream_tokens(request: Request) -> StreamTokenService:
+    service: StreamTokenService = request.app.state.stream_tokens
+    return service
+
+
+EventBusDep = Annotated[EventBus, Depends(get_event_bus)]
+StreamTokenDep = Annotated[StreamTokenService, Depends(get_stream_tokens)]
 TraceIdDep = Annotated[str, Depends(get_trace_id)]
 
 
@@ -85,6 +108,57 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+@dataclass(frozen=True, slots=True)
+class StreamPrincipal:
+    """SSE 的凭据持有者。**两条来路**（详设 17.3.1）。
+
+    Attributes:
+        user: 解析出来的用户。
+        token_task_id: 走订阅令牌时的绑定任务；走请求头时为 None。
+            调用方**必须**拿它跟路径里的 task_id 比对——令牌本身就是
+            "只对这一条流有效"的承诺，不比对等于把承诺丢了。
+    """
+
+    user: User
+    token_task_id: str | None = None
+
+
+async def get_stream_principal(
+    request: Request,
+    auth: AuthServiceDep,
+    tokens: StreamTokenDep,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)] = None,
+) -> StreamPrincipal:
+    """SSE 的鉴权：**优先请求头，其次查询参数里的订阅令牌**。
+
+    浏览器只能用后者（`EventSource` 设不了请求头）；而命令行、SSE 客户端
+    这类能带头的调用方走前者更直接——两条都留，是因为"只支持 token 查询参数"
+    会逼着所有非浏览器调用方多跑一趟换令牌。
+
+    **查询参数里只接受订阅令牌**：它短时效、一次性、绑定任务；
+    把 Access Token 放查询参数是详设 17.3.1 明令禁止的（会进访问日志）。
+    因此这里不校验"token 参数长得像不像 access token"——它压根不进那条分支。
+    """
+    if credentials is not None:
+        return StreamPrincipal(user=await auth.authenticate(credentials.credentials))
+
+    raw = request.query_params.get("token")
+    if not raw:
+        raise AgentError(ErrorCode.AUTHENTICATION_REQUIRED, "缺少访问令牌或订阅令牌")
+    claims = await tokens.consume(raw)
+    user_repo: UserRepository = request.app.state.user_repo
+    user = await user_repo.get_by_id(claims.user_id)
+    if user is None or not user.is_active:
+        # 令牌是签给一个已不存在/已停用的用户的（签发后发生的）。**按认证失败处理**：
+        # 这里没有"他还能看到什么"的余地。签发时读过用户，但那是几十秒前的事，
+        # 而这条路径的代价只有"重新登录拿令牌"
+        raise AgentError(ErrorCode.AUTHENTICATION_REQUIRED, "订阅令牌对应的用户不可用")
+    return StreamPrincipal(user=user, token_task_id=claims.task_id)
+
+
+StreamPrincipalDep = Annotated[StreamPrincipal, Depends(get_stream_principal)]
 
 
 def rate_limit_dependency(

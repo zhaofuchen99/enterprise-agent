@@ -12,8 +12,21 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
-#: 本阶段对外的业务接口
-PUBLIC_PATHS = ("/api/auth/login", "/api/agent/chat", "/api/agent/tasks/{task_id}")
+#: 本阶段对外的业务接口。
+#:
+#: **新增接口必须登记到这里**：门禁只扫这份清单，漏登记不会红——
+#: 那个接口就静默地不受任何契约检查，而门禁看起来仍然全绿。
+#: 实测踩过一次：`/tasks/{task_id}/trace` 交付时没登记，
+#: 于是"每个公开接口都有 summary/tags/错误用例"这条约束对它不成立。
+PUBLIC_PATHS = (
+    "/api/auth/login",
+    "/api/agent/chat",
+    "/api/agent/tasks/{task_id}",
+    "/api/agent/tasks/{task_id}/trace",
+    "/api/agent/tasks/{task_id}/cancel",
+    "/api/agent/tasks/{task_id}/stream",
+    "/api/agent/tasks/{task_id}/stream-token",
+)
 
 
 @pytest.fixture
