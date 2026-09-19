@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -34,6 +36,12 @@ from app.services.rate_limit import RedisFixedWindowLimiter
 from app.services.stream_token import StreamTokenService
 from app.services.task_runner import TaskRunner
 from app.services.task_service import TaskService
+
+#: 演示控制台的静态目录（`app/static/index.html`）。
+#: **用 `Path(__file__)` 推而不是相对路径**：进程的工作目录取决于启动方式
+#: （`make run` 在仓库根、容器里可能是 `/app`），相对路径会在换一种启动方式后
+#: 变成一个 404——而那时看起来像是"页面没做"。
+WEB_DIR = Path(__file__).resolve().parent / "static"
 
 #: OpenAPI 的接口分组（开发流程 6.2 施工项 8）
 OPENAPI_TAGS: list[dict[str, str]] = [
@@ -181,6 +189,19 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(chat.router)
     app.include_router(tasks.router)
+
+    # 演示控制台（`app/static/index.html`，单文件无构建）。
+    #
+    # **用 `Mount` 而不是 `@app.get("/")`**：Mount 不进 OpenAPI——它不是 API，
+    # 列进接口文档只会让"每个公开接口都有 summary/tags/错误用例"那条门禁
+    # 多一个语义不同的条目。挂 `/ui` 而不是根路径，是为了不与将来的 API 抢路由。
+    if WEB_DIR.is_dir():
+        app.mount("/ui", StaticFiles(directory=WEB_DIR, html=True), name="console")
+
+        @app.get("/", include_in_schema=False)
+        async def console_redirect() -> RedirectResponse:
+            """根路径直接进演示控制台——面试演示时少记一个地址。"""
+            return RedirectResponse("/ui/")
 
     # FastAPI 自动埋点在本文件里调用，**不能放进 infrastructure/observability.py**：
     # 那个模块会被 app/worker.py 引用，一旦它 import 了 instrumentation-fastapi，

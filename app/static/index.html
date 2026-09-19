@@ -1,0 +1,366 @@
+<!doctype html>
+<!--
+  演示控制台（单文件，无构建、无框架、无依赖）。
+
+  **它的定位是"演示面"，不是产品界面**：只做一件事——把后端已经具备的能力
+  摆到人眼前。因此刻意不引 React/Vue/构建链：多一个依赖就要多一份维护，
+  而它要展示的东西（实时事件流、证据、冲突、限制）全都是接口现成的。
+
+  它同时是 SSE 端点的**第一个真实客户端**：`EventSource` 不能自定义请求头，
+  所以走的是 `stream-token` 换来的查询参数令牌——那条路径在浏览器里被走通，
+  才算真的可用（curl 可以带头，测不出这一点）。
+
+  数据全部来自公开接口，没有任何后端专用接口：
+    POST /api/auth/login                        登录
+    POST /api/agent/chat                        提问（202 + task_id）
+    POST /api/agent/tasks/{id}/stream-token      换订阅令牌
+    GET  /api/agent/tasks/{id}/stream            SSE 事件流
+    GET  /api/agent/tasks/{id}                   答案 / 证据 / 冲突 / 限制
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>企业智能数据分析与决策 Agent · 演示控制台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --muted: #98a1b3; --accent: #6ea8fe; --ok: #4cc38a;
+    --warn: #e3b341; --err: #f2707a; --node: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  .badge {
+    font-size: 12px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge.ok { color: var(--ok); border-color: #1f4d3a; }
+  main { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, 1.1fr); gap: 16px; padding: 16px 20px 40px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  input, textarea, button, select {
+    font: inherit; color: var(--fg); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+  input:focus, textarea:focus { outline: 1px solid var(--accent); }
+  textarea { width: 100%; resize: vertical; min-height: 64px; }
+  button { cursor: pointer; background: #24304a; border-color: #2f3d5c; }
+  button:hover { background: #2b3a5c; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .chips button { font-size: 12px; padding: 4px 8px; color: var(--muted); background: transparent; }
+  .chips button:hover { color: var(--fg); }
+  #login { display: flex; gap: 8px; align-items: center; }
+  #login input { width: 130px; }
+  .timeline { max-height: 46vh; overflow: auto; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .tl { display: grid; grid-template-columns: 62px 1fr auto; gap: 8px; padding: 3px 0; border-bottom: 1px solid #1c2029; }
+  .tl .t { color: var(--muted); }
+  .tl .k { color: var(--accent); }
+  .tl.node .k { color: var(--node); }
+  .tl.task .k { color: var(--ok); }
+  .tl.end .k { color: var(--ok); font-weight: 600; }
+  .tl.err .k { color: var(--err); }
+  .tl .d { color: var(--muted); text-align: right; }
+  .answer { white-space: pre-wrap; }
+  .answer h3 { font-size: 14px; margin: 14px 0 4px; }
+  .answer ul { margin: 4px 0 4px 18px; padding: 0; }
+  .answer code { background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+  details { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 10px; background: var(--panel-2); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  details[open] summary { margin-bottom: 8px; }
+  .item { padding: 6px 0; border-top: 1px solid #22262f; font-size: 13px; }
+  .item:first-of-type { border-top: 0; }
+  .item .meta { color: var(--muted); font-size: 12px; }
+  .conflict { border-left: 3px solid var(--warn); padding-left: 8px; }
+  .limitation { border-left: 3px solid var(--muted); padding-left: 8px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  .status { font-weight: 600; }
+  .status.SUCCEEDED { color: var(--ok); } .status.FAILED { color: var(--err); }
+  .status.RUNNING, .status.QUEUED { color: var(--warn); }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>企业智能数据分析与决策 Agent</h1>
+  <span class="badge" id="conn">未连接</span>
+  <div class="spacer"></div>
+  <div id="login" class="row">
+    <input id="username" value="analyst" aria-label="用户名">
+    <input id="password" type="password" value="analyst-dev-pass" aria-label="口令">
+    <button id="loginBtn">登录</button>
+    <span class="muted" id="who"></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>提问</h2>
+    <textarea id="question" placeholder="用中文问一个业务问题，例如：2025年Q3华东地区的净销售额是多少？"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="askBtn">提问并订阅</button>
+      <span class="muted" id="taskLine"></span>
+    </div>
+    <div class="chips" id="chips"></div>
+    <h2 style="margin-top:16px">执行时间线（SSE 实时）</h2>
+    <div class="timeline" id="timeline"><div class="empty">提问后，这里会一条条出现后端正在做的事。</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>结论</h2>
+    <div class="row" style="margin-bottom:8px">
+      <span class="status muted" id="status">—</span>
+      <span class="muted" id="intentLine"></span>
+    </div>
+    <div class="answer" id="answer"><span class="empty">还没有结果。</span></div>
+    <div id="extras"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- 演示问题
+// 与 configs/demo_questions.yaml 一致的六条：面试时点一下就能演，不靠手打
+const DEMO_QUESTIONS = [
+  "2025年Q3华东地区的净销售额是多少？",
+  "华东区域渠道折扣政策对直营渠道的折扣上限是怎么规定的？",
+  "华东区域2025年第三季度专项分析的分区域经营情况表里，华东的净销售额是多少？与数据库里查到的季度净销售额一致吗？",
+  "2026年1月华南地区的净销售额是多少？",
+  "根据《跨境出海业务管理办法》，海外渠道的报备要求是什么？",
+  "上个季度卖得怎么样？",
+];
+
+const $ = (id) => document.getElementById(id);
+const state = { accessToken: "", taskId: "", source: null, startedAt: 0 };
+
+// ---------------------------------------------------------------- 登录
+async function login() {
+  const body = { username: $("username").value, password: $("password").value };
+  const res = await api("POST", "/api/auth/login", body, false);
+  state.accessToken = res.data.access_token;
+  $("who").textContent = `已登录：${$("username").value}`;
+  $("conn").textContent = "已认证"; $("conn").className = "badge ok";
+}
+
+/** 统一调用：所有响应都是 `{code, message, data, trace_id}` 外壳。 */
+async function api(method, path, body, auth = true) {
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (auth && state.accessToken) headers["Authorization"] = `Bearer ${state.accessToken}`;
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const json = await res.json().catch(() => ({ code: "UNKNOWN", message: "响应不是 JSON" }));
+  if (!res.ok || (json.code !== "OK" && json.code !== "ACCEPTED")) {
+    throw new Error(`${json.code || res.status}：${json.message || ""}`);
+  }
+  return json;
+}
+
+// ---------------------------------------------------------------- 提问 + 订阅
+async function ask() {
+  const question = $("question").value.trim();
+  if (!question) return;
+  if (state.source) { state.source.close(); state.source = null; }
+  $("timeline").innerHTML = ""; $("extras").innerHTML = "";
+  $("answer").innerHTML = '<span class="empty">任务已提交，等待结果…</span>';
+  $("status").textContent = "QUEUED"; $("status").className = "status QUEUED";
+  $("intentLine").textContent = ""; $("taskLine").textContent = "";
+  $("askBtn").disabled = true;
+
+  try {
+    const created = await api("POST", "/api/agent/chat", { message: question });
+    state.taskId = created.data.task_id;
+    $("taskLine").textContent = `任务 ${state.taskId}`;
+    const token = await api("POST", `/api/agent/tasks/${state.taskId}/stream-token`, null);
+    subscribe(token.data.stream_url);
+  } catch (err) {
+    $("taskLine").innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+    $("askBtn").disabled = false;
+  }
+}
+
+function subscribe(streamUrl) {
+  state.startedAt = performance.now();
+  const source = new EventSource(streamUrl);   // 令牌在查询参数里：EventSource 设不了请求头
+  state.source = source;
+  $("conn").textContent = "已连接事件流"; $("conn").className = "badge ok";
+
+  for (const kind of ["snapshot", "task.started", "plan.created", "node.started",
+                      "node.completed", "node.failed", "progress.assessed",
+                      "plan.updated", "review.completed", "clarification.required",
+                      "task.completed", "task.failed", "done"]) {
+    source.addEventListener(kind, (event) => onEvent(kind, event.data));
+  }
+  // `heartbeat` 刻意不渲染：它不是"发生了什么"，只是"服务还活着"
+  source.addEventListener("heartbeat", () => {
+    $("conn").textContent = `已连接（${Math.round((performance.now() - state.startedAt) / 1000)}s）`;
+  });
+  source.addEventListener("error", () => {
+    // **没有 `done` 就断开 = 异常终止**：按约定 66，客户端应回退到轮询任务详情
+    if (state.source) {
+      $("conn").textContent = "事件流中断，已回退轮询"; $("conn").className = "badge";
+      state.source.close(); state.source = null;
+      refreshDetail(1500);
+    }
+  });
+}
+
+function onEvent(kind, raw) {
+  let payload = {};
+  try { payload = JSON.parse(raw); } catch (e) { /* 帧坏了不该让整页挂掉 */ }
+  if (kind === "done") {
+    $("status").textContent = payload.final_status || "";
+    $("status").className = `status ${payload.final_status || ""}`;
+    $("conn").textContent = "事件流已结束"; $("conn").className = "badge ok";
+    // **主动关闭**：服务端结束后 EventSource 会自动重连，而订阅令牌是一次性的，
+    // 重连只会拿到 401。不关的话浏览器控制台会刷一串无意义的报错
+    if (state.source) { state.source.close(); state.source = null; }
+    $("askBtn").disabled = false;
+    refreshDetail(0);
+    return;
+  }
+  addRow(kind, payload);
+}
+
+function addRow(kind, payload) {
+  const line = document.createElement("div");
+  const ms = Math.round(performance.now() - state.startedAt);
+  const node = payload.node || "";
+  const cls = kind.startsWith("node.") ? "node" : kind.startsWith("task.") ? "task" : "";
+  const duration = payload.duration_ms != null ? `${payload.duration_ms}ms` : "";
+  let detail = "";
+  if (kind === "plan.created") detail = `${payload.step_count} 步：${(payload.tool_types || []).join("、")}`;
+  else if (kind === "progress.assessed") detail = `${payload.decision}｜${(payload.finding_statement || "").slice(0, 40)}`;
+  else if (kind === "review.completed") detail = `${payload.status}｜${payload.score} 分｜${payload.issue_count} 条问题`;
+  else if (kind === "clarification.required") detail = payload.question || "";
+  else if (kind === "snapshot") detail = `${payload.status}${payload.replay_lost ? "（历史已被清理）" : ""}`;
+  line.className = `tl ${cls} ${kind === "done" ? "end" : ""}`;
+  line.innerHTML =
+    `<span class="t">${(ms / 1000).toFixed(2)}s</span>` +
+    `<span class="k">${escapeHtml(kind)}${node ? " · " + escapeHtml(node) : ""}</span>` +
+    `<span class="d">${escapeHtml(detail || duration)}</span>`;
+  const box = $("timeline");
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ---------------------------------------------------------------- 任务详情
+async function refreshDetail(delayMs) {
+  if (!state.taskId) return;
+  if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+  try {
+    const res = await api("GET", `/api/agent/tasks/${state.taskId}`);
+    renderDetail(res.data);
+  } catch (err) {
+    $("answer").innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+  }
+}
+
+function renderDetail(d) {
+  $("status").textContent = d.status;
+  $("status").className = `status ${d.status}`;
+  $("intentLine").textContent = [
+    d.intent ? `意图 ${d.intent}` : "",
+    d.progress_decision ? `判定 ${d.progress_decision}` : "",
+    d.trace_incomplete ? "轨迹不完整" : "",
+  ].filter(Boolean).join("｜");
+
+  $("answer").innerHTML = d.final_answer_md
+    ? miniMarkdown(d.final_answer_md)
+    : '<span class="empty">没有答案（任务未成功，或还在跑）。</span>';
+
+  const parts = [];
+  parts.push(block("步骤", d.steps.map((s) =>
+    `<div class="item">${escapeHtml(s.tool || "")} · ${escapeHtml(s.objective || "")}
+     <span class="meta">${escapeHtml(s.status || "")}${s.empty ? "（跑了但空）" : ""}</span></div>`).join("")));
+  parts.push(block("证据", (d.evidence || []).map((e) =>
+    `<div class="item"><div>${escapeHtml(e.claim || "")}</div>
+     <div class="meta">${escapeHtml(e.source_type || "")}｜${escapeHtml(e.title || "")}</div></div>`).join("")));
+  if ((d.conflicts || []).length) {
+    parts.push(`<details open><summary>⚠ 数据不一致（${d.conflicts.length} 条，未判定谁对）</summary>` +
+      d.conflicts.map((c) => `<div class="item conflict">${escapeHtml(String(c))}</div>`).join("") + `</details>`);
+  }
+  if ((d.limitations || []).length) {
+    parts.push(`<details><summary>限制（${d.limitations.length} 条）</summary>` +
+      d.limitations.map((c) => `<div class="item limitation">${escapeHtml(String(c))}</div>`).join("") + `</details>`);
+  }
+  if (d.review) {
+    parts.push(`<details><summary>审查结论</summary><div class="item">` +
+      `${escapeHtml(String(d.review.status || ""))}｜${escapeHtml(String(d.review.score ?? ""))} 分` +
+      `</div></details>`);
+  }
+  parts.push(`<div class="muted" style="margin-top:10px;font-size:12px">trace_id ${escapeHtml(d.trace_id)}（拿去日志里查）</div>`);
+  $("extras").innerHTML = parts.join("");
+}
+
+function block(title, inner) {
+  if (!inner) return `<details><summary>${title}（0）</summary><div class="item empty">没有。</div></details>`;
+  return `<details><summary>${title}</summary>${inner}</details>`;
+}
+
+// ---------------------------------------------------------------- 工具
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+/**
+ * 极小 Markdown 渲染：**只处理演示里真的会出现的那几种语法**
+ * （`###` 标题、`-` 列表、`**加粗**`、`` `代码` ``）。
+ * 它不是通用渲染器，也不打算是——引一个 Markdown 库就要多一份依赖与 XSS 面。
+ * **先转义再替换**：顺序反了等于给自己开一个注入口子。
+ */
+function miniMarkdown(text) {
+  const lines = escapeHtml(text).split("\n");
+  const out = [];
+  let inList = false;
+  for (const line of lines) {
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+    if (bullet) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${inline(bullet[1])}</li>`);
+      continue;
+    }
+    if (inList) { out.push("</ul>"); inList = false; }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    // **普通段落也要过 `inline`**：答案里的 `**加粗**` 多数出现在段落里，
+    // 只给标题与列表做行内替换的话，它们会原样带着星号显示出来
+    if (heading) out.push(`<h3>${inline(heading[2])}</h3>`);
+    else out.push(inline(line));
+  }
+  if (inList) out.push("</ul>");
+  return out.join("\n");
+}
+function inline(text) {
+  return text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+             .replace(/`(.+?)`/g, "<code>$1</code>");
+}
+
+// ---------------------------------------------------------------- 装配
+$("loginBtn").onclick = () => login().catch((err) => alert(err.message));
+$("askBtn").onclick = ask;
+$("question").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") ask();
+});
+for (const q of DEMO_QUESTIONS) {
+  const b = document.createElement("button");
+  b.textContent = q.length > 22 ? q.slice(0, 22) + "…" : q;
+  b.title = q;
+  b.onclick = () => { $("question").value = q; ask(); };
+  $("chips").appendChild(b);
+}
+</script>
+</body>
+</html>

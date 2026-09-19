@@ -22,6 +22,12 @@ make run       # 一个终端：api + worker
 make demo      # 另一个终端：跑固化下来的六条问题
 ```
 
+**演示控制台**：起了之后打开 <http://localhost:8000/> —— 提一个问题，
+左边的时间线会**一条条实时出现**后端正在做的事（`node.started` / `progress.assessed` /
+`review.completed` …），右边出结论、证据、冲突与限制。单文件 HTML、零依赖、无构建，
+走的就是公开接口（SSE 那条路用的是浏览器唯一能走的订阅令牌）。
+六条固化问题在里面做成了快捷按钮，面试时点一下就跑。
+
 六条问题覆盖了四条验收标准，**每条都有可断言的判据**（`configs/demo_questions.yaml`），
 而不是打出来让人自己看：
 
@@ -191,6 +197,9 @@ make eval-rag   RAG Recall@8 评测        make verify-corpus  语料缺陷注�
 make ingest     语料入库并发布            make retrieve   单次混合检索（调试用）
 make sql        单次自然语言 → SQL 证据   make tokenize   中文分词逐条核对
 ```
+
+演示控制台（`app/static/index.html`）在 <http://localhost:8000/>，需要 `make run`。
+它不占命令行入口：页面要展示的东西全是接口现成的，没有后端专用接口。
 
 多实例验收用 `make api PORT=8001`。
 
