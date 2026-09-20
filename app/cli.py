@@ -812,9 +812,15 @@ def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolR
         meta = chunk.get("metadata") or {}
         path = " > ".join(meta.get("section_path") or [])
         page = f"p{meta['page_no']}" if meta.get("page_no") else "—"
+        # 表格行块**打出它在整张表里的位置**：表格按行分块，光看这一条
+        # 分不出它是"整张表"还是"表里的一行"，而两者的差别正是
+        # "能不能对它求和"。`—` 表示这不是表格的一部分。
+        row = chunk.get("table_row")
+        table = f"｜表第 {row[0]}/{row[1]} 行（{meta.get('table_caption')}）" if row else ""
         print(
             f"    {path}｜{page}｜{meta.get('source_kind')}/{meta.get('classification')}"
             f"｜生效 {meta.get('effective_from') or '—'} ~ {meta.get('effective_to') or '—'}"
+            f"{table}"
         )
         for line in str(chunk.get("text", "")).splitlines()[:4]:
             print(f"    {line}")

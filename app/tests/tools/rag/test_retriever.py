@@ -82,6 +82,8 @@ def _metadata(
     effective_from: date | None = None,
     effective_to: date | None = None,
     status: DocumentStatus = DocumentStatus.ACTIVE,
+    is_table: bool = False,
+    table_caption: str | None = None,
 ) -> ChunkMetadata:
     return ChunkMetadata(
         chunk_id=f"chk_{index:04d}",
@@ -97,6 +99,8 @@ def _metadata(
         effective_from=effective_from,
         effective_to=effective_to,
         status=status,
+        is_table=is_table,
+        table_caption=table_caption,
         classification=classification,
         source_kind=source_kind,
         allowed_roles=("ADMIN",) if classification == "CONFIDENTIAL" else ("ANALYST", "ADMIN"),
@@ -1114,3 +1118,105 @@ async def test_tool_reports_the_rerank_criterion_in_safe_detail(
     detail = (result.error.safe_detail if result.error else "") or ""
     assert "判据三" in detail
     assert "重排分最高 0.0300" in detail
+
+
+# ---------------------------------------------------------------- ⑧ 表格行定位
+
+
+async def test_table_rows_carry_their_position_in_the_whole_table(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """表格按行分块，所以「这张表还有别的行」必须由检索侧补上。
+
+    没有它，召回 8 行与召回整张表在证据列表上完全同形——实测踩到过：
+    模型拿 8 行求和当成区域合计（7,146.22 万 vs 真值 13,249.31 万）。
+
+    场景：一张 4 行的表，**只有第 1 行进得了候选**（其余三行与查询正交、
+    又不携带任何 token，被 21 条更相关的干扰块挤出稠密 Top 20）。
+    数行数要回到存储层去数，因此断言的是"总共 4 行"而不是"召回了 4 条"。
+    """
+    store = InMemoryVectorStore()
+    # 同一张表的 4 行：char_start 递增，故行号就是入块顺序
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华南 | 渠道{index} | 智能家居 | {index}.00 | 1.00",
+                dense=[1.0, 0, 0, 0] if index == 10 else [0.0, 1.0, 0, 0],
+                sparse={},
+                is_table=True,
+                table_caption="分区域分渠道分产品线净销售额明细",
+                section=("2025年第三季度经营分析", "五、风险提示"),
+            )
+            for index in range(10, 14)
+        ]
+    )
+    # 21 条干扰块：比那三行更像查询，把稠密路塞满
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华东渠道折扣第{index}条",
+                dense=[0.99, 0.1, 0, 0],
+                sparse={},
+                logical_key="report/other",
+            )
+            for index in range(100, 121)
+        ]
+    )
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0])
+
+    outcome = await _retriever(settings, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    rows = {c.chunk_id: c.table_row for c in outcome.candidates if c.metadata.is_table}
+    assert rows, "表格行块应当被召回"
+    assert set(rows.values()) == {(1, 4)}, "行号与总行数都要来自存储层，不是来自召回集"
+    # 非表格块没有位置可言——`None` 表示"不是表格的一部分"，
+    # 不是"表有 0 行"，两者混起来会让下游把正文块也算进表格缺口
+    assert all(c.table_row is None for c in outcome.candidates if not c.metadata.is_table), (
+        "非表格块不该带表格位置"
+    )
+
+
+async def test_table_position_reaches_the_evidence_locator(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """位置必须一路走到证据上：分析节点读的是 `Evidence`，不是检索候选。"""
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华南 | 渠道{index} | 智能家居 | {index}.00 | 1.00",
+                dense=[1.0, 0, 0, 0] if index == 0 else [0.0, 1.0, 0, 0],
+                sparse={},
+                is_table=True,
+                table_caption="分区域分渠道分产品线净销售额明细",
+                section=("2025年第三季度经营分析", "五、风险提示"),
+            )
+            for index in range(3)
+        ]
+    )
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华东渠道折扣第{index}条",
+                dense=[0.99, 0.1, 0, 0],
+                sparse={},
+                logical_key="report/other",
+            )
+            for index in range(100, 121)
+        ]
+    )
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0])
+
+    outcome = await _retriever(settings, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+    evidence = build_document_evidence(outcome.candidates, question="华东区域渠道折扣政策")
+
+    table_evidence = [e for e in evidence if e.locator["is_table"]]
+    assert table_evidence and table_evidence[0].locator["table_row"] == [1, 3]

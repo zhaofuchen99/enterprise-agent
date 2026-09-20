@@ -96,6 +96,21 @@ class ScoredPoint(BaseModel):
     payload: dict[str, Any]
 
 
+class ChunkRecord(BaseModel):
+    """按条件取回的一块**本身**（不含分数、不含向量）。
+
+    与 `ScoredPoint` 分开而不是复用它：那个模型的 `score` 是"这次检索给它的
+    相关性"，而这里根本没有检索。填 `0.0` 会被读成"和问题完全无关"——
+    那是个我们并不知道的结论（同 `RetrievedChunk.dense_score` 可空的理由）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    chunk_id: str
+    text: str
+    payload: dict[str, Any]
+
+
 class ChunkFilter(BaseModel):
     """检索前的标量过滤条件（11.7 第 3 步 / 11.4 的 ChunkMetadata）。
 
@@ -218,6 +233,22 @@ class VectorStore(Protocol):
         按 `logical_key` 删会顺手把同一制度的其它已发布版本一起删掉，
         而那个版本的文档记录仍然是 ACTIVE——检索侧从此少了一版，
         没有任何地方会报错。
+        """
+        ...
+
+    async def fetch(self, chunk_filter: ChunkFilter, *, limit: int) -> list[ChunkRecord]:
+        """按标量条件把块**取回来**——不是检索：没有查询、没有打分、没有阈值。
+
+        存在的理由只有一个：11.7 第 ⑧ 步要「按定位取同文档同章节的相邻块」，
+        而那句话的前提是先知道有哪些块。
+
+        它与上面那句「没有『列出全部』这类方法」并不冲突：`chunk_filter` 是
+        **必填**的，且实现要求 `document_ids` 非空——调用方必须先定位到一份文档，
+        拿不到文档就一块也取不回来。把过滤做成可选，它就退化成"枚举全库"，
+        而那件事该由 MySQL 的 `knowledge_document` 回答。
+
+        ⚠️ `limit` 是**截断**不是分页。调用方要么给够，要么如实接受不完整结果——
+        分页会引入"翻到第几页了"的状态，而这个接口的用途没有这个需求。
         """
         ...
 
@@ -418,12 +449,48 @@ class QdrantVectorStore:
         )
         return result.count
 
+    async def fetch(self, chunk_filter: ChunkFilter, *, limit: int) -> list[ChunkRecord]:
+        _require_document_scope(chunk_filter)
+        records, _ = await self._client.scroll(
+            self._collection,
+            scroll_filter=_build_filter(chunk_filter),
+            limit=limit,
+            # 取 payload 不取向量：调用方要的是正文与标量字段，而向量
+            # 每次都是 1024 维浮点——白搬一趟。
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [_to_record(dict(item.payload or {})) for item in records]
+
     async def aclose(self) -> None:
         await self._client.close()
 
     def __repr__(self) -> str:
         # 不带 URL：它可能含凭据，而 repr 会进日志（19.4 脱敏纪律）
         return f"QdrantVectorStore(collection={self._collection!r})"
+
+
+def _require_document_scope(chunk_filter: ChunkFilter) -> None:
+    """`fetch` 的前置条件：必须定位到文档。**两个实现共用这一条**。
+
+    不放在 `fetch` 的文档里当约定，是因为约定不会报错：一个空的
+    `ChunkFilter()` 在 Qdrant 侧就是"全库扫描"，而它跑起来完全正常，
+    只是把"枚举全库"这件事悄悄做成了——那正是 Protocol 明写不要的方向。
+    """
+    if not chunk_filter.document_ids:
+        raise ValueError(
+            "fetch 必须带 document_ids：它是「按定位取块」，不是枚举接口。"
+            "要枚举 chunk 请查 MySQL 的 knowledge_document。"
+        )
+
+
+def _to_record(payload: dict[str, Any]) -> ChunkRecord:
+    """payload → `ChunkRecord`。`chunk_id` / `text` 写在 payload 里（见 `_to_point_struct`）。"""
+    return ChunkRecord(
+        chunk_id=str(payload.get("chunk_id", "")),
+        text=str(payload.get("text", "")),
+        payload=payload,
+    )
 
 
 def _to_point_struct(point: VectorPoint) -> models.PointStruct:
@@ -630,6 +697,18 @@ class InMemoryVectorStore:
             for cid, score in scores.items()
         ]
         return _top(fused, limit)
+
+    async def fetch(self, chunk_filter: ChunkFilter, *, limit: int) -> list[ChunkRecord]:
+        _require_document_scope(chunk_filter)
+        # 顺序按 point id 排：两个实现的次序不必一致（同 `_top` 的说明），
+        # 但**同一个实现重复调用要一致**——不一致会让"这一批取回来的第几条"
+        # 变成不可复现的事实，而调用方会拿它当定位用。
+        records = [
+            _to_record(_payload(p))
+            for pid, p in sorted(self._points.items())
+            if chunk_filter.matches(_payload(p))
+        ]
+        return records[:limit]
 
     async def set_status(self, chunk_ids: Sequence[str], status: str) -> None:
         for chunk_id in chunk_ids:

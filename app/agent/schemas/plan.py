@@ -99,6 +99,17 @@ class StepResult(BaseModel):
     #: 它与 `FAILED` 是两回事：前者是**关于数据的事实**，后者是执行出错。
     #: `reflect` 的演进判定读的正是它。
     empty: bool = False
+    #: 这一步**实际**被数据权限限定到的区域；`None` = 没有施加限制。
+    #:
+    #: 有它，`empty` 才分得清是哪一种空——「查不到」（数据不存在）与
+    #: 「看不到」（不在授权范围内）从执行结果上看长得一模一样，而两者
+    #: 处置相反：前者要换数据源，后者要找数据负责人。`_pipeline_limitations`
+    #: 靠它把这一层说出来。
+    #:
+    #: **只有 SQL 会赋值**：数据权限在详设 9.1 里就是 SQL Tool 的服务端谓词，
+    #: RAG 侧没有等价物（语料是公司级文档，不按区域切）。RAG 的步骤恒为
+    #: `None`，那表示"这一步不涉及数据权限"，不是"不受限"。
+    data_scope: tuple[str, ...] | None = None
 
 
 class Finding(BaseModel):

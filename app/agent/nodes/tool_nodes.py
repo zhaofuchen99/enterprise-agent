@@ -112,6 +112,12 @@ def _normalize(state: AgentState, step: TaskStep, result: ToolResult) -> dict[st
         error_code=result.error.code if result.error else None,
         duration_ms=result.duration_ms,
         empty=empty,
+        # **数据权限是第三种"没结果"，而且只在这里取得回来**：空结果按
+        # `build_evidence` 的设计不产证据，所以证据里那份 `data_scope` 此刻
+        # 是空的；`warnings` 里虽有一句提示串，却是给人读的、未必在。不带过去，
+        # 到分析节点手上就只剩 `summary` 的「查询未命中任何数据」——
+        # 「你没权限看」会被原样说成「没有这个数据」。
+        data_scope=_as_data_scope(payload.get("data_scope")),
     )
     update: dict[str, Any] = {
         "step_results": {step.id: step_result},
@@ -135,6 +141,19 @@ def _normalize(state: AgentState, step: TaskStep, result: ToolResult) -> dict[st
     if result.error is not None and not empty:
         update["errors"] = [_as_agent_error(result.error)]
     return update
+
+
+def _as_data_scope(value: object) -> tuple[str, ...] | None:
+    """工具 payload 里的 `data_scope` → `StepResult.data_scope`。
+
+    payload 是 `model_dump(mode="json")` 的产物，元组到这里已经是列表。
+    **认不出来就返回 `None`，不返回空元组**：`None` 在 `StepResult` 里的
+    语义是"没有施加限制"，而空元组会是"限定成零个区域"（一种不存在的
+    权限）。把解析失败伪装成前者，下游就少写一句该写的限制。
+    """
+    if not isinstance(value, list):
+        return None
+    return tuple(str(item) for item in value)
 
 
 def _as_agent_error(error: ToolError) -> AgentError:

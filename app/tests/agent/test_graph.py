@@ -104,6 +104,14 @@ class FakeTool:
             if self._empty_as_success
             else [_evidence(i, self._source) for i in range(1, self._evidence_count + 1)]
         )
+        payload: dict[str, Any] = {}
+        if self._empty_as_success:
+            payload["is_empty"] = True
+            # 真实工具把**本次实际施加的**权限范围放在这里。替身按调用时拿到的
+            # `permission_scope` 给，且照 `model_dump(mode="json")` 出来的形状
+            # （列表）给——否则用例测的是替身的形状，不是代码要处理的形状。
+            if ctx.permission_scope.region_ids:
+                payload["data_scope"] = list(ctx.permission_scope.region_ids)
         return ToolResult(
             call_id=f"tcl_{len(self.calls):022d}",
             tool=self.name,
@@ -111,7 +119,7 @@ class FakeTool:
             started_at=now,
             finished_at=now,
             summary="查询未命中任何数据" if self._empty_as_success else f"命中 {len(items)} 条",
-            payload={"is_empty": True} if self._empty_as_success else {},
+            payload=payload,
             evidence=items,
         )
 
@@ -300,6 +308,99 @@ async def test_expansion_does_not_loop_forever(settings: Settings) -> None:
     assert len(rag.calls) == 1
     assert state["progress_assessment"].decision == "SUFFICIENT"
     assert state["open_questions"], "两路都没结果时，未解决的问题要留下来"
+
+
+async def test_empty_sql_under_a_restricted_scope_is_not_reported_as_missing_data(
+    settings: Settings,
+) -> None:
+    """**「你看不到」不能说成「没有这个数据」。**
+
+    两者在执行结果上完全同形——都只是零行——而处置相反：数据不存在要换数据源，
+    不在授权范围内要找数据负责人放开权限。合成一句「按当前条件未取得结果」，
+    用户只会去怀疑数据。
+
+    这条信息只可能断在 `tool_nodes` 那一层：空结果按 `build_evidence` 的设计
+    **不产证据**，所以证据自带的那份 `data_scope` 标注此刻是空的；
+    工具返回的 `warnings` 又只是一句给人读的提示串——判定要一个字段。
+    """
+    sql = FakeTool("sql_query", empty_as_success=True)
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(
+        settings, graph, scope=PermissionScope(role=UserRole.ANALYST, region_ids=("华东",))
+    )
+
+    limits = " ".join(state["analysis_result"].limitations)
+    # 断言整句而不是"限制里有华东"：文档来源那条限制同样会带上「华东」，
+    # 按关键词断言会让两个用例互相顶替。
+    assert "已按数据权限限定在 华东" in limits
+
+
+async def test_restricted_scope_says_document_evidence_is_unfiltered(settings: Settings) -> None:
+    """受限用户从文档里读到的东西**没有经过数据权限过滤**，必须说出来。
+
+    数据权限在详设 9.1 里就是 SQL Tool 的服务端谓词，RAG 侧没有等价物：
+    同一个数字，SQL 那条路被谓词拦下，文档这条路原样给出。不说的话，
+    用户会把"文档里写着"当成"我有权看"——而这是他唯一能察觉这层差异的地方。
+    """
+    sql = FakeTool("sql_query", source="SQL")
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql", "rag"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(
+        settings, graph, scope=PermissionScope(role=UserRole.ANALYST, region_ids=("华东",))
+    )
+
+    limits = " ".join(state["analysis_result"].limitations)
+    assert "文档" in limits and "未经过滤" in limits
+    assert "华东" in limits, "受限范围要点名——写「部分数据」等于没说"
+
+
+async def test_unfiltered_document_limitation_needs_a_restricted_user(settings: Settings) -> None:
+    """不受限的用户不写这条：他本就没有"看不看得到"的问题。
+
+    与上一条的「只在引用文档时写」共同构成两个条件——缺一个，这句话就会
+    出现在它不成立的场合，而**总在出现的提示等于没有提示**。
+    """
+    sql = FakeTool("sql_query", source="SQL")
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql", "rag"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph, scope=PermissionScope(role=UserRole.ADMIN))
+
+    limits = " ".join(state["analysis_result"].limitations)
+    assert "未经过滤" not in limits
+
+
+async def test_unfiltered_document_limitation_needs_document_evidence(settings: Settings) -> None:
+    """只走 SQL 的用户不写这条：他的证据本来就过了权限谓词。"""
+    sql = FakeTool("sql_query", source="SQL")
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(
+        settings, graph, scope=PermissionScope(role=UserRole.ANALYST, region_ids=("华东",))
+    )
+
+    limits = " ".join(state["analysis_result"].limitations)
+    assert "未经过滤" not in limits
+
+
+async def test_unrestricted_scope_adds_no_permission_limitation(settings: Settings) -> None:
+    """不受限时不写这条限制。
+
+    每跑一次都带一条「可能受权限限制」，这条提示就变成噪声，真受限的那次
+    反而没人看了（同 `reranker` 的 `DISABLED` 不进 `warnings` 的理由）。
+    """
+    sql = FakeTool("sql_query", empty_as_success=True)
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph, scope=PermissionScope(role=UserRole.ADMIN))
+
+    limits = " ".join(state["analysis_result"].limitations)
+    assert "授权范围" not in limits
 
 
 async def test_hard_failure_is_reported_as_an_error_not_as_empty(settings: Settings) -> None:

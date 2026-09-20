@@ -30,10 +30,16 @@ from typing import Any
 from app.agent.nodes.conflict import render as render_conflicts
 from app.agent.prompts.analysis import ANALYSIS_PROMPT
 from app.agent.schemas.analysis import AnalysisResult, InvestigationStep, SupportedClaim
+from app.agent.schemas.plan import StepResult
 from app.agent.state import AgentState
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
 from app.infrastructure.model_gateway import ModelGateway
+
+#: 「表格证据不完整」最多列几张表。语料里的表格块占比很高（SP-015 一篇就 87 块），
+#: 一次检索命中十来张表是可能的，而**限制清单是给人读的**——
+#: 十几行同名句式会把真正要看的那一条淹掉。超出部分汇总成一行说明。
+_MAX_TABLE_LIMITS = 3
 
 #: 单条证据最多渲染多少字。**证据正文可能是上千字的文档分块**，
 #: 全塞进 prompt 会让 token 花在"用户已经知道出处的那部分"上；
@@ -102,8 +108,27 @@ def _render(numbered: dict[str, Evidence]) -> str:
     lines: list[str] = []
     for label, item in numbered.items():
         source = "业务数据库" if item.source_type == "SQL" else "企业知识库"
-        lines.append(f"[{label}] （来源：{source}｜{item.title}）\n{item.claim[:_EVIDENCE_CHARS]}")
+        lines.append(
+            f"[{label}] （来源：{source}｜{item.title}{_table_note(item)}）\n"
+            f"{item.claim[:_EVIDENCE_CHARS]}"
+        )
     return "\n\n".join(lines)
+
+
+def _table_note(item: Evidence) -> str:
+    """表格行证据带上它在整张表里的位置，其余证据为空串。
+
+    **这是给模型看的**，而模型的输入里原本没有任何东西能表明"这张表还有别的行"：
+    表格按行分块，召回 8 行与召回整张表在证据列表上长得一模一样。
+    实测踩到过——模型拿 8 行求和当成区域合计，真值是它的近两倍。
+
+    写在**证据行上**而不是靠 prompt 里的一句通则：通则要求模型自己想起
+    "这一条可能是残缺的"，而位置是这一条证据自带的属性，没有推理余地。
+    """
+    row = item.locator.get("table_row")
+    if not isinstance(row, list) or len(row) != 2:
+        return ""
+    return f"｜该表第 {row[0]} 行，共 {row[1]} 行"
 
 
 def _with_resolved_ids(
@@ -168,13 +193,93 @@ def _pipeline_limitations(state: AgentState) -> tuple[str, ...]:
         reason = f"（{result.error_code}）" if result.error_code else ""
         if result.empty:
             limits.append(f"{result.step_id}{reason}按当前条件未取得结果，相应结论缺少该来源的支撑")
+            # **「看不到」不能与「查不到」共用一句话**（与约定 36 同一条理由）：
+            # 两者在执行结果上完全同形——都只是"零行"——而处置相反。
+            # 只说"没查到"，用户会去怀疑数据；而真相可能是他自己的授权范围。
+            if result.data_scope:
+                limits.append(_scope_limitation(result))
         elif result.status.value == "FAILED":
             limits.append(f"{result.step_id}{reason}执行失败，该来源未纳入分析")
+    # **文档来源没有数据权限这一层**，而受限用户读到的文档是全量正文。
+    # 这是取舍不是遗漏：语料是公司级报告、本身跨区域，按区域过滤会让 RAG
+    # 大面积失效。但代价必须说出来——不说的话，一个只被授权看华东的用户
+    # 会从文档里读到华南的数字，而"两条路给出的是同一个数"恰恰是他判断
+    # "我到底能不能看"的唯一线索。范围要点名：「部分数据」等于没说。
+    limits.extend(_incomplete_tables(state))
+    scope = state.get("permission_scope")
+    if scope is not None and not scope.unrestricted and _cites_documents(state):
+        areas = "、".join(scope.region_ids)
+        limits.append(
+            f"本结论引用了知识库文档证据：数据权限（{areas}）只作用于数据库查询，"
+            "文档内容未经过滤，可能包含授权范围之外区域的数据"
+        )
     for question in state.get("open_questions") or []:
         limits.append(f"未解决的问题：{question}")
     for error in state.get("errors") or []:
         limits.append(f"执行期间的错误：{error.code.value} - {error.message}")
     return tuple(limits)
+
+
+def _cites_documents(state: AgentState) -> bool:
+    """本次结论是否用到了文档来源的证据。"""
+    return any(item.source_type == "DOCUMENT" for item in state.get("evidence") or ())
+
+
+def _incomplete_tables(state: AgentState) -> list[str]:
+    """只引用了一部分行的表，逐张列出来（11.7 第 ⑧ 步的缺口）。
+
+    **它是"表格按行分块"这个取舍的补丁**：一张 16 行的表变成 16 个块之后，
+    召回 8 行与召回整张表在证据列表上完全同形。实测踩到过——模型拿 8 行
+    求和当成区域合计（7,146.22 万，真值 13,249.31 万），而 Reviewer 那六条
+    确定性检查没有一条看得出证据残缺。**"数没数全"是产出的属性，不是推理的结论**，
+    所以它由代码判、不由模型判。
+
+    表名相同但文档或章节不同的表**分别列出**：两张同名的表本来就该分开说。
+    """
+    cited: dict[tuple[str, ...], set[int]] = {}
+    totals: dict[tuple[str, ...], int] = {}
+    for item in state.get("evidence") or ():
+        row = item.locator.get("table_row")
+        if not isinstance(row, list) or len(row) != 2:
+            continue
+        key = (
+            str(item.locator.get("document_id")),
+            str(item.locator.get("section_path")),
+            str(item.locator.get("table_caption")),
+        )
+        cited.setdefault(key, set()).add(int(row[0]))
+        totals[key] = int(row[1])
+
+    incomplete = [
+        (key[2], totals.get(key, 0), len(rows))
+        for key, rows in cited.items()
+        if len(rows) < totals.get(key, 0)
+    ]
+    listed = incomplete[:_MAX_TABLE_LIMITS]
+    limits = [
+        f"表格「{caption}」共 {total} 行，本次证据只覆盖其中 {cited_rows} 行："
+        "不得用这些行求和当作整表合计，该表的汇总值需查数据库或查阅原文"
+        for caption, total, cited_rows in listed
+    ]
+    if len(incomplete) > len(listed):
+        # **截断时如实说还差几条**：静默截断会让读者以为列出来的就是全部，
+        # 而那正是这条限制要防的错觉。
+        limits.append(f"另有 {len(incomplete) - len(listed)} 张表的证据同样不完整，未逐条列出")
+    return limits
+
+
+def _scope_limitation(result: StepResult) -> str:
+    """数据权限导致的空结果，**单出一条**限制。
+
+    写"可能源于授权范围"而不是"没有这个数据"：从一次执行的结果上，
+    这两种原因本来就分不出来——把其中一种写成结论，等于替用户做了一个
+    我们并没有依据的判断。而"需要与数据负责人确认"是此刻唯一可行动的下一步。
+    """
+    scope = "、".join(result.data_scope or ())
+    return (
+        f"{result.step_id}已按数据权限限定在 {scope}：未取得结果可能源于"
+        "授权范围而非数据不存在，两者从本次执行无法区分，需确认权限后再下结论"
+    )
 
 
 def _no_evidence_limitations(state: AgentState) -> list[str]:

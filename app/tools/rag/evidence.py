@@ -123,6 +123,11 @@ def _evidence_of(chunk: RetrievedChunk, *, question: str, retrieved_at: datetime
             "char_end": meta.char_end,
             "is_table": meta.is_table,
             "table_caption": meta.table_caption,
+            # 表格行块在整张表里的位置 `[第几行, 共几行]`（11.7 第 ⑧ 步的前一半）。
+            # **非表格块为 None**：那表示"这一条不是表格的一部分"，
+            # 不是"表有 0 行"。下游据它判断证据是否只覆盖了表的一部分——
+            # 少了它，"拿 8 行求和当区域合计"这件事在产物上看不出来。
+            "table_row": list(chunk.table_row) if chunk.table_row else None,
             # 原始生效日期进 locator：`event_time` 需要闭合区间，
             # 而只有起始日的制度给不出终止日（见模块 docstring）
             "effective_from": meta.effective_from.isoformat() if meta.effective_from else None,

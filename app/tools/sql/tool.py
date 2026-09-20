@@ -244,6 +244,7 @@ class SqlQueryTool:
             data_time_range=validated.data_time_range,
             warnings=tuple(validated.rewrites)
             + (("已按当前账号的数据权限限定查询范围",) if validated.scope_injected else ()),
+            data_scope=_applied_scope(validated, ctx.permission_scope),
             schema_version=self.catalog.version,
         )
         evidence = build_evidence(
@@ -345,7 +346,15 @@ class SqlQueryTool:
             )
             return _Outcome(
                 attempts=tuple(attempts),
-                result=self._assemble(call_id, validated, execution, candidate, context, attempts),
+                result=self._assemble(
+                    call_id,
+                    validated,
+                    execution,
+                    candidate,
+                    context,
+                    attempts,
+                    ctx.permission_scope,
+                ),
             )
 
     async def _repair(
@@ -368,6 +377,7 @@ class SqlQueryTool:
         candidate: StructuredResult[SqlCandidate],
         context: SchemaContext,
         attempts: list[SqlAttempt],
+        scope: PermissionScope,
     ) -> SqlToolResult:
         """把三样东西拼成 `SqlToolResult`。
 
@@ -405,6 +415,7 @@ class SqlQueryTool:
             metric_codes=self._metric_codes(candidate, context),
             metric_definitions=self._metric_definitions(candidate, context),
             warnings=tuple(warnings),
+            data_scope=_applied_scope(validated, scope),
             attempts=tuple(attempts),
             schema_version=self.catalog.version,
         )
@@ -438,6 +449,17 @@ class SqlQueryTool:
 # ------------------------------------------------------------------ 结果构造
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _applied_scope(validated: ValidatedSql, scope: PermissionScope) -> tuple[str, ...] | None:
+    """本次查询**实际**被服务端谓词限定到的区域；没限定就是 `None`。
+
+    判据取 `scope_injected` 而不是「权限范围是否为空」：一个受限用户查了
+    一张没有 `scope_column` 的表时，谓词根本没注入，此时把范围报出去，
+    下游就会把空结果归因到一条并不存在的限制上——那是另一种误导，
+    只是方向反了。
+    """
+    return tuple(scope.region_ids) if validated.scope_injected else None
 
 
 def _success_result(

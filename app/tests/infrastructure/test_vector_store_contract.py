@@ -371,3 +371,56 @@ async def test_payload_round_trips(store: VectorStore) -> None:
     assert hits[0].chunk_id == "chk_0000"
     assert hits[0].payload["text"] == "第 0 条分块"
     assert hits[0].payload["document_id"] == "doc_a"
+
+
+# ------------------------------------------------------------------ fetch
+
+
+async def test_fetch_returns_chunks_not_scores(store: VectorStore) -> None:
+    """`fetch` 是**按定位取块**，不是检索：没有查询、没有打分。
+
+    所以它返回 `ChunkRecord` 而不是 `ScoredPoint`——后者的 `score` 填 0.0
+    会被读成"和问题完全无关"，而这一路压根没有相关性可言。
+    """
+    await _seed(store)
+
+    records = await store.fetch(ChunkFilter(document_ids=("doc_a",)), limit=10)
+
+    assert sorted(r.chunk_id for r in records) == ["chk_0000", "chk_0001", "chk_0002"]
+    assert records[0].text.startswith("第 ")
+    assert records[0].payload["document_id"] == "doc_a"
+
+
+async def test_fetch_honours_the_limit_without_paging(store: VectorStore) -> None:
+    """`limit` 是**截断**不是分页：给几条就是几条，不返回游标。"""
+    await _seed(store)
+
+    records = await store.fetch(ChunkFilter(document_ids=("doc_a",)), limit=2)
+
+    assert len(records) == 2
+
+
+async def test_fetch_applies_the_same_filters_as_search(store: VectorStore) -> None:
+    """过滤条件与检索**共用同一套语义**——两条路各写一份必然漂移。
+
+    这里用状态位：默认的 `ChunkFilter` 只要 ACTIVE，PROCESSING 的必须取不到。
+    """
+    await store.upsert(
+        [_point(9, dense=[1.0, 0.0, 0.0, 0.0], sparse={1: 1.0}, status="PROCESSING")]
+    )
+
+    default = await store.fetch(ChunkFilter(document_ids=("doc_a",)), limit=10)
+    staging = await store.fetch(ChunkFilter(document_ids=("doc_a",), status="PROCESSING"), limit=10)
+
+    assert "chk_0009" not in [r.chunk_id for r in default]
+    assert [r.chunk_id for r in staging] == ["chk_0009"]
+
+
+async def test_fetch_requires_a_document_scope(store: VectorStore) -> None:
+    """**没有文档定位就取不到块**——这是它与"枚举全库"的分界线。
+
+    空过滤在两个实现里都跑得通（Qdrant 侧就是全库扫描），
+    所以这条只能靠显式拒绝来守；靠文档约定守不住，因为不报错。
+    """
+    with pytest.raises(ValueError, match="document_ids"):
+        await store.fetch(ChunkFilter(), limit=10)

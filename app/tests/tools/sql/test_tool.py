@@ -14,6 +14,7 @@ from sqlalchemy.exc import InvalidRequestError, OperationalError, StatementError
 
 from app.core.config import Settings
 from app.domain.evidence import Evidence
+from app.domain.user import PermissionScope
 from app.tests.fakes import FakeModelGateway, FakeSqlRunner
 from app.tools.base import ToolContext
 from app.tools.sql.executor import SqlExecutionError, _sanitize_db_error
@@ -239,6 +240,67 @@ class TestEmptyAndTruncated:
         result = await tool.execute(ARGS, ctx)
 
         assert any("数据权限" in w for w in (result.payload or {})["warnings"])
+
+    async def test_data_scope_is_a_field_not_just_a_warning(
+        self, tool: SqlQueryTool, gateway: FakeModelGateway, runner: FakeSqlRunner, ctx: ToolContext
+    ) -> None:
+        """空结果 + 数据权限 = 「你看不到」，不是「没有这个数据」。
+
+        `warnings` 那句是给人读的提示串，下游节点没法据它做判断；
+        判定要的是一个字段，而且空结果按 `build_evidence` 的设计不产证据，
+        证据里那份 `data_scope` 标注此刻也是空的——这个字段是唯一带得走的一份。
+        """
+        gateway.responses = [_candidate()]
+        runner.results = [_result([])]
+
+        payload = (await tool.execute(ARGS, ctx)).payload or {}
+
+        assert payload["is_empty"] is True
+        assert payload["data_scope"] == ["华东"]
+
+    async def test_unrestricted_query_records_no_scope(
+        self,
+        tool: SqlQueryTool,
+        gateway: FakeModelGateway,
+        runner: FakeSqlRunner,
+        ctx: ToolContext,
+        unrestricted: PermissionScope,
+    ) -> None:
+        """不限数据范围时必须是 `None`，不是空列表。
+
+        空列表会是「限定成零个区域」——一种不存在的权限；写成它，下游就会
+        把空结果归因到一条根本没施加过的限制上，那是方向相反的另一种误导。
+        """
+        gateway.responses = [_candidate()]
+        runner.results = [_result([])]
+
+        result = await tool.execute(ARGS, ctx.model_copy(update={"permission_scope": unrestricted}))
+
+        assert (result.payload or {})["data_scope"] is None
+
+    async def test_query_without_scoped_table_records_no_scope(
+        self, tool: SqlQueryTool, gateway: FakeModelGateway, runner: FakeSqlRunner, ctx: ToolContext
+    ) -> None:
+        """受限用户查一张没有 `scope_column` 的表：谓词没注入，就不该报范围。
+
+        判据取「谓词是否真的注入了」而不是「权限范围是否为空」——后者会把
+        「这次没施加限制」与「这个用户不受限」混成一件。`dim_channel` 在目录里
+        没有 `scope_column`（区域对渠道维度不成立），正是这一路。
+        """
+        gateway.responses = [
+            _candidate(
+                sql="SELECT channel_name FROM dim_channel",
+                selected_tables=["dim_channel"],
+                selected_columns=["channel_name"],
+                metric_codes=[],
+                expected_columns=["channel_name"],
+            )
+        ]
+        runner.results = [_result([])]
+
+        result = await tool.execute(ARGS, ctx)
+
+        assert (result.payload or {})["data_scope"] is None
 
 
 class TestSelfRepair:

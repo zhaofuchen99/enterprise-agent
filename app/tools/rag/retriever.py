@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from app.core.config import Settings
@@ -58,7 +58,7 @@ from app.core.errors import AgentError, ErrorCode
 from app.domain.knowledge import DocumentStatus
 from app.domain.user import PermissionScope
 from app.infrastructure.model_gateway import ModelGateway
-from app.infrastructure.vector_store import ChunkFilter, ScoredPoint, VectorStore
+from app.infrastructure.vector_store import ChunkFilter, ChunkRecord, ScoredPoint, VectorStore
 from app.tools.rag.metadata import ChunkMetadata
 from app.tools.rag.prompts import QUERY_REWRITE_PROMPT
 from app.tools.rag.reranker import Reranker
@@ -249,6 +249,11 @@ class Retriever:
             else best_dense < tuning.score_threshold or bool(unseen)
         )
 
+        # ⑧ 的**前一半**：给存活下来的表格行块标出它在整张表里的位置。
+        # 放在拒答判定**之后**：判为没有相关知识时一个候选都不返回，
+        # 为它们去扫存储层是白花的往返。
+        selected = () if no_relevant else await self._with_table_rows(ranked.chunks, chunk_filter)
+
         outcome = RetrievalOutcome(
             queries=queries,
             rewrite_degraded=degraded,
@@ -257,7 +262,7 @@ class Retriever:
             # 「检索为空时显式返回 NO_RELEVANT_KNOWLEDGE」，而只要候选还在，
             # 下游就有机会把它当成证据用——"不让生成节点补写制度"这条纪律
             # 靠的是**没有东西可写**，不是靠调用方自觉。
-            candidates=() if no_relevant else ranked.chunks,
+            candidates=selected,
             relevance_threshold=tuning.score_threshold,
             best_dense_score=best_dense,
             unseen_topics=unseen,
@@ -270,6 +275,66 @@ class Retriever:
             duration_ms=_elapsed_ms(started),
         )
         return outcome
+
+    # ------------------------------------------------------------- ⑧ 表格行定位
+    async def _with_table_rows(
+        self, chunks: Sequence[RetrievedChunk], chunk_filter: ChunkFilter
+    ) -> tuple[RetrievedChunk, ...]:
+        """给表格行块标出它在整张表里的位置（11.7 第 ⑧ 步的**前一半**）。
+
+        ## 它解决的是什么
+
+        表格按行分块（11.3 的取舍，理由是"一行脱离表头就不可解读"），
+        代价是**表不再是一个能被整体推理的对象**：召回 8 行与召回整张表
+        在检索结果里长得一模一样。模型于是拿着 8 行去求和、当成区域合计——
+        实测踩到过（2026-09-20，华南 Q3：8 行求和 7,146.22 万，
+        真值 13,249.31 万，而 Reviewer 给了 100 分）。
+
+        ## 为什么只标注、不补块
+
+        补块是第 ⑧ 步的**后一半**（"确有上下文缺口时扩展"），它会改变候选集合、
+        因而改变召回指标，需要重跑 `make eval-rag`——属独立工作量。
+        而"让下游知道证据不完整"这一步不需要它：缺口事实一旦写进证据，
+        下游就能拒绝把部分行当合计，错误答案当场消失。
+
+        ## 数出来的行数是"存储里的"行数
+
+        按 `(章节路径, 表名)` 分组数块。**表名不是可过滤的标量字段**
+        （`ChunkFilter` 里没有它，payload 索引里也没有），所以只能取回整份文档
+        再在内存里分——这也是 `VectorStore.fetch` 要求 `document_ids` 非空的原因。
+        """
+        tables = [item for item in chunks if item.metadata.is_table]
+        if not tables:
+            return tuple(chunks)
+
+        positions = await self._table_positions(tables, chunk_filter)
+        return tuple(
+            item.model_copy(update={"table_row": positions[item.chunk_id]})
+            if item.chunk_id in positions
+            else item
+            for item in chunks
+        )
+
+    async def _table_positions(
+        self, tables: Sequence[RetrievedChunk], chunk_filter: ChunkFilter
+    ) -> dict[str, tuple[int, int]]:
+        """`{chunk_id: (第几行, 共几行)}`，行号 1 起。
+
+        **按整份文档取一次，不是按表逐个取**：表名不可过滤（见上），
+        逐表取也只能取回整份文档再筛，那就退化成一表一次往返。
+        """
+        limit = self._settings.rag.table_scan_limit
+        positions: dict[str, tuple[int, int]] = {}
+        for document_id in dict.fromkeys(item.metadata.document_id for item in tables):
+            # 沿用本次检索的过滤条件（状态、角色、有效期），只把文档收窄：
+            # 换一套条件去数，数出来的可能是**另一批**块——
+            # 而"这张表有几行"必须与"我能不能看到它们"用同一把尺子。
+            records = await self._store.fetch(
+                chunk_filter.model_copy(update={"document_ids": (document_id,)}), limit=limit
+            )
+            for chunk_id, index, total in _group_table_rows(records):
+                positions[chunk_id] = (index, total)
+        return positions
 
     # ------------------------------------------------------------------ ② 改写
     async def _rewrite(self, args: RagQueryArgs) -> tuple[tuple[str, ...], bool]:
@@ -415,6 +480,32 @@ class Retriever:
 
 
 # ------------------------------------------------------------------ 融合与组装
+
+
+def _group_table_rows(records: Sequence[ChunkRecord]) -> Iterator[tuple[str, int, int]]:
+    """一份文档的块 → 逐条 `(chunk_id, 第几行, 共几行)`，只吐表格行块。
+
+    分组键是 `(章节路径, 表名)`，行序按 `char_start`。**跨页表格因此是连续的**：
+    11.3 的表头还原保证了同表各行的序列化形态一致，而原文位置本来就是有序的。
+    按 `page_no` 再切一刀会把跨页表格断成两张，那正是表头还原要修的东西。
+
+    ⚠️ 同一章节里出现**两张同名表**时它们会并成一张。本语料没有这种形态，
+    而"不把跨页表格切断"更要紧——两者不可兼得时取不切断。
+    """
+    groups: dict[tuple[tuple[str, ...], object], list[ChunkRecord]] = {}
+    for record in records:
+        if not record.payload.get("is_table"):
+            continue
+        key = (
+            tuple(record.payload.get("section_path") or ()),
+            record.payload.get("table_caption"),
+        )
+        groups.setdefault(key, []).append(record)
+    for group in groups.values():
+        ordered = sorted(group, key=lambda item: item.payload.get("char_start") or 0)
+        total = len(ordered)
+        for index, record in enumerate(ordered, start=1):
+            yield record.chunk_id, index, total
 
 
 def _fuse(

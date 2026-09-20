@@ -401,6 +401,19 @@ class SqlToolResult(BaseModel):
     metric_codes: tuple[str, ...] = ()
     metric_definitions: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: 本次查询**实际**被服务端谓词限定到的区域（详设 10.4 第 11 步）。
+    #:
+    #: `None` 表示没有施加任何限制，两种情况都归到它：调用者本就不受限，
+    #: 或这条查询没落到带 `scope_column` 的表上。两者对下游是同一件事——
+    #: **空结果不能归因于数据权限**。空元组不会出现：限定成"零个区域"
+    #: 不是一种权限。
+    #:
+    #: 有值时下游必须把它写进限制。缺了它，`has_no_values` 判出来的
+    #: 「查询未命中任何数据」会被读成"公司没有这个数据"，而真相是
+    #: "你看不到这个数据"——两者处置相反：前者要换数据源，后者要找
+    #: 数据负责人。⚠️ `warnings` 里那句「已按当前账号的数据权限限定
+    #: 查询范围」不能替代它：那是给人读的提示串，而这是可判断的字段。
+    data_scope: tuple[str, ...] | None = None
     #: 本次查询的全部尝试，供 Tool 执行器逐条写 `agent_tool_call`
     attempts: tuple[SqlAttempt, ...] = ()
     #: 生成 SQL 时使用的 Schema 目录版本，进 Trace 便于「昨天还能查今天不行」的排查
