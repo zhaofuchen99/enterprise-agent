@@ -655,14 +655,39 @@ def _example_from_schema(node: Any, defs: dict[str, Any], depth: int = 0) -> Any
         # Literal / Enum：取第一个取值，模型据此知道合法取值长什么样
         return node["enum"][0]
 
-    # `Optional[X]` 在 Pydantic 里生成 `anyOf: [X, {type: null}]`，
-    # 取第一个非 null 分支，示例才是有内容的
+    # `Optional[X]` 在 Pydantic 里生成 `anyOf: [X, {type: null}]`。
+    #
+    # **可空字段的示例给 `null`，不给 X 构造出来的具体值。** 这条规则是按
+    # 「模型照抄示例的后果」定的，不是按"示例要有内容"定的：
+    #
+    # - **照抄 `null` 得到正确语义**（这个字段可以没有），
+    # - 照抄一个具体值得到的是**看起来合法、实际错误**的值。
+    #
+    # 实测（2026-09-20）：`time_range` 的示例原本是 `{"start": "", "end": ""}`，
+    # 模型把"这个问题没有时间"原样写成那个空串 → 校验失败（整条任务挂）。
+    # 把示例改成合法日期之后，**它开始照抄那个日期** → 意图里凭空多出
+    # "2025-01-01 到 2025-01-01"，会真的去过滤文档生效期、把 v2.0 滤掉，
+    # 而且**没有任何报错**。间歇发生，比稳定报错危险得多。
     for key in ("anyOf", "oneOf"):
         if key in node:
-            options = [o for o in node[key] if o.get("type") != "null"] or node[key]
-            return _example_from_schema(options[0], defs, depth + 1)
+            if any(option.get("type") == "null" for option in node[key]):
+                return None
+            return _example_from_schema(node[key][0], defs, depth + 1)
 
     node_type = node.get("type")
+    if node_type == "string":
+        # **示例必须是"这个字段合法取值"，否则模型会照着它填出一个非法值。**
+        # 实测踩到（2026-09-20）：`date` 字段的示例原来是空串 `""`，
+        # 于是模型把「没有时间」原样写成 `{"start": "", "end": ""}`，
+        # Pydantic 判非法 → `MODEL_OUTPUT_INVALID` → 整条任务失败。
+        # 症状具有极强的误导性：**只有不含明确年份的问题会挂**
+        # （带"2025年Q3"的问题模型会填真日期，看起来一切正常）。
+        if node.get("format") == "date":
+            return "2025-01-01"
+        if node.get("format") == "date-time":
+            return "2025-01-01T00:00:00Z"
+        # 同理：声明了非空下限的字段给空串也是**注定非法**
+        return "示例" if int(node.get("minLength") or 0) > 0 else ""
     if node_type == "object" or "properties" in node:
         return {
             key: _example_from_schema(value, defs, depth + 1)
@@ -676,8 +701,6 @@ def _example_from_schema(node: Any, defs: dict[str, Any], depth: int = 0) -> Any
         return 0.0
     if node_type == "boolean":
         return False
-    if node_type == "string":
-        return ""
     return None
 
 

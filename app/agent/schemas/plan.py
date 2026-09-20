@@ -20,9 +20,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domain.evidence import TimeRange
 
@@ -143,6 +143,25 @@ class IntentResult(BaseModel):
     """
 
     model_config = ConfigDict(extra="ignore")
+
+    @field_validator("time_range", mode="before")
+    @classmethod
+    def _empty_time_range_means_none(cls, value: Any) -> Any:
+        """`{"start": "", "end": ""}` → `None`（**"没给时间"不是"给错了"**）。
+
+        模型表达"这个问题没有时间"时，惯用写法是留空串，而不是省略字段。
+        空串不携带任何信息，而本字段的 `None` 本来就表示"不限时点"——
+        两者语义相同，因此这里归一化而不是判非法。
+
+        **不这样做的话，症状极具误导性**（2026-09-20 实测）：只有"不含明确年份"
+        的问题会整条任务失败（`MODEL_OUTPUT_INVALID`），而带"2025年Q3"的问题
+        一切正常——看起来像是"检索坏了"或"某些问题查不出来"。
+        根因已同时修掉（`build_json_contract` 不再拿空串当日期示例），
+        这一层是防御：模型仍可能这么写，而**它确实是可理解的输入**。
+        """
+        if isinstance(value, dict) and not any(str(item or "").strip() for item in value.values()):
+            return None
+        return value
 
     intent: Intent
     metrics: tuple[str, ...] = ()

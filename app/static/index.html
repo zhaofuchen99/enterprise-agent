@@ -36,7 +36,11 @@
   header {
     display: flex; align-items: center; gap: 12px; padding: 14px 20px;
     border-bottom: 1px solid var(--line); background: var(--panel);
+    /* **允许换行**：登录区固定在右侧时，窄窗口会把它挤出可视区——
+       而"按钮被挤出去了"的观感是"这个页面没做完"，不是"窗口太窄" */
+    flex-wrap: wrap;
   }
+  #login { flex-wrap: wrap; }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; }
   header .spacer { flex: 1; }
   .badge {
@@ -115,7 +119,8 @@
     </div>
     <div class="chips" id="chips"></div>
     <h2 style="margin-top:16px">执行时间线（SSE 实时）</h2>
-    <div class="timeline" id="timeline"><div class="empty">提问后，这里会一条条出现后端正在做的事。</div></div>
+    <div class="timeline" id="timeline"><div class="empty">提问后，这里会一条条出现后端正在做的事。<br>
+      （首次提问会自动登录右上角那个演示账号）</div></div>
   </section>
 
   <section class="panel">
@@ -155,6 +160,16 @@ async function login() {
   $("conn").textContent = "已认证"; $("conn").className = "badge ok";
 }
 
+/**
+ * 没登录就先登录。**默认演示口令已经预填在输入框里**，所以"必须先点一下登录"
+ * 只是多一个失败点——第一次提问时自动完成，登录态过期时也自动重来一次。
+ * 登录按钮保留：换账号（analyst / admin）时要能显式切。
+ */
+async function ensureToken() {
+  if (state.accessToken) return;
+  await login();
+}
+
 /** 统一调用：所有响应都是 `{code, message, data, trace_id}` 外壳。 */
 async function api(method, path, body, auth = true) {
   const headers = {};
@@ -180,13 +195,16 @@ async function ask() {
   $("askBtn").disabled = true;
 
   try {
+    await ensureToken();
     const created = await api("POST", "/api/agent/chat", { message: question });
     state.taskId = created.data.task_id;
     $("taskLine").textContent = `任务 ${state.taskId}`;
     const token = await api("POST", `/api/agent/tasks/${state.taskId}/stream-token`, null);
     subscribe(token.data.stream_url);
   } catch (err) {
-    $("taskLine").innerHTML = `<span class="err">${escapeHtml(err.message)}</span>`;
+    // 登录失败（口令不对）与业务失败要分开说：前者要重新填口令，后者看后端码
+    const hint = state.accessToken ? "" : "（登录失败，请检查右上角的口令）";
+    $("taskLine").innerHTML = `<span class="err">${escapeHtml(err.message)}${hint}</span>`;
     $("askBtn").disabled = false;
   }
 }
@@ -221,6 +239,7 @@ function onEvent(kind, raw) {
   let payload = {};
   try { payload = JSON.parse(raw); } catch (e) { /* 帧坏了不该让整页挂掉 */ }
   if (kind === "done") {
+    // `done` 由订阅端发出、不是 18.1 事件 → `final_status` 平铺在顶层
     $("status").textContent = payload.final_status || "";
     $("status").className = `status ${payload.final_status || ""}`;
     $("conn").textContent = "事件流已结束"; $("conn").className = "badge ok";
@@ -237,15 +256,20 @@ function onEvent(kind, raw) {
 function addRow(kind, payload) {
   const line = document.createElement("div");
   const ms = Math.round(performance.now() - state.startedAt);
+  // **两层结构，别猜**：18.1 的业务事件把领域字段放在 `data` 里
+  // （`payload.data.step_count`），而 `snapshot` / `done` / `heartbeat`
+  // 是订阅端直接发的、字段平铺。用"有没有 `type`"区分——
+  // 实测踩到：全按顶层读时，`plan.created` 会显示成「undefined 步」。
+  const body = payload.type ? (payload.data || {}) : payload;
   const node = payload.node || "";
   const cls = kind.startsWith("node.") ? "node" : kind.startsWith("task.") ? "task" : "";
-  const duration = payload.duration_ms != null ? `${payload.duration_ms}ms` : "";
+  const duration = body.duration_ms != null ? `${body.duration_ms}ms` : "";
   let detail = "";
-  if (kind === "plan.created") detail = `${payload.step_count} 步：${(payload.tool_types || []).join("、")}`;
-  else if (kind === "progress.assessed") detail = `${payload.decision}｜${(payload.finding_statement || "").slice(0, 40)}`;
-  else if (kind === "review.completed") detail = `${payload.status}｜${payload.score} 分｜${payload.issue_count} 条问题`;
-  else if (kind === "clarification.required") detail = payload.question || "";
-  else if (kind === "snapshot") detail = `${payload.status}${payload.replay_lost ? "（历史已被清理）" : ""}`;
+  if (kind === "plan.created") detail = `${body.step_count} 步：${(body.tool_types || []).join("、")}`;
+  else if (kind === "progress.assessed") detail = `${body.decision}｜${(body.finding_statement || "").slice(0, 40)}`;
+  else if (kind === "review.completed") detail = `${body.status}｜${body.score} 分｜${body.issue_count} 条问题`;
+  else if (kind === "clarification.required") detail = body.question || "";
+  else if (kind === "snapshot") detail = `${body.status}${body.replay_lost ? "（历史已被清理）" : ""}`;
   line.className = `tl ${cls} ${kind === "done" ? "end" : ""}`;
   line.innerHTML =
     `<span class="t">${(ms / 1000).toFixed(2)}s</span>` +
