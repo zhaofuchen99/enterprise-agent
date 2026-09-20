@@ -146,8 +146,13 @@ eval-rag:  ## 跑 RAG 金标 20 条，产出 Recall@8 与定位一致率（前�
 	uv run python scripts/eval_rag.py $(if $(ONLY),--only $(ONLY),)
 calibrate-rerank:  ## 校准重排阈值：打印 20+3 条的分数分布与可用区间（前置：RERANKER_ENABLED=true）
 	uv run python scripts/calibrate_rerank.py
-demo:  ## 端到端演示六条固化问题（前置：另一个终端跑 make run）
-	uv run python scripts/demo.py $(if $(ONLY),--only $(ONLY),) $(if $(BASE),--base $(BASE),)
+demo:  ## 端到端演示九条固化问题（前置：另一个终端跑 make run）
+	uv run python scripts/demo.py $(if $(ONLY),--only $(ONLY),) $(if $(BASE),--base $(BASE),) $(if $(ASK),--ask "$(ASK)",)
+
+# 账号变量叫 ACCOUNT 不叫 AS：`AS` 是 make 的**内建变量**（汇编器命令，
+# 值就是 "as"），`$(if $(AS),...)` 因此恒为真，命令会变成 `--as as`。
+demo-ask:  ## 先跑一遍再固化：make demo-ask Q="某条还没固化的问题" [ACCOUNT=analyst]
+	uv run python scripts/demo.py --ask "$(Q)" $(if $(ACCOUNT),--as $(ACCOUNT),)
 verify-corpus:  ## 断言 10 类缺陷真的注入了产物（不是清单标注），任一失败即非零（前置：make ingest）
 	uv run python -m app.cli verify-corpus
 

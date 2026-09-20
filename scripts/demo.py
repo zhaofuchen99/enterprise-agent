@@ -2,7 +2,8 @@
 
 ```bash
 make run          # 另开一个终端：api + worker
-make demo         # 跑固化下来的六条问题
+make demo         # 跑固化下来的九条问题
+make demo-ask Q="某条还没固化的问题"  # 先跑一遍再固化（本文件自己的纪律）
 make demo ONLY=demo-cross
 ```
 
@@ -51,9 +52,8 @@ DEMO_PATH = Path("configs/demo_questions.yaml")
 #: "华东之外的数据被权限挡掉"而出现看不懂的空结果——那不是系统坏了，
 #: 但演示时解释它要花掉半分钟。
 DEMO_USERNAME = "admin"
-DEMO_PASSWORD = next(
-    password for username, password, _, _ in DEMO_ACCOUNTS if username == DEMO_USERNAME
-)
+#: `{username: password}`，同样从 `DEMO_ACCOUNTS` 取（见上）
+_PASSWORDS = {username: password for username, password, _, _ in DEMO_ACCOUNTS}
 
 #: 单条任务最多等多久。图的正常耗时在 30–90 秒（含两次模型调用与一次检索），
 #: 给 180 秒是留足余量又能在真的卡住时很快报出来。
@@ -83,6 +83,26 @@ class Outcome:
 #: "通了但报错"两类。演示脚本的异常处理越短越好——它出问题时
 #: 正是在有人看着的时候。
 _TIMEOUT = httpx.Timeout(30.0)
+
+
+#: `{username: token}`。**按账号缓存**：一条用例可以选择用它自己的账号跑
+#: （见 `configs/demo_questions.yaml` 的 `account`），而反复登录既慢又没必要。
+_TOKENS: dict[str, str] = {}
+
+
+def _login(base: str, username: str) -> str:
+    """登录并缓存 token。口令从 `DEMO_ACCOUNTS` 取，不在这里再抄一份。"""
+    if username not in _PASSWORDS:
+        # 账号写错时报出**有哪些账号**，而不是一个裸的 `KeyError`：
+        # 这条路径只有改 `configs/demo_questions.yaml` 时才会走到，
+        # 而那时人正盯着 YAML 找拼写。
+        raise SystemExit(f"演示账号 {username!r} 不存在，只有：{sorted(_PASSWORDS)}")
+    if username not in _TOKENS:
+        password = _PASSWORDS[username]
+        _TOKENS[username] = _post(
+            f"{base}/api/auth/login", {"username": username, "password": password}
+        )["data"]["access_token"]
+    return _TOKENS[username]
 
 
 def _post(url: str, payload: dict[str, Any], *, token: str | None = None) -> dict[str, Any]:
@@ -251,22 +271,54 @@ def _wait(token: str, task_id: str, *, base: str) -> dict[str, Any]:
     raise TimeoutError(f"任务 {task_id} 在 {_TASK_TIMEOUT_SECONDS} 秒内没有结束")
 
 
+def _ask(base: str, token: str, question: str) -> int:
+    """跑一个**还没固化的**问题，把写 `expect_*` 需要的事实打出来。
+
+    存在的理由是本项目自己的一条纪律：**演示问题必须先用真链路跑一遍再固化**，
+    否则固化的是"我以为会怎样"——语料里那条「2024年1月」就是这么踩出来的
+    （那一年恰好有数据，根本不触发演进）。没有这个入口时，写一条新用例
+    要先手改 YAML 再跑 `--only`，而"先跑一遍"就变成了"先猜一遍"。
+    """
+    created = _post(f"{base}/api/agent/chat", {"message": question}, token=token)["data"]
+    detail = _wait(token, created["task_id"], base=base)
+    steps = [step for step in detail.get("steps") or [] if step.get("status") != "PENDING"]
+    print(f"任务 {detail['status']}｜id {created['task_id']}")
+    print(f"走了：{sorted({step['tool'] for step in steps})}")
+    print(f"refused：{detail.get('refused')}｜冲突 {len(detail.get('conflicts') or [])} 条")
+    print("限制与未覆盖：")
+    for item in detail.get("limitations") or []:
+        print(f"  - {item}")
+    # **照**基准单位**填 `expect_numbers`**（判据会按单位还原答案里的数）。
+    # 列表里混着年份与百分比等噪声，抄之前先认出哪个是要断言的那个值。
+    print("答案里出现的数（含年份/百分比等噪声）：")
+    for value in sorted(_amounts(detail.get("final_answer_md") or "")):
+        print(f"  - {value}")
+    print("─" * 78)
+    print(detail.get("final_answer_md") or "")
+    return 0 if detail["status"] == "SUCCEEDED" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="端到端演示（需 make run 已在跑）")
     parser.add_argument("--base", default="http://127.0.0.1:8000", help="API 地址")
     parser.add_argument("--only", default="", help="只跑指定 ID，逗号分隔")
+    parser.add_argument(
+        "--ask", default="", help="跑一个还没固化的问题，打印写 expect_* 所需的事实"
+    )
+    parser.add_argument("--as", dest="ask_as", default="", help="以哪个演示账号跑 --ask")
     args = parser.parse_args(argv)
 
     try:
-        token = _post(
-            f"{args.base}/api/auth/login", {"username": DEMO_USERNAME, "password": DEMO_PASSWORD}
-        )["data"]["access_token"]
+        _login(args.base, args.ask_as or DEMO_USERNAME)
     except (httpx.HTTPError, OSError) as exc:
         # **说出该跑什么**，而不是抛一个连接异常。演示脚本的报错信息
         # 是"下一步做什么"，不是"哪里错了"。
         print(f"连不上 API（{args.base}）：{exc}", file=sys.stderr)
         print("先在另一个终端跑 `make run`（只跑 make api 的话任务会永远停在 QUEUED）")
         return 2
+
+    if args.ask:
+        return _ask(args.base, _login(args.base, args.ask_as or DEMO_USERNAME), args.ask)
 
     cases = _load_cases(args.only)
     if not cases:
@@ -277,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
     for case in cases:
         print(f"\n{'=' * 78}\n▶ {case['id']}：{case['question']}")
         try:
+            # **每条用例可以指定账号**（默认 admin）。权限相关的行为只有换一个
+            # 受限账号才演示得出来——"同一个问题，两个账号看到的限制不同"
+            # 本身就是一句话能讲清、且别处看不到的东西。
+            token = _login(args.base, case.get("account") or DEMO_USERNAME)
             created = _post(
                 f"{args.base}/api/agent/chat", {"message": case["question"]}, token=token
             )["data"]
