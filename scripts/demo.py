@@ -26,9 +26,11 @@ HTTP → 限流 → 入库 → 队列 → Worker 领取 → 图 → 写回 → �
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +107,71 @@ def _load_cases(only: str) -> list[dict[str, Any]]:
     return cases
 
 
+#: 数值断言里的数字。**带单位**——语料与答案里「万元」「亿元」是常态，
+#: 不认单位会让一条正确的「11,196.70 万元」判成错的。
+_NUMBER = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(亿元|亿|万元|万|千元|千)?")
+
+#: 中文数词的单位倍率
+_UNITS: dict[str, Decimal] = {
+    "亿": Decimal(10**8),
+    "亿元": Decimal(10**8),
+    "万": Decimal(10**4),
+    "万元": Decimal(10**4),
+    "千": Decimal(10**3),
+    "千元": Decimal(10**3),
+}
+
+#: 数值断言的**相对**容差。
+#:
+#: 取 0.1% 是因为**单位换算必然带来舍入**：真实值 111,967,031.73 元
+#: 写成「11,196.70 万元」只差 0.0003%。而真正的算错差得远不止这个量级——
+#: 实测那次把 8 行明细当成区域合计，差了 46%。
+#: 两者之间有五个数量级的空档，阈值取在哪儿都不影响判定，取一个能容下
+#: 舍入的值即可。
+_NUMBER_TOLERANCE = Decimal("0.001")
+
+
+def _amounts(text: str) -> list[Decimal]:
+    """答案里出现的所有金额（**按单位还原成基准值**）。
+
+    不还原单位的话，「1.12 亿」与「111,967,031.73」会被当成两个不相关的数，
+    而它们说的是同一件事——**断言会因为写法不同而误报**，
+    那种红叉比没有断言更糟（它会让人开始忽略断言）。
+    """
+    found: list[Decimal] = []
+    for raw, unit in _NUMBER.findall(text):
+        try:
+            value = Decimal(raw.replace(",", ""))
+        except InvalidOperation:  # pragma: no cover - 正则已保证是数字
+            continue
+        found.append(value * _UNITS.get(unit, Decimal(1)))
+    return found
+
+
+def _close(found: Decimal, expected: Decimal) -> bool:
+    if expected == 0:
+        return found == 0
+    return abs(found - expected) / abs(expected) <= _NUMBER_TOLERANCE
+
+
+def _missing_amounts(answer: str, expected: list[str]) -> list[str]:
+    """`expect_numbers` 里**没有出现**在答案中的那些。
+
+    配置写错（不是数字）时直接抛——那是**这份清单自己的 bug**，
+    静默跳过会让一条永远不会生效的断言看起来一直在通过。
+    """
+    found = _amounts(answer)
+    missing: list[str] = []
+    for raw in expected:
+        try:
+            want = Decimal(str(raw).replace(",", ""))
+        except InvalidOperation as exc:
+            raise ValueError(f"demo_questions.yaml 的 expect_numbers 不是数字：{raw!r}") from exc
+        if not any(_close(value, want) for value in found):
+            missing.append(str(raw))
+    return missing
+
+
 def _evaluate(case: dict[str, Any], detail: dict[str, Any]) -> tuple[bool, str]:
     """按 `expect_*` 判定。**每条只给一个结论**——多个失败点会让报告读不出主因。
 
@@ -153,6 +220,21 @@ def _evaluate(case: dict[str, Any], detail: dict[str, Any]) -> tuple[bool, str]:
 
     if case.get("expect_conflicts") and not conflicts:
         return False, "**没有检出冲突**——而这条问题的两个来源数字本就不一致"
+
+    # **数值断言**：这是唯一能拦住「答案里的数字是错的」的判据。
+    # 其余三处门禁都测不到它——`eval-sql` 测 SQL 与金标结果集等价、
+    # `eval-rag` 测 Recall@8、`verify-corpus` 测缺陷注入，全在组件层；
+    # 而 2026-09-20 实测到的那次，**四道门禁全绿、Reviewer 给 100 分，
+    # 答案里的数是错的**（8 行明细当成区域合计，差 46%）。
+    if missing := _missing_amounts(answer, case.get("expect_numbers") or []):
+        return False, f"**答案里没有出现期望的数值**：{missing}"
+
+    if missing_limits := [
+        item
+        for item in (case.get("expect_limitations_contain") or [])
+        if item not in " ".join(detail.get("limitations") or [])
+    ]:
+        return False, f"**限制清单里缺少**：{missing_limits}"
 
     return True, f"走了 {sorted(sources)}" + (
         f"，检出 {len(conflicts)} 条冲突" if conflicts else ""

@@ -122,6 +122,34 @@ def test_same_caption_in_different_documents_stays_separate() -> None:
     assert any("共 9 行" in item for item in limits)
 
 
+def test_same_caption_different_documents_are_tellable_apart() -> None:
+    """分开说还不够，**得让人看得出为什么有两条**。
+
+    实测踩到（2026-09-20）：两张来自不同经营月报的同名表渲染成了两句话
+    一模一样的限制，读者只会以为系统重复输出了一遍——而真相是
+    "有两张同名的表，都只覆盖了一部分"。文件名要进这一句。
+    """
+    state = _state(
+        [
+            _doc_evidence(
+                table_row=(1, 4),
+                document_id="report/a@v1.0",
+                section=["2025年1月经营月报", "二、经营业绩回顾"],
+            ),
+            _doc_evidence(
+                table_row=(1, 9),
+                document_id="report/b@v1.0",
+                section=["2025年2月经营月报", "二、经营业绩回顾"],
+            ),
+        ]
+    )
+
+    limits = _incomplete_tables(state)
+
+    assert "2025年1月经营月报" in limits[0] and "2025年2月经营月报" in limits[1]
+    assert limits[0] != limits[1]
+
+
 def test_long_table_list_is_truncated_but_says_so() -> None:
     """限制清单是给人读的，列太多会把要看的那条淹掉——但**截断必须说出来**。
 

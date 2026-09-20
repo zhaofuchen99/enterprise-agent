@@ -238,31 +238,48 @@ def _incomplete_tables(state: AgentState) -> list[str]:
     所以它由代码判、不由模型判。
 
     表名相同但文档或章节不同的表**分别列出**：两张同名的表本来就该分开说。
+    ⚠️ 但**分开说就必须让人看得出区别**：实测（2026-09-20）两张来自不同
+    经营月报的同名表「分区域经营情况」渲染成了**两句话一模一样**的限制，
+    读者只会以为系统重复输出了一遍。所以文件名要进这一句。
     """
     cited: dict[tuple[str, ...], set[int]] = {}
     totals: dict[tuple[str, ...], int] = {}
+    names: dict[tuple[str, ...], str] = {}
     for item in state.get("evidence") or ():
         row = item.locator.get("table_row")
         if not isinstance(row, list) or len(row) != 2:
             continue
+        raw_section = item.locator.get("section_path")
+        # `locator` 的值类型是 `object`（详设 13.1：键按来源类型变化），
+        # 所以要先确认它真是列表——直接迭代会把 mypy 挡下，
+        # 而运行时更糟：字符串会被逐字符拆开，于是"文件名"变成第一个字，
+        # 两条限制又长得一样了。
+        section = tuple(str(part) for part in raw_section) if isinstance(raw_section, list) else ()
         key = (
             str(item.locator.get("document_id")),
-            str(item.locator.get("section_path")),
+            str(section),
             str(item.locator.get("table_caption")),
         )
         cited.setdefault(key, set()).add(int(row[0]))
         totals[key] = int(row[1])
+        # 展示名取章节路径的第一段——那一段就是文档名（见 `chunker.py`
+        # 的标题路径约定）。取不到时退回 `document_id`，**不退回空串**：
+        # 空串会让两条不同的表长得一模一样，而那正是这里要避免的。
+        names[key] = section[0] if section else str(item.locator.get("document_id"))
 
     incomplete = [
-        (key[2], totals.get(key, 0), len(rows))
+        (names.get(key, ""), key[2], totals.get(key, 0), len(rows))
         for key, rows in cited.items()
         if len(rows) < totals.get(key, 0)
     ]
+    # 按（文档, 表名）排一次序：`cited` 是插入序，而它取决于证据顺序，
+    # 同一份输入两次跑出来的清单顺序因此可能不同——限制清单是要被 diff 的。
+    incomplete.sort()
     listed = incomplete[:_MAX_TABLE_LIMITS]
     limits = [
-        f"表格「{caption}」共 {total} 行，本次证据只覆盖其中 {cited_rows} 行："
+        f"表格「{caption}」（{document}）共 {total} 行，本次证据只覆盖其中 {cited_rows} 行："
         "不得用这些行求和当作整表合计，该表的汇总值需查数据库或查阅原文"
-        for caption, total, cited_rows in listed
+        for document, caption, total, cited_rows in listed
     ]
     if len(incomplete) > len(listed):
         # **截断时如实说还差几条**：静默截断会让读者以为列出来的就是全部，
