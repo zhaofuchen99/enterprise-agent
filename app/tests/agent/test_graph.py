@@ -175,7 +175,9 @@ def _run(
     scripts: list[Any] = []
     for intent in intents:
         scripts.append(intent)
-    scripts.extend(analyses or [AnalysisResult(direct_answer="测试结论")] * len(intents))
+    scripts.extend(
+        analyses or [AnalysisResult(direct_answer="测试结论", refused=False)] * len(intents)
+    )
 
     gateway = FakeModelGateway(responses=scripts)
     graph = build_graph(settings, gateway=gateway, sql_tool=sql_tool, rag_tool=rag_tool)
@@ -401,6 +403,66 @@ async def test_unrestricted_scope_adds_no_permission_limitation(settings: Settin
 
     limits = " ".join(state["analysis_result"].limitations)
     assert "授权范围" not in limits
+
+
+async def test_no_evidence_at_all_refuses_by_code_not_by_model(settings: Settings) -> None:
+    """一条证据都没有时，`refused` **由代码置位**，不问模型。
+
+    这条路径上模型根本没被调用（把空证据列表发给它，得到的大概率是一段
+    用常识补出来的答案）。所以这个判定不可能来自模型措辞——
+    它要是靠猜，就会回到"答案里有没有那几个词"那种判据上去。
+    """
+    sql = FakeTool("sql_query", empty_as_success=True)
+    rag = FakeTool("rag_retrieve", source="DOCUMENT", empty=ErrorCode.NO_RELEVANT_KNOWLEDGE)
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph)
+
+    assert state["analysis_result"].refused is True
+    assert state["answer_payload"]["refused"] is True, (
+        "拒答必须一路走到 answer_payload —— API 与演示判据读的是那里，"
+        "而不是 `analysis_result`（见 `final._payload` 的说明）"
+    )
+
+
+async def test_model_declared_refusal_reaches_the_payload(settings: Settings) -> None:
+    """分析层拒答（检索到语义相邻的材料、但被问的那件事不在其中）由**模型**判定。
+
+    这条只有模型能判：词表与余弦分不开"语料没讲这件事"与"语料用了另一个说法"
+    （见约定 30 的同义词漏网类）。它与工具层那条路径的**共同点**是
+    结果都必须是 `refused=true`。
+    """
+    from app.agent.schemas.analysis import AnalysisResult
+
+    sql = FakeTool("sql_query", source="SQL")
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(
+        settings,
+        [_intent(["rag"])],
+        sql_tool=sql,
+        rag_tool=rag,
+        analyses=[AnalysisResult(direct_answer="证据里没有这份制度。", refused=True)],
+    )
+
+    state = await _invoke(settings, graph)
+
+    assert state["answer_payload"]["refused"] is True
+
+
+async def test_answering_normally_is_not_marked_as_refused(settings: Settings) -> None:
+    """正常作答时是 `False`。
+
+    这一条看着像废话，但它挡的是"默认值/示例被照抄成 true"那类错误：
+    照抄成 `true` 会让每一次正常回答都被下游统计成拒答，
+    而**所有回答都拒答**这件事在数字上与"系统坏了"长得一样。
+    """
+    sql = FakeTool("sql_query", source="SQL")
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+
+    state = await _invoke(settings, graph)
+
+    assert state["answer_payload"]["refused"] is False
 
 
 async def test_hard_failure_is_reported_as_an_error_not_as_empty(settings: Settings) -> None:

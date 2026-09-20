@@ -78,6 +78,7 @@ def test_a_grounded_answer_passes() -> None:
     """
     item = _evidence()
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="华东净销售额为 100。",
         claims=(_claim(evidence_ids=(item.id,)),),
         limitations=("数据截止时点未明确",),
@@ -104,6 +105,7 @@ def test_a_fact_without_evidence_is_blocking() -> None:
     而用户会拿它去做决定。
     """
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="华东净销售额为 100。",
         claims=(_claim(kind="FACT"),),
     )
@@ -123,6 +125,7 @@ def test_a_hypothesis_without_evidence_is_not_blocking_but_is_recorded() -> None
     - 完全静默也不对：「本答案含未验证推测」是读者该知道的事。
     """
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="可能是口径差异。",
         claims=(_claim(kind="HYPOTHESIS"),),
         limitations=("尚需验证",),
@@ -143,7 +146,9 @@ def test_a_required_step_that_never_ran_is_blocking() -> None:
     它意味着"计划里该查的那一路根本没查"，而这时的答案必然是片面的。
     """
     item = _evidence()
-    analysis = AnalysisResult(direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),))
+    analysis = AnalysisResult(
+        refused=False, direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),)
+    )
 
     result = review(analysis, _state(evidence=[item], steps=(_step(),), results={}))
 
@@ -156,7 +161,9 @@ def test_an_optional_step_that_did_not_run_is_not_an_issue() -> None:
     """非必需步骤没跑不算问题——计划里本来就有可选的步骤。"""
     item = _evidence()
     optional = TaskStep(id="step_02", objective="补充", tool="rag_retrieve", required=False)
-    analysis = AnalysisResult(direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),))
+    analysis = AnalysisResult(
+        refused=False, direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),)
+    )
 
     result = review(
         analysis,
@@ -174,6 +181,7 @@ def test_a_citation_to_a_missing_evidence_is_blocking() -> None:
     它看起来完全正常，所以检查不该依赖上游永远正确。
     """
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="答",
         claims=(_claim(evidence_ids=("evd_01M2SG0000000000000000AA",)),),
     )
@@ -192,6 +200,7 @@ def test_a_leaked_credential_pattern_is_blocking() -> None:
     """
     item = _evidence()
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="用户记录里的 password_hash 是 abc123。",
         claims=(_claim(evidence_ids=(item.id,)),),
     )
@@ -208,6 +217,7 @@ def test_chinese_word_password_is_not_flagged() -> None:
     """「密码」这个词本身不触发——制度文本里完全可能正常出现。"""
     item = _evidence()
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="制度要求口令（密码）每 90 天更换一次。",
         claims=(_claim(evidence_ids=(item.id,)),),
     )
@@ -222,7 +232,9 @@ def test_open_questions_must_appear_in_the_limitations() -> None:
     缺的是"哪些事还没查清"的交代——那影响的是完整性，不是正确性。
     """
     item = _evidence()
-    analysis = AnalysisResult(direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),))
+    analysis = AnalysisResult(
+        refused=False, direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),)
+    )
 
     result = review(
         analysis,
@@ -254,7 +266,9 @@ def test_a_blocking_conflict_must_be_disclosed() -> None:
         description="两个来源的净销售额相差 40%",
         resolution=ConflictResolution.UNRESOLVED,
     )
-    analysis = AnalysisResult(direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),))
+    analysis = AnalysisResult(
+        refused=False, direct_answer="答", claims=(_claim(evidence_ids=(item.id,)),)
+    )
 
     result = review(analysis, _state(evidence=[item], conflicts=(conflict,)))
 
@@ -289,6 +303,7 @@ def test_the_score_is_reported_but_does_not_override_a_blocking_verdict() -> Non
     """
     item = _evidence()
     analysis = AnalysisResult(
+        refused=False,
         direct_answer="答",
         claims=(_claim(evidence_ids=(item.id,)), _claim(kind="FACT")),
     )

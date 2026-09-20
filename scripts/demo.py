@@ -124,25 +124,23 @@ def _evaluate(case: dict[str, Any], detail: dict[str, Any]) -> tuple[bool, str]:
     answer = detail.get("final_answer_md") or ""
 
     if case.get("expect_rejected"):
-        # **拒答有两条路径，这里两条都认**：
+        # **判据读 `refused` 字段，不再认答案里的词**。
         #
-        # 1. **工具层拒答**（`final` 渲染的那句固定文案）——检索门禁判定
-        #    "语料里没有"时走它。**重排关闭**时由「未登录词 + 余弦地板」触发；
-        #    重排开启时由"逐候选重排分全被剔"触发，而那对**相邻主题**不成立
-        #    （见 CLAUDE.md 约定 57 的补充）。
-        # 2. **分析层拒答**——检索返回了语义相邻的候选（本例是《渠道数据报送规范》），
-        #    而分析模型如实说明"没有找到该制度的任何规定"。**这与编造是不同的行为**：
-        #    用户拿到的仍然是一句明确的"没查到"。
-        #
-        # ⚠️ **这是启发式判据**，它挡不住的是：模型既说"没找到"又顺带编几条
-        #    "该办法要求……"。真正的防编造靠 11.8 的证据纪律与 Reviewer
-        #    （`agent_review` 的落地检查），不是这几行字符串匹配。
-        if "没有检索到可支撑该问题的内容" in answer or "没有与问题相关" in answer:
-            return True, "按 11.8 拒答（工具层）"
-        refusal_markers = ("没有检索到", "未能检索到", "未检索到", "没有找到", "无法回答")
-        if any(marker in answer for marker in refusal_markers):
-            return True, "按 11.8 拒答（分析层：检索到相邻材料但如实说明没有该制度）"
-        return False, "**没有拒答**——语料里没有这条制度却给出了答案"
+        # 这里原先是一串字符串匹配（"没有找到"/"未能检索到"/…），它出过一次
+        # 典型的漏判：同一条问题、同一份代码，模型说「没有找到」时判对，
+        # 说「证据中没有…的条文」时判错——**四次里错一次**。判据在猜词，
+        # 而演示现场出现一次红叉，代价远大于它省下的那点改动。
+        # 现在 `refused` 由分析节点按 11.8 的判据直接给出（工具层拒答
+        # 由代码置位），见 `AnalysisResult.refused`。
+        if detail.get("refused") is True:
+            return True, "按 11.8 拒答（refused=true）"
+        # 分析生成失败时 `refused` 是 `False`（故障不是拒答），
+        # 但此时报"没有拒答"会把一次故障说成一次编造——**失败指错了层**。
+        # 这里认的是 `_degraded` 自己写下的那句，是**我们自己的字符串**，
+        # 不是模型措辞，所以不含上面那种不确定性。
+        if any("分析生成失败" in item for item in detail.get("limitations") or []):
+            return False, "**未能判定**——综合分析生成失败，这条不是拒答行为的结果"
+        return False, "**没有拒答**——refused=false，而语料里没有这条制度"
 
     if case.get("expect_clarification"):
         if not steps:

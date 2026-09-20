@@ -64,6 +64,9 @@ def build_analysis_node(
             return {
                 "analysis_result": AnalysisResult(
                     direct_answer="没有检索到可支撑该问题的内容。",
+                    # **这一条由代码判定，不经模型**：一条证据都没有，
+                    # 就是"证据里没有问题所问的那件事"，不需要问模型。
+                    refused=True,
                     conflicts=tuple(item.description for item in (state.get("conflicts") or [])),
                     limitations=tuple(_no_evidence_limitations(state)),
                 )
@@ -295,6 +298,10 @@ def _degraded(evidence: list[Evidence], exc: AgentError) -> AnalysisResult:
     """模型不可用时的降级产物（见模块 docstring）。"""
     return AnalysisResult(
         direct_answer=(f"已取得以下证据，但综合分析的生成失败，未能给出结论。（{exc.code.value}）"),
+        # **降级不是拒答**：这里没有作答是因为模型/服务不可用，
+        # 不是因为"语料里没有这件事"。混成 `True` 会让一次故障
+        # 在统计上长得像一次正确的拒答——**而故障恰恰是最需要被看见的**。
+        refused=False,
         # **claims 留空而不是把证据拼成结论**：见模块 docstring
         claims=(),
         limitations=(

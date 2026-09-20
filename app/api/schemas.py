@@ -194,6 +194,13 @@ class TaskDetailData(BaseModel):
     review: dict[str, Any] | None = None
     #: 答案的限制：证据覆盖不到的部分、失败的数据源、未明确的前提
     limitations: list[str] = Field(default_factory=list)
+    #: 本次回答是否**因为证据里没有问题所问的那件事**而没有作答（11.8 的拒答）。
+    #: `None` 表示这个任务没有走到分析那一步。
+    #:
+    #: **做成字段而不是让调用方去读答案文本**：拒答的判据曾经是"答案里有没有
+    #: 这几个词"，而模型换个说法就漏判（实测四次错一次）——那种不稳定性
+    #: 在演示与面试现场是最贵的。拒绝理由的定义见 `AnalysisResult.refused`。
+    refused: bool | None = None
 
     @classmethod
     def from_domain(cls, task: Task) -> Self:
@@ -208,6 +215,7 @@ class TaskDetailData(BaseModel):
             conflicts=list(payload.get("conflicts") or []),
             review=payload.get("review"),
             limitations=list(payload.get("limitations") or []),
+            refused=payload.get("refused"),
             task_id=task.id,
             parent_task_id=task.parent_task_id,
             conversation_id=task.conversation_id,

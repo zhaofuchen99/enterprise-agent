@@ -191,6 +191,12 @@ def _payload(
     """
     return {
         "direct_answer": analysis.direct_answer if analysis else None,
+        # **`refused` 必须在这里**：它已经渲染进 Markdown（人读），
+        # 该由程序读的那一份就在这里。漏了它，`make demo` 的拒答判据
+        # 只能回去猜词——而那正是它被加进来的原因（见 `AnalysisResult.refused`）。
+        # 没有分析产物时给 `None` 而不是 `False`：那是"没走到这一步"，
+        # 与"走到了且没拒答"是两件事。
+        "refused": analysis.refused if analysis else None,
         # **`conflicts` 必须在这里**：它已经渲染进 Markdown（人读），
         # 也落进了 `agent_conflict` 表（程序读），而 API 的任务详情读的
         # **正是这个 payload**。漏了它，前端与 `make demo` 的判据都看到空列表——

@@ -141,7 +141,10 @@ def _explain(intent: IntentResult) -> AnalysisResult:
     else:
         answer = intent.clarification_question or "请补充必要信息后重试。"
         limits = (f"缺少：{'、'.join(intent.missing_fields)}",) if intent.missing_fields else ()
-    return AnalysisResult(direct_answer=answer, limitations=limits)
+    # `refused=False`：澄清与不支持都**不是** 11.8 的拒答——拒答说的是
+    # "证据里没有你问的这件事"，而这两者是"问题缺前提"与"问题类型不归这里管"。
+    # 三者的处置完全不同，混成一个布尔量会让统计上它们变成一件事。
+    return AnalysisResult(direct_answer=answer, refused=False, limitations=limits)
 
 
 def _plan(intent: IntentResult) -> list[TaskStep]:

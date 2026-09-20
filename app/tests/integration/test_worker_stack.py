@@ -206,7 +206,7 @@ async def test_full_loop_through_a_real_worker(
             expected_columns=("net_sales",),
             explanation="按季度汇总净销售额",
         ),
-        AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。"),
+        AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。", refused=False),
     ]
     monkeypatch.setattr(
         "app.worker.build_model_gateway", lambda _settings: FakeModelGateway(scripts)
@@ -448,7 +448,7 @@ async def test_events_from_a_real_worker_reach_a_subscriber_on_another_instance(
             expected_columns=("net_sales",),
             explanation="按季度汇总净销售额",
         ),
-        AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。"),
+        AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。", refused=False),
     ]
     monkeypatch.setattr(
         "app.worker.build_model_gateway", lambda _settings: FakeModelGateway(scripts)
