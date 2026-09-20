@@ -124,10 +124,24 @@ def _evaluate(case: dict[str, Any], detail: dict[str, Any]) -> tuple[bool, str]:
     answer = detail.get("final_answer_md") or ""
 
     if case.get("expect_rejected"):
-        # 拒答的判据是**答案里没有编造**：`final` 在无证据时会写"没有检索到"，
-        # 而工具层返回的是 FAILED + NO_RELEVANT_KNOWLEDGE
+        # **拒答有两条路径，这里两条都认**：
+        #
+        # 1. **工具层拒答**（`final` 渲染的那句固定文案）——检索门禁判定
+        #    "语料里没有"时走它。**重排关闭**时由「未登录词 + 余弦地板」触发；
+        #    重排开启时由"逐候选重排分全被剔"触发，而那对**相邻主题**不成立
+        #    （见 CLAUDE.md 约定 57 的补充）。
+        # 2. **分析层拒答**——检索返回了语义相邻的候选（本例是《渠道数据报送规范》），
+        #    而分析模型如实说明"没有找到该制度的任何规定"。**这与编造是不同的行为**：
+        #    用户拿到的仍然是一句明确的"没查到"。
+        #
+        # ⚠️ **这是启发式判据**，它挡不住的是：模型既说"没找到"又顺带编几条
+        #    "该办法要求……"。真正的防编造靠 11.8 的证据纪律与 Reviewer
+        #    （`agent_review` 的落地检查），不是这几行字符串匹配。
         if "没有检索到可支撑该问题的内容" in answer or "没有与问题相关" in answer:
-            return True, "按 11.8 拒答"
+            return True, "按 11.8 拒答（工具层）"
+        refusal_markers = ("没有检索到", "未能检索到", "未检索到", "没有找到", "无法回答")
+        if any(marker in answer for marker in refusal_markers):
+            return True, "按 11.8 拒答（分析层：检索到相邻材料但如实说明没有该制度）"
         return False, "**没有拒答**——语料里没有这条制度却给出了答案"
 
     if case.get("expect_clarification"):
