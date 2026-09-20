@@ -8,16 +8,26 @@
 ⑤ RRF 合并，候选 ≤ 30
 ⑥ 重排                        → `tools/rag/reranker.py`（可关、失败降级）
 ⑦ 取 Top 8，低于阈值的候选剔除 → 同左
-⑧ 邻近块扩展                  → **仍然后置**，见下
+⑧ 表格行定位 + 补块           → `_resolve_tables`（见下）
 ⑨ 输出证据                    → `tools/rag/evidence.py`
 ```
 
-## 第 ⑧ 步为什么仍然不在这一版里
+## 第 ⑧ 步：缺口的判据换了，且只补装得下的表
 
-它的条件原文是「同文档、同章节且**确有上下文缺口**时」。现在重排分已经有了，
-"缺口"终于可以判了，但这一步还要**存储层的新能力**：按 payload 取同一文档
-同一章节的相邻块（`VectorStore` 现在只有向量检索，没有按定位取块）。
-它是一次独立的工作量，登记为【后续扩展】——**不是**能力不够，是范围没排进来。
+原文是「同文档、同章节且**确有上下文缺口**时扩展」，而**缺口判据原文挂在
+重排分上，实测判不出来**：重排分评的是"这条与问题有多相关"，而表格行块
+可以相关度极高、完整性却是零——实测那 8 行的重排分全在 0.97 以上。
+本实现改用 `table_row`：**这张表本次没取全就是缺口**。
+「答得全不全」与「相不相关」是两个问题，不能用同一个信号判。
+
+补块**有边界**：整表超过 `rag.table_expand_max_rows` 就不补。
+语料里那张 80 行的明细表要 80 个块（约 9KB）才装得下，会撑爆分析节点的
+证据预算；而且**这类聚合问题的正确来源本来就是数据库**，文档表格只是它的
+有损渲染。超过边界的表维持"如实说明覆盖不足 + 建议查数据库"。这是边界，
+不是没做完。
+
+⚠️ 补块**会改变候选集合**，因而会影响召回指标——`make eval-rag` 的数字
+必须在这次改动之后重新取值，不能沿用改前的。
 
 ## 相关性判据：重排在时由它判，不在时回到那两条代偿规则
 
@@ -50,8 +60,11 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
+
+from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
@@ -249,10 +262,9 @@ class Retriever:
             else best_dense < tuning.score_threshold or bool(unseen)
         )
 
-        # ⑧ 的**前一半**：给存活下来的表格行块标出它在整张表里的位置。
-        # 放在拒答判定**之后**：判为没有相关知识时一个候选都不返回，
-        # 为它们去扫存储层是白花的往返。
-        selected = () if no_relevant else await self._with_table_rows(ranked.chunks, chunk_filter)
+        # ⑧ 定位 + 补块。放在拒答判定**之后**：判为没有相关知识时
+        # 一个候选都不返回，为它们去扫存储层是白花的往返。
+        selected = () if no_relevant else await self._resolve_tables(ranked.chunks, chunk_filter)
 
         outcome = RetrievalOutcome(
             queries=queries,
@@ -276,11 +288,11 @@ class Retriever:
         )
         return outcome
 
-    # ------------------------------------------------------------- ⑧ 表格行定位
-    async def _with_table_rows(
+    # ------------------------------------------------------------- ⑧ 表格行
+    async def _resolve_tables(
         self, chunks: Sequence[RetrievedChunk], chunk_filter: ChunkFilter
     ) -> tuple[RetrievedChunk, ...]:
-        """给表格行块标出它在整张表里的位置（11.7 第 ⑧ 步的**前一半**）。
+        """11.7 第 ⑧ 步：先标注每行在整张表里的位置，再把装得下的小表补全。
 
         ## 它解决的是什么
 
@@ -290,12 +302,20 @@ class Retriever:
         实测踩到过（2026-09-20，华南 Q3：8 行求和 7,146.22 万，
         真值 13,249.31 万，而 Reviewer 给了 100 分）。
 
-        ## 为什么只标注、不补块
+        两半的分工：
 
-        补块是第 ⑧ 步的**后一半**（"确有上下文缺口时扩展"），它会改变候选集合、
-        因而改变召回指标，需要重跑 `make eval-rag`——属独立工作量。
-        而"让下游知道证据不完整"这一步不需要它：缺口事实一旦写进证据，
-        下游就能拒绝把部分行当合计，错误答案当场消失。
+        - **标注**（`table_row`）让下游知道证据不完整。它不改变候选集合，
+          因而不影响召回指标——这是"先让系统诚实"那一步；
+        - **补块**让聚合问题真的能答对。它**会**改变候选集合，
+          因而要重跑 `make eval-rag`——所以它与标注分成两半交付。
+
+        ## 缺口的判据是"没取全"，不是"重排分低"
+
+        详设把缺口判据挂在重排分上，而**重排分评的不是这件事**：
+        它评"这条与问题有多相关"，而表格行块相关度可以很高、完整性却是零——
+        实测那 8 行的重排分全在 0.97 以上，靠它永远判不出缺口。
+        **"答得全不全"与"相不相关"是两个问题，不能用同一个信号判。**
+        这里用的是现成的 `table_row`：第二个数大于本次覆盖的行数，就是缺口。
 
         ## 数出来的行数是"存储里的"行数
 
@@ -307,24 +327,25 @@ class Retriever:
         if not tables:
             return tuple(chunks)
 
-        positions = await self._table_positions(tables, chunk_filter)
-        return tuple(
-            item.model_copy(update={"table_row": positions[item.chunk_id]})
-            if item.chunk_id in positions
+        index = await self._table_index(tables, chunk_filter)
+        marked = tuple(
+            item.model_copy(update={"table_row": index.positions[item.chunk_id]})
+            if item.chunk_id in index.positions
             else item
             for item in chunks
         )
+        return self._expand_tables(marked, index)
 
-    async def _table_positions(
+    async def _table_index(
         self, tables: Sequence[RetrievedChunk], chunk_filter: ChunkFilter
-    ) -> dict[str, tuple[int, int]]:
-        """`{chunk_id: (第几行, 共几行)}`，行号 1 起。
+    ) -> _TableIndex:
+        """够到的那些文档里，表格行块的分布。**一次取回，供标注与补块共用**。
 
-        **按整份文档取一次，不是按表逐个取**：表名不可过滤（见上），
+        **按整份文档取，不是按表逐个取**：表名不可过滤（见上），
         逐表取也只能取回整份文档再筛，那就退化成一表一次往返。
         """
         limit = self._settings.rag.table_scan_limit
-        positions: dict[str, tuple[int, int]] = {}
+        index = _TableIndex()
         for document_id in dict.fromkeys(item.metadata.document_id for item in tables):
             # 沿用本次检索的过滤条件（状态、角色、有效期），只把文档收窄：
             # 换一套条件去数，数出来的可能是**另一批**块——
@@ -332,9 +353,66 @@ class Retriever:
             records = await self._store.fetch(
                 chunk_filter.model_copy(update={"document_ids": (document_id,)}), limit=limit
             )
-            for chunk_id, index, total in _group_table_rows(records):
-                positions[chunk_id] = (index, total)
-        return positions
+            index.add(records)
+        return index
+
+    def _expand_tables(
+        self, chunks: tuple[RetrievedChunk, ...], index: _TableIndex
+    ) -> tuple[RetrievedChunk, ...]:
+        """把**装得下的小表**其余行块补回候选。
+
+        ## 为什么有 `table_expand_max_rows` 这条边界
+
+        语料里那张 80 行的明细表要 80 个块（约 9KB）才装得下，会撑爆分析节点
+        的证据预算；而且**这类聚合问题的正确来源本来就是数据库**，文档表格
+        只是它的有损渲染。所以超过上限的表**不补**，维持"如实说明覆盖不足 +
+        建议查数据库"。这是边界，不是没做完。
+
+        ## 补回来的块**不参与重排**
+
+        它们在第 ⑦ 步之后才进来（这正是 11.7 把第 ⑧ 步排在第 ⑦ 步之后的原因）：
+        拿去重排会按相关性被再剔一次，而它们存在的理由恰恰是"分数低但缺不得"。
+        """
+        cited = {item.chunk_id for item in chunks}
+        expanded: list[RetrievedChunk] = []
+        ceiling = self._settings.rag.max_candidates
+        max_rows = self._settings.rag.table_expand_max_rows
+
+        # 排序是为了让补块的顺序**可复现**：`index.groups` 是插入序，
+        # 而它取决于存储层的返回顺序。限制清单与证据列表都是要被 diff 的。
+        for key in sorted(index.groups, key=lambda item: (str(item[1] or ""), " > ".join(item[0]))):
+            rows = index.groups[key]
+            covered = sum(1 for record in rows if record.chunk_id in cited)
+            # 没够到这张表就不补（它与本次问题无关）；取全了也没什么可补
+            if covered == 0 or covered >= len(rows) or len(rows) > max_rows:
+                continue
+            for record in rows:
+                if record.chunk_id in cited:
+                    continue
+                metadata = _metadata_or_none(record.payload)
+                if metadata is None:
+                    continue
+                cited.add(record.chunk_id)
+                expanded.append(
+                    RetrievedChunk(
+                        chunk_id=record.chunk_id,
+                        text=record.text,
+                        # **没有检索分就是 `None`**，不填 0：它压根没被评过
+                        # （见 `RetrievedChunk.fusion_score` 的说明）
+                        fusion_score=None,
+                        expanded=True,
+                        # 名次接着召回的那些往下排：它们进证据的顺序在这里定下
+                        rank=len(chunks) + len(expanded) + 1,
+                        table_row=index.positions.get(record.chunk_id),
+                        metadata=metadata,
+                    )
+                )
+                if len(chunks) + len(expanded) >= ceiling:
+                    # 到顶就**如实停在正确的条数上**，不偷偷截断：没补上的行
+                    # 仍然算"未覆盖"，`analysis._incomplete_tables` 会把它们
+                    # 照旧算进缺口——文案与事实因此保持一致。
+                    return chunks + tuple(expanded)
+        return chunks + tuple(expanded)
 
     # ------------------------------------------------------------------ ② 改写
     async def _rewrite(self, args: RagQueryArgs) -> tuple[tuple[str, ...], bool]:
@@ -482,30 +560,82 @@ class Retriever:
 # ------------------------------------------------------------------ 融合与组装
 
 
-def _group_table_rows(records: Sequence[ChunkRecord]) -> Iterator[tuple[str, int, int]]:
-    """一份文档的块 → 逐条 `(chunk_id, 第几行, 共几行)`，只吐表格行块。
+#: 表格分组的键：`(章节路径, 表名)`。
+_TableKey = tuple[tuple[str, ...], object]
 
-    分组键是 `(章节路径, 表名)`，行序按 `char_start`。**跨页表格因此是连续的**：
-    11.3 的表头还原保证了同表各行的序列化形态一致，而原文位置本来就是有序的。
+
+@dataclass
+class _TableIndex:
+    """够到的那些文档里，表格行块的分布（11.7 第 ⑧ 步的输入）。
+
+    一次存储层取回同时服务两件事——**标注**（每行在整张表里的位置）与
+    **补块**（缺口表的完整行块）。合成一个对象而不是各取一次：
+    分两次取会各用各的过滤条件，而两处一旦漂移，"这张表有几行"与
+    "补回来的是哪几行"就会对不上，**且两边都不会报错**。
+    """
+
+    #: `chunk_id -> (第几行, 共几行)`，行号 1 起
+    positions: dict[str, tuple[int, int]] = field(default_factory=dict)
+    #: `(章节, 表名) -> 按原文位置排好序的行块`
+    groups: dict[_TableKey, list[ChunkRecord]] = field(default_factory=dict)
+
+    def add(self, records: Sequence[ChunkRecord]) -> None:
+        for key, rows in _table_groups(records).items():
+            merged = self.groups.setdefault(key, [])
+            merged.extend(rows)
+            merged.sort(key=_by_position)
+            self._reindex(key)
+
+    def _reindex(self, key: _TableKey) -> None:
+        rows = self.groups[key]
+        for position, record in enumerate(rows, start=1):
+            self.positions[record.chunk_id] = (position, len(rows))
+
+
+def _table_groups(records: Sequence[ChunkRecord]) -> dict[_TableKey, list[ChunkRecord]]:
+    """一份文档的块 → `{(章节路径, 表名): 按原文位置排好序的行块}`。
+
+    行序按 `char_start`。**跨页表格因此是连续的**：11.3 的表头还原保证了
+    同表各行的序列化形态一致，而原文位置本来就是有序的。
     按 `page_no` 再切一刀会把跨页表格断成两张，那正是表头还原要修的东西。
 
     ⚠️ 同一章节里出现**两张同名表**时它们会并成一张。本语料没有这种形态，
     而"不把跨页表格切断"更要紧——两者不可兼得时取不切断。
     """
-    groups: dict[tuple[tuple[str, ...], object], list[ChunkRecord]] = {}
+    groups: dict[_TableKey, list[ChunkRecord]] = {}
     for record in records:
         if not record.payload.get("is_table"):
             continue
-        key = (
-            tuple(record.payload.get("section_path") or ()),
-            record.payload.get("table_caption"),
-        )
+        raw = record.payload.get("section_path")
+        # payload 的值类型是 `object`：直接 `tuple(...)` 会把字符串逐字符拆开，
+        # 于是分组键变成"第一章节的第一个字"——两张不同的表被并成一张，
+        # 而且不会有任何报错。
+        section = tuple(str(part) for part in raw) if isinstance(raw, list) else ()
+        key = (section, record.payload.get("table_caption"))
         groups.setdefault(key, []).append(record)
-    for group in groups.values():
-        ordered = sorted(group, key=lambda item: item.payload.get("char_start") or 0)
-        total = len(ordered)
-        for index, record in enumerate(ordered, start=1):
-            yield record.chunk_id, index, total
+    for rows in groups.values():
+        rows.sort(key=_by_position)
+    return groups
+
+
+def _by_position(record: ChunkRecord) -> float:
+    """原文位置。取不到时排在最前——**不返回随机值**：排序不稳定会让
+    "第几行"这个数在两次相同的检索之间变来变去，而它是要写进证据的。"""
+    value = record.payload.get("char_start")
+    return float(value) if isinstance(value, int | float) else 0.0
+
+
+def _metadata_or_none(payload: dict[str, Any]) -> ChunkMetadata | None:
+    """payload → `ChunkMetadata`；反解不出来返回 `None`。
+
+    与 `_to_chunks` 一样**整条丢掉而不是降级**：`ChunkMetadata` 的字段
+    都是证据定位必需的（没有 `checksum` 就说不清引用的是哪一份文件），
+    放一条定位不全的候选进去，下游会把它当成一条正常证据来引用。
+    """
+    try:
+        return ChunkMetadata.from_payload(payload)
+    except ValidationError:
+        return None
 
 
 def _fuse(

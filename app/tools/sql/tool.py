@@ -245,6 +245,7 @@ class SqlQueryTool:
             warnings=tuple(validated.rewrites)
             + (("已按当前账号的数据权限限定查询范围",) if validated.scope_injected else ()),
             data_scope=_applied_scope(validated, ctx.permission_scope),
+            scope_filters=validated.scope_filters,
             schema_version=self.catalog.version,
         )
         evidence = build_evidence(
@@ -416,6 +417,7 @@ class SqlQueryTool:
             metric_definitions=self._metric_definitions(candidate, context),
             warnings=tuple(warnings),
             data_scope=_applied_scope(validated, scope),
+            scope_filters=validated.scope_filters,
             attempts=tuple(attempts),
             schema_version=self.catalog.version,
         )

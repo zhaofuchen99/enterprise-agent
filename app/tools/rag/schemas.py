@@ -71,7 +71,7 @@ class QueryRewrite(BaseModel):
 class RetrievedChunk(BaseModel):
     """一条候选（11.7 第 7 步的 Top 8 之一）。
 
-    `dense_score` 与 `fusion_score` **必须都留下**，它们的量纲完全不同：
+    `dense_score` 与 `fusion_score` 都要留下，它们的量纲完全不同：
 
     - `fusion_score` 是 RRF 分（`Σ 1/(k+rank)`，约 0.016–0.033），**只可比大小**；
     - `dense_score` 是余弦相似度（[0,1]），它才是**绝对量级**的相关性信号。
@@ -84,7 +84,16 @@ class RetrievedChunk(BaseModel):
 
     chunk_id: str
     text: str
-    fusion_score: float
+    #: **可空**：第 ⑧ 步补回来的行块**没有参与过检索**，因而没有 RRF 分。
+    #: 补 0.0 会让它看起来像"排名垫底"，而真相是"它压根没被评过"——
+    #: 同 `dense_score` / `rerank_score` 的理由（详设 11.7 的落地记录里那条
+    #: 「没算过就没有值」）。读的人靠 `expanded` 区分这两类候选。
+    fusion_score: float | None = None
+    #: 这条是**第 ⑧ 步补回来的**，不是检索召回的。
+    #:
+    #: 单独一个字段而不是靠"三个分数是不是都空"去推：那是个会随
+    #: 检索路径增减而变的判据，而这个事实只有一个来源。
+    expanded: bool = False
     #: **可空**：只被稀疏路召回的候选没有稠密分——它压根没被稠密路评估过。
     #: 补 0.0 会让它看起来像"语义完全不相关"，那是个我们并不知道的结论，
     #: 而下游（Reviewer、冲突检测）一旦读到就会把它当成事实。

@@ -551,8 +551,9 @@ async def test_top_k_bounds_the_evidence(settings: Settings, vocabulary: Vocabul
 
     assert len(outcome.candidates) == settings.rag.rerank_top_k
     assert [c.rank for c in outcome.candidates] == list(range(1, 9))
-    # 融合分单调不增
-    scores = [c.fusion_score for c in outcome.candidates]
+    # 融合分单调不增。**只对召回来的那些断言**：第 ⑧ 步补回来的行块
+    # 没有参与过检索，因而 `fusion_score` 是 `None`（填 0 会被读成"垫底"）
+    scores = [c.fusion_score for c in outcome.candidates if c.fusion_score is not None]
     assert scores == sorted(scores, reverse=True)
 
 
@@ -1172,12 +1173,105 @@ async def test_table_rows_carry_their_position_in_the_whole_table(
 
     rows = {c.chunk_id: c.table_row for c in outcome.candidates if c.metadata.is_table}
     assert rows, "表格行块应当被召回"
-    assert set(rows.values()) == {(1, 4)}, "行号与总行数都要来自存储层，不是来自召回集"
+    # 行号与总行数都要来自**存储层**，不是来自召回集：这张表 4 行、
+    # 只召回了 1 行，而第 ⑧ 步把其余 3 行补了回来（表装得下）
+    assert set(rows.values()) == {(1, 4), (2, 4), (3, 4), (4, 4)}
+    assert sorted(rows) == ["chk_0010", "chk_0011", "chk_0012", "chk_0013"]
     # 非表格块没有位置可言——`None` 表示"不是表格的一部分"，
     # 不是"表有 0 行"，两者混起来会让下游把正文块也算进表格缺口
     assert all(c.table_row is None for c in outcome.candidates if not c.metadata.is_table), (
         "非表格块不该带表格位置"
     )
+
+
+async def test_table_expansion_marks_where_each_row_came_from(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """补回来的行块与召回的行块**必须分得开**。
+
+    三件事同时钉住：`expanded` 说明来源、`fusion_score` 是 `None`
+    而不是 0（它压根没被检索过，填 0 会被读成"排名垫底"）、
+    `rerank_score` 同样没有值——补块发生在重排**之后**，这正是 11.7
+    把第 ⑧ 步排在第 ⑦ 步之后的原因：拿去重排会按相关性被再剔一次，
+    而它们存在的理由恰恰是"分数低但缺不得"。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华东 | 渠道{index} | 智能家居 | {index}.00 | 1.00",
+                dense=[1.0, 0, 0, 0] if index == 0 else [0.0, 1.0, 0, 0],
+                sparse={},
+                is_table=True,
+                table_caption="分区域分渠道分产品线净销售额明细",
+                section=("2025年第三季度经营分析", "五、风险提示"),
+            )
+            for index in range(3)
+        ]
+    )
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华东渠道折扣第{index}条",
+                dense=[0.99, 0.1, 0, 0],
+                sparse={},
+                logical_key="report/other",
+            )
+            for index in range(100, 121)
+        ]
+    )
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0])
+
+    outcome = await _retriever(settings, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    expanded = [c for c in outcome.candidates if c.expanded]
+    retrieved = [c for c in outcome.candidates if not c.expanded]
+    assert len(expanded) == 2, "3 行的表只召回了 1 行，其余 2 行应当补回来"
+    assert all(c.fusion_score is None for c in expanded)
+    assert all(c.rerank_score is None for c in expanded)
+    assert all(c.fusion_score is not None for c in retrieved), "召回的那些必须有融合分"
+
+
+async def test_table_expansion_skips_a_table_it_cannot_afford(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """装不下的表**不补**——这是有意的边界，不是没做完。
+
+    语料里那张 80 行的明细表要 80 个块才装得下，会撑爆分析节点的证据预算；
+    而这类聚合问题的正确来源本来就是数据库。此时仍要**标注位置**
+    （下游据此如实说明覆盖不足），只是不把行块补进来。
+    """
+    big = settings.model_copy(
+        update={"rag": settings.rag.model_copy(update={"table_expand_max_rows": 2})}
+    )
+    store = InMemoryVectorStore()
+    await store.upsert(
+        [
+            _point(
+                index,
+                text=f"华东 | 渠道{index} | 智能家居 | {index}.00 | 1.00",
+                dense=[1.0, 0, 0, 0] if index == 0 else [0.0, 1.0, 0, 0],
+                sparse={},
+                is_table=True,
+                table_caption="一张装不下的表",
+                section=("2025年第三季度经营分析", "五、风险提示"),
+            )
+            for index in range(4)
+        ]
+    )
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0])
+
+    outcome = await _retriever(big, store, gateway, vocabulary).retrieve(
+        RagQueryArgs(question="华东区域渠道折扣政策"), scope=_scope()
+    )
+
+    assert not [c for c in outcome.candidates if c.expanded]
+    marked = [c for c in outcome.candidates if c.metadata.is_table]
+    assert marked and marked[0].table_row == (1, 4), "不补块也要标注：下游靠它说清覆盖不足"
 
 
 async def test_table_position_reaches_the_evidence_locator(

@@ -33,18 +33,11 @@ from typing import Final
 from app.core.ids import IdPrefix, new_id
 from app.domain.evidence import Evidence, TimeRange
 from app.domain.user import PermissionScope
-from app.tools.sql.schemas import SchemaCatalog, SqlToolResult
+from app.tools.sql.schemas import SCOPE_COLUMNS, SchemaCatalog, SqlToolResult
 
-#: 结果列名 -> 证据 `scope` 的键（详设 13.1 的 `scope`、13.4 第 7 步的 SCOPE 冲突）。
-#: 只认这几个列：scope 是给**跨来源比对**用的，把每列都塞进去会让
-#: 「同口径」的判定被无关字段干扰，而 SCOPE 冲突恰恰是漏报比误报更糟的那类。
-_SCOPE_COLUMNS: Final[dict[str, str]] = {
-    "region_name": "region",
-    "channel_name": "channel",
-    "product_line_name": "product_line",
-    "category": "category",
-    "customer_level": "customer_level",
-}
+#: 结果列名 -> 证据 `scope` 的键在 `schemas.SCOPE_COLUMNS`。
+#: **与校验器抽 WHERE 用的是同一份**：两边各存一份、靠注释对齐的做法，
+#: 漂移时的症状是"某类冲突再也检不出来"，而没有任何地方会报错。
 
 #: 敏感级别 -> 证据的 `access_level`（TBC-07 的两级 + PUBLIC）。
 _ACCESS_LEVEL: Final[dict[str, str]] = {
@@ -74,6 +67,10 @@ def build_evidence(
         scope: 调用者的数据权限范围。用于在证据里标注本次查询受过的限制——
             「这个数是全量还是只有华东」必须是证据自带的属性，
             否则 Phase 9 的冲突检测会把两个不同范围的事实当成同一个来比。
+
+    WHERE 里的维度等值条件取自 `result.scope_filters`：标量聚合的结果集
+    只有一个聚合列，**粒度只存在于 WHERE 里**；没有它，冲突检测就只能放行——
+    而放行意味着"拿华北的行去对华东的库值"也会被报成冲突。
         catalog: 用于判定证据的密级（取所涉列的最高敏感级别）。
         max_rows: 逐行生成的上限。超过时退化成**一条覆盖整段切片**的汇总证据。
 
@@ -99,6 +96,7 @@ def build_evidence(
         metric_code=metric_code,
         definition_version=_definition_version(catalog, metric_code),
         access_level=_access_level(catalog, columns),
+        scope_filters=result.scope_filters,
     )
 
     if result.row_count > max_rows:
@@ -123,6 +121,8 @@ class _Common:
     metric_code: str | None
     definition_version: str | None
     access_level: str
+    #: WHERE 里的维度等值条件，见 `build_evidence` 的 `scope_filters`
+    scope_filters: Sequence[tuple[str, str]] = ()
 
 
 def _row_evidence(
@@ -144,7 +144,7 @@ def _row_evidence(
         retrieved_at=common.retrieved_at,
         metric_code=common.metric_code,
         definition_version=common.definition_version,
-        scope=_scope_of(common.columns, row, scope),
+        scope=_scope_of(common.columns, row, scope, filters=common.scope_filters),
         # 详设 13.2 第 1 条：计算经营指标时，业务数据库的结果优先级最高。
         reliability="HIGH",
         content_hash=_content_hash(common.sql_fingerprint, common.columns, row),
@@ -181,8 +181,10 @@ def _summary_evidence(
         retrieved_at=common.retrieved_at,
         metric_code=common.metric_code,
         definition_version=common.definition_version,
-        # 汇总证据带不了单行的维度取值，只标数据范围——**不猜**某一行的 scope
-        scope={"data_scope": list(scope.region_ids)} if not scope.unrestricted else {},
+        # 汇总证据带不了单行的维度取值，只标数据范围——**不猜**某一行的 scope。
+        # 但 WHERE 里的维度条件要带上：它是这次查询**确凿**的粒度，
+        # 与"结果里每一行各自的范围"是两回事。
+        scope=_summary_scope(scope, common.scope_filters),
         reliability="HIGH",
         content_hash=_content_hash(
             common.sql_fingerprint, common.columns, [result.row_count, result.truncated]
@@ -202,19 +204,38 @@ def _render_row(columns: Sequence[str], row: Sequence[object]) -> str:
 
 
 def _scope_of(
-    columns: Sequence[str], row: Sequence[object], scope: PermissionScope
+    columns: Sequence[str],
+    row: Sequence[object],
+    scope: PermissionScope,
+    *,
+    filters: Sequence[tuple[str, str]] = (),
 ) -> dict[str, str | list[str]]:
-    """从结果行提取可比对的维度范围。
+    """从结果行提取可比对的维度范围，**并以 WHERE 里的维度条件打底**。
 
     受限用户带上 `data_scope` 标注：同样是「华东销售额」，
     全量用户算出的数与限华东用户算出的数**本就该不同**，
     不标注的话，两个来源的数字一旦不同就会被报成 VALUE 冲突。
+
+    **结果行的取值优先于 WHERE 的条件**：两者本该一致（`WHERE region_name='华东'
+    GROUP BY region_name` 只可能返回华东那一行），不一致说明查询本身有矛盾，
+    而证据应当反映**结果里实际有的**那个范围——下游是拿它去和别的来源比数的。
     """
-    extracted: dict[str, str | list[str]] = {}
+    extracted: dict[str, str | list[str]] = dict(filters)
     for name, value in zip(columns, row, strict=False):
-        key = _SCOPE_COLUMNS.get(name)
+        key = SCOPE_COLUMNS.get(name)
         if key is not None and value is not None:
             extracted[key] = str(value)
+    if not scope.unrestricted:
+        extracted["data_scope"] = list(scope.region_ids)
+    return extracted
+
+
+def _summary_scope(
+    scope: PermissionScope, filters: Sequence[tuple[str, str]]
+) -> dict[str, str | list[str]]:
+    """汇总证据的 `scope`：只有 WHERE 的维度条件与数据范围标注，
+    **不含每一行各自的取值**（那是逐行证据的事）。"""
+    extracted: dict[str, str | list[str]] = dict(filters)
     if not scope.unrestricted:
         extracted["data_scope"] = list(scope.region_ids)
     return extracted

@@ -803,7 +803,9 @@ def _print_retrieval(settings: Settings, args: argparse.Namespace, result: ToolR
         dense = chunk.get("dense_score")
         print(
             f"[{chunk['rank']}] {chunk['chunk_id']}"
-            f"｜融合 {chunk['fusion_score']:.4f}"
+            # 第 ⑧ 步补回来的行块没有检索分，打 `—` 而不是 0.0000：
+            # 两者必须长得不一样，否则"没评过"会被读成"评了、垫底"
+            f"｜融合 {_score_text(chunk.get('fusion_score'))}"
             f"｜余弦 {_score_text(dense)}"
             # 重排分**逐条打出来**：它是"为什么这条排在前面"的直接答案，
             # 而候选顺序变了却看不出原因时，第一件要查的就是它

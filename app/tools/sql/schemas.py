@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -343,6 +343,28 @@ class ValidatedSql(BaseModel):
     #: 「为什么我只看到华东的数据」变成一个查不出来的谜。
     scope_injected: bool = False
     data_time_range: TimeRange | None = None
+    #: WHERE 里的**维度等值条件**，如 `(("region", "华东"),)`。
+    #:
+    #: 它是 SQL 证据的粒度：`SELECT SUM(net_amount) WHERE region_name='华东'`
+    #: 这种标量聚合的结果集只有一个聚合列，**粒度只存在于 WHERE 里**，
+    #: 光看结果看不出这个数是哪个区域的。没有它，13.4 的比对就只能放行——
+    #: 而放行意味着"拿华北的行去对华东的库值"也会被报成冲突。
+    #: 见 `conflict.py` 的模块说明与 CLAUDE.md 约定 41/84。
+    scope_filters: tuple[tuple[str, str], ...] = ()
+
+
+#: 结果列名 / 维表列名 → 证据 `scope` 的键。
+#:
+#: **放在 schemas 里而不是各模块各一份**：取值必须逐字一致的模块有三个
+#: （SQL 侧组证据、校验器抽 WHERE、冲突检测比对），
+#: 三份手工对齐的字典迟早会漂移，而漂移的症状是"某类冲突再也检不出来"。
+SCOPE_COLUMNS: Final[dict[str, str]] = {
+    "region_name": "region",
+    "channel_name": "channel",
+    "product_line_name": "product_line",
+    "category": "category",
+    "customer_level": "customer_level",
+}
 
 
 # --------------------------------------------------------------------- 结果
@@ -414,6 +436,13 @@ class SqlToolResult(BaseModel):
     #: 数据负责人。⚠️ `warnings` 里那句「已按当前账号的数据权限限定
     #: 查询范围」不能替代它：那是给人读的提示串，而这是可判断的字段。
     data_scope: tuple[str, ...] | None = None
+    #: WHERE 里的**维度等值条件**，如 `(("region", "华东"),)`。
+    #:
+    #: 它是这个数所属的范围：`SELECT SUM(net_amount) WHERE region_name='华东'`
+    #: 的结果集只有一个聚合列，**粒度只存在于 WHERE 里**，光看结果看不出来。
+    #: 没有它，冲突检测对"SQL 侧范围未知"就只能放行——而放行意味着
+    #: 「拿华北的行去对华东的库值」也会被报成冲突（2026-09-20 实测到四条）。
+    scope_filters: tuple[tuple[str, str], ...] = ()
     #: 本次查询的全部尝试，供 Tool 执行器逐条写 `agent_tool_call`
     attempts: tuple[SqlAttempt, ...] = ()
     #: 生成 SQL 时使用的 Schema 目录版本，进 Trace 便于「昨天还能查今天不行」的排查

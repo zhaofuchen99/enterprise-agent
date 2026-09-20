@@ -136,7 +136,10 @@ def _evidence_of(chunk: RetrievedChunk, *, question: str, retrieved_at: datetime
             "checksum": meta.checksum,
             # 检索侧的分数**进 locator**：它解释"为什么这条被选中"，
             # 而 13.4 的比对只看 claim 与 scope，多这两个键不影响分组
-            "fusion_score": round(chunk.fusion_score, 6),
+            # 第 ⑧ 步补回来的行块没有检索分——**留 `None` 不填 0**，
+            # 同下面 `dense_score` 的理由；`expanded` 说明它为什么没有
+            "fusion_score": None if chunk.fusion_score is None else round(chunk.fusion_score, 6),
+            "expanded": chunk.expanded,
             "dense_score": None if chunk.dense_score is None else round(chunk.dense_score, 6),
             "source_kind": meta.source_kind.value,
         },

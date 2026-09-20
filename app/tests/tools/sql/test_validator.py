@@ -627,3 +627,57 @@ class TestAcceptedAndRewritten:
         # 超长不是攻击特征，是模型跑飞了——但它也不可修复（重新猜不是修正）
         assert excinfo.value.error_class == "VALIDATION"
         assert not excinfo.value.repairable
+
+
+class TestScopeFilters:
+    """从 WHERE 里抽维度等值条件（SQL 证据的粒度）。
+
+    标量聚合的结果集只有一个聚合列，**粒度只存在于 WHERE 里**。
+    没有它，13.4 的比对对"SQL 侧范围未知"就只能放行——而放行意味着
+    「拿华北的行去对华东的库值」也会被报成冲突（2026-09-20 实测到四条）。
+    """
+
+    def test_equality_on_a_dimension_column_is_extracted(self, validator: SqlValidator) -> None:
+        result = validator.validate(
+            "SELECT SUM(net_amount) FROM fact_sales_order_item AS s "
+            "JOIN dim_region AS r ON s.region_id = r.region_id "
+            "WHERE r.region_name = :region",
+            parameters={"region": "华东"},
+        )
+
+        assert result.scope_filters == (("region", "华东"),)
+
+    def test_literals_work_too(self, validator: SqlValidator) -> None:
+        """模型有时直接写字母量（校验器随后会把它规范化成绑定参数）。"""
+        result = validator.validate(
+            "SELECT SUM(net_amount) FROM fact_sales_order_item AS s "
+            "JOIN dim_region AS r ON s.region_id = r.region_id "
+            "WHERE r.region_name = '华东'"
+        )
+
+        assert result.scope_filters == (("region", "华东"),)
+
+    def test_range_conditions_are_not_extracted(self, validator: SqlValidator) -> None:
+        """**只认等值**：范围条件表达的是区间而不是一个取值。
+
+        把它塞进 `scope` 会造出一条"取值不同"的判定，让比对直接跳过——
+        漏报比多报贵得多，因为多报看得出来，漏报看不出来。
+        """
+        result = validator.validate(
+            "SELECT SUM(net_amount) FROM fact_sales_order_item AS s "
+            "JOIN dim_region AS r ON s.region_id = r.region_id "
+            "WHERE r.region_name IN ('华东', '华南')"
+        )
+
+        assert result.scope_filters == ()
+
+    def test_non_dimension_columns_are_ignored(self, validator: SqlValidator) -> None:
+        """只有 `SCOPE_COLUMNS` 里的列才算维度——每个等值条件都收进来，
+        会让"同口径"的判定被无关字段干扰。"""
+        result = validator.validate(
+            "SELECT SUM(net_amount) FROM fact_sales_order_item "
+            "WHERE currency = 'CNY' AND region_id = :rid",
+            parameters={"rid": "r1"},
+        )
+
+        assert result.scope_filters == ()

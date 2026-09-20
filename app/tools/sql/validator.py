@@ -61,6 +61,7 @@ from app.domain.evidence import TimeRange
 from app.domain.user import PermissionScope
 from app.tools.base import ErrorClass
 from app.tools.sql.schemas import (
+    SCOPE_COLUMNS,
     ColumnSpec,
     SchemaCatalog,
     ScopeSpec,
@@ -245,6 +246,7 @@ class SqlValidator:
             rewrites=tuple(rewrites),
             scope_injected=bool(injected),
             data_time_range=self._extract_time_range(tree, aliases, params),
+            scope_filters=self._extract_scope_filters(tree, params),
         )
 
     # ------------------------------------------------- 1 请求文本长度
@@ -844,6 +846,46 @@ class SqlValidator:
         if lower is None or upper is None:
             return None
         return TimeRange(start=_midnight(lower), end=_midnight(upper))
+
+    def _extract_scope_filters(
+        self, tree: exp.Expr, params: Mapping[str, object]
+    ) -> tuple[tuple[str, str], ...]:
+        """从 WHERE 的**等值**条件里取维度取值，供结果证据的 `scope`。
+
+        ## 为什么需要它
+
+        SQL 证据的 `scope` 原先只从**结果列**里取（`evidence._scope_of`），
+        而标量聚合的结果集只有一个聚合列——`SELECT SUM(net_amount) WHERE
+        region_name = '华东'` 的粒度只存在于 WHERE 里，从结果上看不出来。
+        约定 41 因此把「SQL 侧 scope 为空就不比这一项」写成了放行条件，
+        代价一直没显形：**直到检索侧开始把同表的多行一起放进证据**
+        （11.7 第 ⑧ 步的补块），五个区域的行于是全被拿去对华东的库值，
+        报出四条相对差 9–16% 的假冲突（2026-09-20 实测）。
+
+        ## 只认等值
+
+        范围条件（`>`、`IN`、`BETWEEN`）表达的是一个**区间**而不是一个取值，
+        塞进 `scope` 会造出一条"取值不同"的判定，把真冲突直接跳过。
+        认不出就如实返回空——**宁可少一条 scope，不能多一条错的**：
+        空 scope 退回放行（多报一条，人能看出来），错 scope 会让比对静默跳过
+        （漏报，没人看得出来）。漏报是这里更贵的那一侧。
+        """
+        found: dict[str, str] = {}
+        for node in tree.find_all(exp.EQ):
+            column = node.args.get("this")
+            if not isinstance(column, exp.Column):
+                continue
+            key = SCOPE_COLUMNS.get(column.name)
+            if key is None:
+                continue
+            value = _resolve_value(node.args.get("expression"), params)
+            if not isinstance(value, str) or not value:
+                continue
+            # 同名维度取**第一次**出现：重复条件（`region_name = '华东' AND
+            # region_name = '华东'`）是同一个事实，取哪个都一样；
+            # 而语义矛盾的重复条件本该由 SQL 自己返回空集，不是这里的事。
+            found.setdefault(key, value)
+        return tuple(sorted(found.items()))
 
     def _is_time_comparison(self, node: exp.Expr, aliases: Mapping[str, str]) -> bool:
         left = node.args.get("this")

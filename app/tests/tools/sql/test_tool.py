@@ -632,3 +632,43 @@ def test_result_model_is_json_serializable() -> None:
     )
     dumped = payload.model_dump(mode="json")
     assert dumped["rows"] == [["111967031.73"]]
+
+
+class TestScopeFiltersOnEvidence:
+    """SQL 证据必须带上 WHERE 里的维度条件——它是这个数**属于哪个范围**。"""
+
+    async def test_scalar_aggregate_carries_its_where_scope(
+        self, tool: SqlQueryTool, gateway: FakeModelGateway, runner: FakeSqlRunner, ctx: ToolContext
+    ) -> None:
+        """标量聚合的结果集只有一个聚合列，**粒度只存在于 WHERE 里**。
+
+        没有它，冲突检测对"SQL 侧范围未知"就只能放行——于是拿别的区域的行
+        去对这个数也会被报成冲突（实测四条，相对差 9–16%）。
+        """
+        gateway.responses = [
+            _candidate(
+                sql=(
+                    "SELECT SUM(s.net_amount) AS net_sales FROM fact_sales_order_item AS s "
+                    "JOIN dim_region AS r ON s.region_id = r.region_id "
+                    "WHERE r.region_name = :region"
+                ),
+                parameters={"region": "华东"},
+            )
+        ]
+        runner.results = [_result([("111967031.73",)])]
+
+        evidence = (await tool.execute(ARGS, ctx)).evidence[0]
+
+        assert evidence.scope["region"] == "华东"
+
+    async def test_a_query_without_dimension_filters_stays_open(
+        self, tool: SqlQueryTool, gateway: FakeModelGateway, runner: FakeSqlRunner, ctx: ToolContext
+    ) -> None:
+        """没有维度条件时 `scope` 里不该凭空多出一个键——
+        那会让比对按一个不存在的维度去筛，把真冲突挡掉。"""
+        gateway.responses = [_candidate()]
+        runner.results = [_result([("1",)])]
+
+        evidence = (await tool.execute(ARGS, ctx)).evidence[0]
+
+        assert "region" not in evidence.scope

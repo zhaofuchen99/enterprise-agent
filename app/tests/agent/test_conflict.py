@@ -288,3 +288,52 @@ def test_render_lists_the_possible_explanations() -> None:
     assert "可能原因" in text
     assert "UNRESOLVED" in text
     assert render(()) == "（未检出冲突）"
+
+
+#: 一张**五个区域各一行**的汇总表。补块（11.7 第 ⑧ 步）会把这种表整张放进
+#: 证据，于是每一行都会被拿去比对——这正是实测踩到四条假冲突的那张表。
+_REGION_TABLE = """华东区域2025年第三季度专项分析 > 二、经营业绩回顾
+表：分区域经营情况
+区域 | 净销售额（万元）
+华东 | 11,039.58
+华南 | 13,062.07
+华北 | 12,792.96
+华中 | 12,206.40
+西南 | 13,017.66"""
+
+
+def test_other_regions_are_not_compared_against_a_scoped_sql_aggregate() -> None:
+    """**SQL 侧有范围时，别的区域的行不能被拿去比。**
+
+    实测（2026-09-20）：检索侧开始把同表的多行一起放进证据之后，
+    这张五行的表里**四条别的区域**都被拿去对华东的库值，
+    报出相对差 9–16% 的假冲突——而它们压根不是同一件事。
+
+    修法在 SQL 侧：`SELECT SUM(...) WHERE region_name='华东'` 的粒度
+    只存在于 WHERE 里，把它抽出来放进证据的 `scope`，比对就自然对上了。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_REGION_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
+    )
+
+    assert len(conflicts) == 1, "只有华东那一行该被比"
+    assert conflicts[0].detected_difference["document_value"] == pytest.approx(110_395_800.0)
+
+
+def test_without_a_sql_side_scope_every_row_still_compares() -> None:
+    """反过来说清楚：**SQL 侧范围未知时仍然照比**（约定 41 的有意放行）。
+
+    这条不是"理想行为"，而是**权衡**：把判据收紧成"范围未知就不比"，
+    `demo-cross` 那条真冲突会一起消失——而那条正是这个双源切片存在的理由。
+    多报看得出来（读者会问"华南这行凭什么对华东的库值"），
+    漏报看不出来。所以宁可多报。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    unscoped = _sql_evidence(111_967_031.73).model_copy(update={"scope": {}})
+
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_REGION_TABLE), unscoped], catalog=catalog
+    )
+
+    assert len(conflicts) == 5
