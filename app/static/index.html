@@ -48,6 +48,9 @@
     border: 1px solid var(--line); color: var(--muted);
   }
   .badge.ok { color: var(--ok); border-color: #1f4d3a; }
+  /* 拒答是 11.8 的**正确行为**，不是故障——但读者必须一眼看出
+     "这不是一个答案"。所以给一个显眼的边框，而不是报错色。 */
+  .badge.refused { color: var(--warn); border-color: #4a3f1f; }
   main { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, 1.1fr); gap: 16px; padding: 16px 20px 40px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
@@ -127,6 +130,7 @@
     <h2>结论</h2>
     <div class="row" style="margin-bottom:8px">
       <span class="status muted" id="status">—</span>
+      <span class="badge refused" id="refusedBadge" hidden>本次拒答：证据里没有问题所问的那件事</span>
       <span class="muted" id="intentLine"></span>
     </div>
     <div class="answer" id="answer"><span class="empty">还没有结果。</span></div>
@@ -192,6 +196,7 @@ async function ask() {
   $("answer").innerHTML = '<span class="empty">任务已提交，等待结果…</span>';
   $("status").textContent = "QUEUED"; $("status").className = "status QUEUED";
   $("intentLine").textContent = ""; $("taskLine").textContent = "";
+  $("refusedBadge").hidden = true;
   $("askBtn").disabled = true;
 
   try {
@@ -295,6 +300,10 @@ async function refreshDetail(delayMs) {
 function renderDetail(d) {
   $("status").textContent = d.status;
   $("status").className = `status ${d.status}`;
+  // `refused` 由后端按 11.8 判定（工具层由代码置位、分析层由模型判定）。
+  // **只在 `true` 时显示**：`null` 表示这个任务没走到分析那一步，
+  // 与"走到了且没拒答"是两件事。
+  $("refusedBadge").hidden = d.refused !== true;
   $("intentLine").textContent = [
     d.intent ? `意图 ${d.intent}` : "",
     d.progress_decision ? `判定 ${d.progress_decision}` : "",

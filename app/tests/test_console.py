@@ -24,6 +24,13 @@ from httpx import AsyncClient
 from app.main import WEB_DIR
 
 _PAGE = WEB_DIR / "index.html"
+#: JS 里 `$("xxx")` 取的元素 id。**静态对一遍 HTML**：
+#: `_stub_dom` 给 `getElementById` 打的是"来者不拒"的桩，所以 node 那几条断言
+#: **发现不了 id 打错**——而真浏览器里 `$` 会返回 `null`，`null.hidden = ...`
+#: 抛异常，整页渲染当场停住，症状是"右半边空白"，不指向那个 id。
+_ELEMENT_ID = re.compile(r'\$\("([^"]+)"\)')
+_DECLARED_ID = re.compile(r'id="([^"]+)"')
+
 #: 从页面里抠出 `<script>` 正文。**用正则而不是 HTML 解析器**：
 #: 这是本项目自己的单文件页面，形状由本仓库控制，引一个解析器不值当。
 _SCRIPT = re.compile(r"<script>\n(.*?)\n</script>", re.S)
@@ -142,6 +149,22 @@ def test_console_script_matches_what_the_browser_would_run(page: str, tmp_path: 
     behaviour = _node(["--input-type=module", "-e", _stub_dom(match.group(1))])
     assert behaviour.returncode == 0, f"页面 JS 断言失败：{behaviour.stderr[:400]}"
     assert behaviour.stdout.strip() == "ok"
+
+
+def test_every_element_the_script_looks_up_exists_in_the_page(page: str) -> None:
+    """JS 里取的每个 id，HTML 里都得有。
+
+    这条防的是一类**只在浏览器里出现、node 断言关不掉**的缺陷：
+    `$` 取不到元素时返回 null，下一步赋值就抛异常，整个 `renderDetail` 停住——
+    症状是"右半边空白"，而它不指向那个打错的 id。
+    """
+    script = _SCRIPT.search(page)
+    assert script is not None
+    looked_up = set(_ELEMENT_ID.findall(script.group(1)))
+    declared = set(_DECLARED_ID.findall(page))
+
+    assert looked_up, "没抓到任何 id，正则大概与页面脱节了"
+    assert looked_up <= declared, f"页面里缺这些 id：{sorted(looked_up - declared)}"
 
 
 def test_the_static_dir_constant_points_at_a_real_file() -> None:
