@@ -19,24 +19,27 @@
 
 ```bash
 make run       # 一个终端：api + worker
-make demo      # 另一个终端：跑固化下来的六条问题
+make demo      # 另一个终端：跑固化下来的九条问题
 ```
 
 **演示控制台**：起了之后打开 <http://localhost:8000/> —— 提一个问题，
 左边的时间线会**一条条实时出现**后端正在做的事（`node.started` / `progress.assessed` /
 `review.completed` …），右边出结论、证据、冲突与限制。单文件 HTML、零依赖、无构建，
 走的就是公开接口（SSE 那条路用的是浏览器唯一能走的订阅令牌）。
-六条固化问题在里面做成了快捷按钮，面试时点一下就跑。
+九条固化问题在里面做成了快捷按钮，面试时点一下就跑。
 
-六条问题覆盖了四条验收标准，**每条都有可断言的判据**（`configs/demo_questions.yaml`），
+九条问题覆盖了四条验收标准，**每条都有可断言的判据**（`configs/demo_questions.yaml`），
 而不是打出来让人自己看：
 
 | 用例 | 问题 | 证明什么 |
 |---|---|---|
 | `demo-sql` | 2025年Q3华东地区的净销售额是多少？ | 简单指标查询**只走 SQL**（FR-PLAN-002 规则 1） |
+| `demo-sql-q2` | 2025年Q2华东地区的净销售额是多少？ | 同上、**换一个期间**——防「固化了一个数而它碰巧总能被抄对」 |
+| `demo-sql-annual` | 2025年华东地区全年的净销售额是多少？ | 同上、**跨四个季度**，与单季构成粒度对照 |
 | `demo-rag` | 华东区域渠道折扣政策对直营渠道的折扣上限？ | 制度问法**只走 RAG**，不去查库 |
 | `demo-cross` | …专项分析表里华东的净销售额是多少？与库里一致吗？ | 双源并列 + **检出数值冲突并披露** |
 | `demo-expand` | 2026年1月华南地区的净销售额是多少？ | SQL 查不到时**补一路 RAG**（「能根据工具结果继续分析」） |
+| `demo-scope` | （受限账号）2025年Q3华南地区的净销售额是多少？ | SQL 被数据权限拦成空 → 说清「**看不到**」而不是「没有」，并声明文档来源未经权限过滤 |
 | `demo-absent` | 跨境出海业务管理办法怎么规定？ | 语料里没有 → **拒答**，不编 |
 | `demo-clarify` | 上个季度卖得怎么样？ | 缺时间与指标 → **澄清**，且一次问全 |
 
@@ -54,7 +57,8 @@ make demo      # 另一个终端：跑固化下来的六条问题
 | RAG Recall@8（重排开启） | `make eval-rag` | **20/20 = 100%**，定位一致率 17/20 → **19/20** |
 | 重排阈值 | `make calibrate-rerank` | 有答案 0.1364–0.9989 vs 不存在 0.0008–0.0125 → 取 **0.07** |
 | 语料缺陷注入 | `make verify-corpus` | **10/10 类**（其中 2 类只验证了语料侧，见下） |
-| 全量检查 | `make check` | **753 单测 + 104 集成** |
+| **Agent 端到端** | `make eval-agent` | **稳定用例 19/19**，观察用例 1/1（工具选择 / 冲突 / 审查 / 澄清各 5 条，需 `make run`） |
+| 全量检查 | `make check` | **844 单测 + 104 集成** |
 
 > **重排是默认关闭的**（`.env` 里 `RERANKER_ENABLED`），上表两行 Recall@8 是同一份
 > 语料与金标下的开/关对比：提升全部来自 `rag-06` 那条**同义词误拒**
@@ -192,8 +196,9 @@ make api        只起 API 进程           make test       仅单元测试
 make worker     只起 Worker 进程        make test-integration  需要真实 Redis 的用例
 make run        同时起两个进程          make fmt        格式化并自动修复
 
-make demo       端到端演示六条固化问题   make eval-sql   金标 SQL 评测
+make demo       端到端演示九条固化问题   make eval-sql   金标 SQL 评测
 make eval-rag   RAG Recall@8 评测        make verify-corpus  语料缺陷注入门禁
+make eval-agent Agent 端到端评测 20 条    make eval-agent-ask  先跑一遍再固化
 make ingest     语料入库并发布            make retrieve   单次混合检索（调试用）
 make sql        单次自然语言 → SQL 证据   make tokenize   中文分词逐条核对
 ```

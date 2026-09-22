@@ -146,6 +146,10 @@ eval-rag:  ## 跑 RAG 金标 20 条，产出 Recall@8 与定位一致率（前�
 	uv run python scripts/eval_rag.py $(if $(ONLY),--only $(ONLY),)
 calibrate-rerank:  ## 校准重排阈值：打印 20+3 条的分数分布与可用区间（前置：RERANKER_ENABLED=true）
 	uv run python scripts/calibrate_rerank.py
+eval-agent:  ## 跑 Agent 端到端评测集 20 条，按类报通过率（前置：另一个终端跑 make run）
+	uv run python scripts/eval_agent.py $(if $(ONLY),--only $(ONLY),)
+eval-agent-ask:  ## 先跑一遍再固化：make eval-agent-ask Q="某条还没固化的评测题" [ACCOUNT=analyst]
+	uv run python scripts/eval_agent.py --ask "$(Q)" $(if $(ACCOUNT),--as $(ACCOUNT),)
 demo:  ## 端到端演示九条固化问题（前置：另一个终端跑 make run）
 	uv run python scripts/demo.py $(if $(ONLY),--only $(ONLY),) $(if $(BASE),--base $(BASE),) $(if $(ASK),--ask "$(ASK)",)
 

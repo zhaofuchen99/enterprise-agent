@@ -1,0 +1,369 @@
+# Agent 端到端评测集（开发流程 6.15 第 2 项；构成见 7.4，冲刺方案 §6 定的 40 题口径）
+#
+# ```bash
+# make eval-agent                          # 跑全部
+# make eval-agent ONLY=agent-conflict-01   # 只跑一条（调 prompt 时用）
+# make eval-agent-ask Q="还没固化的问题"     # 先跑一遍再固化
+# ```
+#
+# ## 这一集测的是组件层测不到的那一层
+#
+# `eval-sql` 测「SQL 与金标结果集等价」、`eval-rag` 测「Recall@8」、
+# `verify-corpus` 测「缺陷真的注入了产物」、校验器用例测「安全 100% 阻断」。
+# **四道全绿而端到端照样可能是错的**——2026-09-20 实测到一次：
+# 工具选对了、SQL 也对，而答案里的数字是错的（80 行进 8 行，差 46%），
+# Reviewer 给了 100 分。问题不在任何单个组件里，在**它们串起来之后**：
+# `reflect` 该不该补一路、冲突该不该报、审查该不该拦。
+#
+# ## 判定用 `expect_*`，判据只有一份
+#
+# 判据在 `scripts/agent_harness.py`，与 `make demo` **共用同一份**——
+# 两份判据的漂移方式是"演示判对、评测判错"，而同一条问题在两个入口
+# 给出不同结论时，没有人能说出哪个才对。这里只登记**数据**。
+#
+# 断言的取值来源是 `GET /api/agent/tasks/{id}`（17.2 的任务详情）：
+#
+# | 键 | 读的字段 | 用途 |
+# |---|---|---|
+# | `expect_sources` | `steps[].tool` | 工具选择与路由（**精确集合**） |
+# | `expect_numbers` | 答案正文里的金额（按单位还原） | 答案层的数值门禁 |
+# | `expect_conflicts` / `_count` / `_contain` | `conflicts` | 冲突检出与**不误报** |
+# | `expect_limitations_contain` | `limitations` | 钉住**代码生成的**限制 |
+# | `expect_rejected` / `expect_clarification` | `refused` / 步骤为空 | 拒答与澄清 |
+# | `expect_review_*` | `review` | 审查确实跑过、结论形态正确 |
+#
+# `expect_sources` **缺省 = 不检查，`[]` 才是"不该调任何工具"**；
+# `expect_review_issue_codes` 同理。合成一个的话，一条只断审查结论的用例
+# 会被判成"工具选择不符"——而它压根没打算断言工具。
+#
+# ## 金标是怎么来的
+#
+# **全部来自真跑**（本项目的一条纪律）：每一条都先用 `make eval-agent-ask`
+# 跑过一次真链路，把实际走的工具、检出的冲突、审查结论、限制清单、
+# 答案里的数抄进来，再复跑一遍。这与 `demo_questions.yaml` 同源——
+# 那里踩过一次「2024年1月」（那一年恰好有数据，根本不触发演进），
+# 于是"先跑一遍再固化"写成了命令。
+#
+# 数值全部取**基准单位**（元，不写单位），判据会按单位还原答案里的数。
+# 真值来自 `make seed-business` 的确定性生成（`business_seed._rng` 是摘要
+# 派生的种子），所以写死在这儿是安全的；**改了种子脚本或规模必须整份重跑**。
+#
+# ## 实测（2026-09-22，首次全量）
+#
+# **稳定用例 19/19 = 100%、观察用例 1/1、无未判定**（四类各 5/5）。
+# 分母 19 而不是 20：`agent-clarify-03` 标了 `model-dependent`，不进门禁。
+# 阶段基线定在 **85%**（`eval_agent._DEFAULT_BASELINE`）——单条值 5 个点，
+# 贴着实测值会让门禁变成随机红；而更低则拦不住"某一类整体失效"
+# （丢 5 条会掉到 14/19 = 74%）。理由见常量的注释。
+#
+# ⚠️ **同一份清单前后跑过三次，结果不同**，值得记下来：第一次 20/20，
+# 第二次 19/20（`agent-clarify-03` 的 `refused=false`），改问法后
+# 稳定用例回到 19/19。差别不在系统，在**那条用例的问法**（见它的注释）。
+# 这也说明 `make eval-agent` 值得多跑几轮再固化——**单次通过不是证据**。
+#
+# ⚠️ **这个 100% 不等于"冲突检测是对的"**：五条冲突用例里，两条是刻意
+# 用 `expect_conflict_contain` 只钉"报了那一条"（因为同时有已知的假冲突，
+# 见下），两条钉的是"零条"（不误报）。**真正被验的是"该报的报了、
+# 不该报的没报"这两个方向**，不是"冲突检测整体正确"。
+#
+# ## 两类已知缺陷（本次扩集实测发现的，修复已登记，不在这里断言）
+#
+# ⚠️ **冲突检测缺时间粒度，会报出假冲突**。配对规则是「指标 + 维度范围相同
+# 就比」，而 `scope` 里只有 region / channel / product_line 这些**维度**，
+# 没有期间。于是 2025 年 8 月的库值会被拿去和「上半年合计」「全年」「Q1」
+# 的表格行比——维度都是 `{channel: 直营}`，判为可比。
+# 实测（2026-09-22）报出 4 条 157%–1133% 的假冲突，只有 1 条是真的。
+# 根因与修法见 CLAUDE.md【后续扩展】里「冲突检测的时间粒度」一条：
+# 判据要取「期间**相等**」而不是「期间相交」（表格行是它那个期间的**合计**，
+# 跨期间不可比；按相交判的话 H1/全年/H2 都包含 8 月，照样漏）。
+#
+# ⚠️ **维度比较是单向的，文档行少一个维度时照样判可比**。`conflict.py` 只遍历
+# **文档侧**的键，看不见 SQL 点多出来的维度。实测：文档「产品线表现」表是
+# **全公司**口径（claim scope 只有 `{product_line: 智能家居}`），SQL 查的是
+# **华东**（base scope `{region: 华东, product_line: 智能家居}`）→ 判为可比
+# → 报出相对差 **499.55%** 的假冲突。约定 41 挡住了"文档行维度更多"这个
+# 方向，反过来这个方向没有挡。
+# ⚠️ **不要顺手按"两边维度集合相等"去修**：那是个**试过并回退过**的判据，
+# 见 `app/tests/agent/test_conflict.py` 的
+# `test_an_unscoped_sql_aggregate_still_compares`——真正要做的是先重新论证
+# 那条用例的前提（它写于 `scope_filters` 抽取之前）。
+#
+# **这两条都不断言**（用 `expect_conflicts: true` + `_contain` 钉住真冲突，
+# 而不是钉条数）：钉死"5 条"会让修复本身把这条用例判红，而那是误报。
+# "零条"那两条是例外——单源问题本就没有第二个来源，**精确为 0** 是稳定判据，
+# 也正是"不误报"这个方向的断言。
+version: "2026.09.22-1"
+
+cases:
+  # ==================================================== 工具选择与路由（5）
+  #
+  # 这一类的价值全在**精确集合**：FR-PLAN-002 业务规则 1 明写「简单指标查询
+  # 不得强制调用 RAG」。一个永远两路都调的 Agent 在双源问题上表现完全正常，
+  # 所以"只该调一路"的用例才是这一类的主证据。
+  - id: agent-tool-01
+    category: tool_selection
+    question: 2025年Q3华南地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 132,493,082.21 元（2025-07-01 ~ 2025-09-30），业务库现查
+    expect_numbers: ["132493082.21"]
+    expect_conflict_count: 0
+    proves: 简单指标查询只走 SQL——**不因为"多调一路更保险"就调 RAG**。
+      与 agent-tool-05（双源）成对：一个证明会分，一个证明会合
+
+  - id: agent-tool-02
+    category: tool_selection
+    question: 2025年Q3华东地区的订单行数是多少？
+    expect_sources: [sql_query]
+    # 真值 12,480 行
+    expect_numbers: ["12480"]
+    proves: 计数类指标同样只走 SQL（`order_count` 口径，不是销售额）
+
+  - id: agent-tool-03
+    category: tool_selection
+    question: 临期产品清仓折扣的适用范围和条件是什么？
+    expect_sources: [rag_retrieve]
+    proves: 制度问法只走 RAG——**不该去查数据库**。这是 agent-tool-01 的反面
+
+  - id: agent-tool-04
+    category: tool_selection
+    question: 2025年Q3各产品线的净销售额分别是多少？
+    expect_sources: [sql_query]
+    # 四条产品线里取首尾两条断言即可：**断言的是"分对组了"**，
+    # 不是"四条都抄对"。全抄一遍的价值不比两条多，而误报机会翻倍。
+    # 真值：智能家居 123,346,973.20｜厨房电器 137,962,959.35
+    #       个护健康 158,668,750.82｜影音娱乐 209,943,437.89
+    expect_numbers: ["123346973.20", "209943437.89"]
+    proves: 维度分组路由到 SQL 而不是 RAG；两跳 JOIN（事实 → 产品 → 产品线）
+      在端到端里也走得通
+
+  - id: agent-tool-05
+    category: tool_selection
+    question: 2025年Q3华东地区的净销售额是多少？经营分析报告里对区域差异是怎么解释的？
+    expect_sources: [sql_query, rag_retrieve]
+    # 真值 111,967,031.73 元；报告侧的数字在本集里另有断言（agent-conflict-03）
+    expect_numbers: ["111967031.73"]
+    proves: 数字 + 解释**两路都要**——这是双源切片存在的理由，
+      也是"该分的时候分得对"的正面证据
+
+  # ==================================================== 多源冲突（5）
+  #
+  # 这一集的构成刻意是 **2 真 + 2 不误报**：冲突检测的漏报看不出来
+  # （答案照常给出，只是没人对过账），误报看得出来——所以两个方向都要钉。
+  - id: agent-conflict-01
+    category: conflict
+    question: 华东区域2025年第三季度专项分析里分区域经营情况表中华南的净销售额是多少？与数据库查到的数值一致吗？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_conflicts: true
+    # 文档值 130,620,700.00（13,062.07 万元）vs 库值 132,493,082.21 → 相对 1.41%
+    # **钉的是"报了哪一条"，不是"报了几条"**：钉条数会让修复假冲突的改动
+    # 把这条用例判红，而那是误报（见文件头的已知缺陷一）。
+    expect_conflict_contain: ["华东区域2025年第三季度专项分析", "region=华南"]
+    proves: 真冲突被检出，且**定位到具体哪一份文档、哪一行**。
+      这一条与 demo-cross 同源不同行（demo 用华东行）——换一行是刻意的，
+      防的是"某一行碰巧总能对上"
+
+  - id: agent-conflict-02
+    category: conflict
+    question: 2025年8月直营渠道的净销售额是多少？经营月报里的数和数据库对得上吗？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_conflicts: true
+    # 真冲突：月报「销售额」列是**含税 − 折扣**口径（未扣退货），
+    # 库里的 net_sales 已扣退货 → 58,625,000.00 vs 57,714,271.83，相对 1.58%。
+    # ⚠️ **实测同时报出 4 条假冲突**（上半年/全年/Q1/下半年的同类表格被
+    # 判为可比，相对差 157%–1133%），根因见文件头「已知缺陷一」。
+    # 这里只钉真的那一条，不钉条数。
+    expect_conflict_contain: ["2025年8月经营月报", "channel=直营"]
+    # 用块标量（`|-`）而不是裸标量：值以 `**` 开头时 YAML 会把它当成**别名**
+    # 去解析，报的是 "expected alphabetic or numeric character" ——
+    # 一个指不到这一行的错。
+    proves: |-
+      **口径型冲突**（同一个指标名的两种口径）也能被检出——
+      它不是算错，是两份材料对「净销售额」的定义不同，尤其需要如实披露。
+      别名匹配（`matched_by=alias`）会记进 `detected_difference`
+
+  - id: agent-conflict-03
+    category: conflict
+    question: 2025年第三季度经营分析报告里华东地区的净销售额是多少？与数据库查到的数值一致吗？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_conflicts: true
+    # 这一条的正确答案是"**两份内部报告彼此也不一致**"：
+    # 《2025年第三季度经营分析》的 11,196.70 万元与库一致（量化误差 31.73 元），
+    # 而《华东区域2025年第三季度专项分析》的 11,039.58 万元与库差 1.40%
+    # （那份报告的统计截止日是 09-25，比季度末早，是有意的注入）。
+    expect_conflict_contain: ["华东区域2025年第三季度专项分析", "region=华东"]
+    proves: 同一季度有两份内部报告而它们彼此不一致时，**不能假设内部来源
+      之间一定自洽**——检出的是那个与库对不上的那份
+
+  - id: agent-conflict-04
+    category: conflict
+    question: 2025年华东地区全年的退货金额是多少？
+    expect_sources: [sql_query]
+    # 真值 8,828,242.24 元
+    expect_numbers: ["8828242.24"]
+    # **精确为 0**：单源问题压根没有第二个来源可对，报出任何冲突都是误报。
+    expect_conflict_count: 0
+    proves: 单源路径**不无中生有**地报冲突——"没有可比的第二个数值"
+      与"两个数值一致"在结果上都是零条，而这一条钉的是前者不会变成后者
+
+  - id: agent-conflict-05
+    category: conflict
+    question: 2024年Q3华东地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 127,235,262.70 元（2024 有事实数据，但**没有 2024 年的报告**——
+    # 语料里的报告全部是 2025 年的）
+    expect_numbers: ["127235262.70"]
+    expect_conflict_count: 0
+    proves: 时间上错开的来源不会被凑成一对。2024 年的库值与 2025 年的报告
+      表格**在同维度上完全可能取值相同**，同维度就比会报出假的"一致"或
+      假的"不一致"，两条都是错的
+
+  # ==================================================== 审查（5）
+  #
+  # Reviewer-lite 只做 14.1 的六条**确定性检查**，正常情况下恒 PASS——
+  # 所以这里断言的是「**审查确实跑过、结论形态正确**」，不是拦截率。
+  # 拦截本身由 `app/tests/agent/test_reviewer.py` 的 12 条单元用例钉住
+  # （那里能造出 BLOCKING 的场景，端到端造不出来）。
+  #
+  # ⚠️ **断言的价值在于 `expect_review_issue_codes: []`**：Reviewer 误报的
+  # 症状是"分数低了点"，而分数不是通过判据——不钉住"零 issue"，
+  # 一条凭空多出来的 WARNING 永远不会有人发现。
+  - id: agent-review-01
+    category: reviewer
+    question: 2025年Q3华北地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 129,827,754.39 元（报告里的 12,982.78 万是四舍五入的写法）
+    expect_numbers: ["129827754.39"]
+    expect_review_status: PASS
+    expect_review_reason_code: GROUNDED
+    expect_review_issue_codes: []
+    expect_review_score_min: 100
+    proves: 单源答案经审查放行且**零扣分**——`reason_code=GROUNDED`
+      说的是"结论有依据"，那是 Reviewer 能给的最强结论
+
+  - id: agent-review-02
+    category: reviewer
+    question: 2025年全年华东地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 493,989,521.44 元（跨四个季度；与 demo-sql-annual 同型不同措辞）
+    expect_numbers: ["493989521.44"]
+    expect_review_status: PASS
+    expect_review_issue_codes: []
+    proves: 跨四季度的大聚合同样零 issue——用不同措辞问同一个数，
+      防止"固化了一个数、而它碰巧总能被抄对"
+
+  - id: agent-review-03
+    category: reviewer
+    question: 2025年Q3华东地区各渠道的净销售额分别是多少？
+    expect_sources: [sql_query]
+    # 四个渠道：直营 24,794,053.82｜经销 25,959,893.88
+    #             电商 29,559,772.15｜KA 31,653,311.88（取首尾两条断言）
+    expect_numbers: ["24794053.82", "31653311.88"]
+    expect_review_status: PASS
+    expect_review_issue_codes: []
+    proves: |-
+      **多行结果**进审查也是零 issue——`evidence_score` 的分母是
+      「有引用的结论占比」，多行答案最容易出现「某一行没被引用」
+
+  - id: agent-review-04
+    category: reviewer
+    question: 临期产品清仓折扣的审批要求是什么？
+    expect_sources: [rag_retrieve]
+    expect_review_status: PASS
+    expect_review_issue_codes: []
+    proves: 纯文档证据的答案同样过审。RAG 侧的引用是 `document_id` +
+      `section_path`，与 SQL 的证据形状不同——两条路都要被审到
+
+  - id: agent-review-05
+    category: reviewer
+    question: 2025年Q3华东地区净销售额同比下降的主要原因是什么？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_review_status: PASS
+    expect_review_issue_codes: []
+    proves: 双源 + 归因（答案里会带推断）也零 issue。⚠️ **13.5 允许
+      `HYPOTHESIS` 没有引用**（"证据不足时的推测"），那时应记一条 INFO
+      而**不判 FAIL**（约定 44）；本条实测模型把结论都挂上了证据，
+      所以是零 issue——那个 INFO 分支由 `test_reviewer.py` 覆盖，
+      端到端拿不到稳定复现（强行构造出来的是"模型这次怎么想的"，
+      不是系统的性质）
+
+  # ==================================================== 澄清、拒答与边界（5）
+  #
+  # 五条走的是**五种不同的机制**，不是同一个机制问五遍：
+  # 意图判定（澄清）×2、检索门禁/分析层（拒答）、期间越界（SQL 空 + 补 RAG）、
+  # 数据权限（受限账号）。四条路的后端完全不同，合成一个布尔量会看不出差别。
+  - id: agent-clarify-01
+    category: clarification
+    question: 最近业绩怎么样？
+    expect_clarification: true
+    proves: 详设 8.2 第 6 条：缺少会实质改变结果的时间与指标时进入澄清，
+      且问题要**最小**（一次问全，不挤牙膏）。`intent=CLARIFICATION`、
+      **一步都不跑**——`steps` 为空是这一条的判据
+
+  - id: agent-clarify-02
+    category: clarification
+    question: 这个月的销售情况怎么样？
+    expect_clarification: true
+    proves: 换一种问法仍进澄清。"最近"与"这个月"都缺指标名——
+      缺的是**两样**（时间 + 指标），要一次问全
+
+  - id: agent-clarify-03
+    category: clarification
+    # ⚠️ **观察用例**：拒答与否由模型判定，同一个问题两次跑可能不一样。
+    # 它不是"还没调好"，是这类系统的固有性质——**但不该混进通过率**，
+    # 那会把"模型这次判歪了"说成"系统坏了"（同 `demo_questions.yaml`）。
+    # 与 `demo-absent` 用同一套取值、同一条理由。
+    stability: model-dependent
+    # ⚠️ **问法是踩出来的**，第一版写的是「公司有没有针对直播带货的补贴制度？」。
+    # 实测（2026-09-22）那一版**两次跑里失败一次**：意图被判成需要 SQL，
+    # 于是拿到一条"规则记录数 = 0"的查询结果，分析层把它当成一条证据，
+    # 答"数据库里 0 条"而不是拒答 —— `refused=false`。
+    # 这正是 `demo_questions.yaml` 记过的那条「**问法影响路由**」。
+    # 改成**制度问法**（带书名号 + 「制度」）之后，三种问法各跑两次共 6 次，
+    # **refused 全为 true**。语料里不存在这份制度由
+    # `eval_rag_golden.yaml` 的 `rag-a2` 独立断言（`absent_probes: [直播, 带货]`
+    # 在 1871 个 chunk 正文里出现 0 次）。
+    #
+    # **它为什么仍是观察用例**：2/2 不是确定性。等它连续多轮都绿再改回
+    # `stable`——反过来把一条只因抖动而失败的用例标成观察用例，
+    # 是把回归藏起来，而那正是这个标记最容易被滥用的方向。
+    question: 《直播带货专项补贴制度》里规定的补贴标准是多少？
+    expect_rejected: true
+    # **拒答判据读 `refused` 字段，不认答案里的词**（约定 82）。
+    # 原先是一串字符串匹配，实测同一条问题、同一份代码，模型说「没有找到」
+    # 时判对、说「证据中没有…的条文」时判错，四次里错一次。
+    expect_review_status: PASS
+    proves: 11.8 第 1 条：语料里没有的制度必须**明确拒答、不编造**。
+      语料里渠道只有直营/经销/电商/KA，没有直播带货。
+      ⚠️ 拒答的任务**审查照样放行**——拒答不是失败，把它判成失败
+      会让"如实说不知道"变成一种受罚的行为
+
+  - id: agent-clarify-04
+    category: clarification
+    question: 2026年3月华东地区的净销售额是多少？
+    expect_rejected: true
+    # 实测走了 `[sql_query, rag_retrieve]`，但**不写 `expect_sources`**：
+    # 拒答是模式类断言，它通过后就不再判工具选择（判据见 `agent_harness.evaluate`），
+    # 写了也不会生效——而"写了不生效"正是这份清单最该避免的东西。
+    # 这一条走的是**另一条机制**：SQL 按条件查不到（0 行，`SUCCEEDED` +
+    # `is_empty`）→ `reflect` **据此补一路 RAG**（验收标准③的落点）→
+    # 报告也没有 2026 年 → 分析层如实说证据里没有那个时间点。
+    expect_review_status: PASS
+    proves: 验收③ + 11.8：**"查不到"要变成"如实说查不到"**，
+      而不是拿 2025 年的数顶上。业务库只到 2025-12-31
+
+  - id: agent-clarify-05
+    category: clarification
+    # 换受限账号跑——权限边界只有换账号才演示得出来。
+    account: analyst
+    question: 2025年Q3华南地区的净销售额是多少？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_conflict_count: 0
+    # 这两条是**代码生成的**限制，不是模型措辞（匹配串取代码独有的措辞）。
+    # 它们回答的是约定 80 那个问题：「看不到」被说成了「没有」。
+    expect_limitations_contain:
+      - "已按数据权限限定在 华东"
+      - "文档内容未经过滤"
+    expect_review_status: PASS
+    proves: 11.7 的数据权限只在 SQL 侧（约定 79）：受限账号问授权范围外的
+      区域时，答案必须说清「**看不到**」而不是「没有」，并声明文档来源
+      没有这一层过滤。同一个问题换个账号，限制就多出三条
