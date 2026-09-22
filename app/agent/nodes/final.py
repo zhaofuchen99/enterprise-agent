@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from app.agent.schemas.analysis import AnalysisResult
@@ -88,8 +88,8 @@ def _render(
         for index, claim in enumerate(analysis.claims, start=1):
             lines.append(f"{index}. {claim.text}")
             if claim.evidence_ids:
-                refs = "；".join(
-                    _cite(by_id[item_id]) for item_id in claim.evidence_ids if item_id in by_id
+                refs = _cite_all(
+                    [by_id[item_id] for item_id in claim.evidence_ids if item_id in by_id]
                 )
                 lines.append(f"   - 依据：{refs}")
             else:
@@ -146,6 +146,94 @@ def _render(
     return "\n".join(lines).strip()
 
 
+def _cite_all(items: Sequence[Evidence]) -> str:
+    """一条结论引用的全部证据 → 出处列表，**同源的合并成一条**。
+
+    ## 为什么必须合并
+
+    原先逐条按 `evidence_id` 渲染，于是同一章节同一页的 8 个表格行块
+    渲染出 **8 句一模一样的话**（2026-09-20 复跑实测）。读的人第一反应是
+    "格式坏了"——而它其实是"这条结论引用了同一张表的 8 行"，
+    一件**正常且必须能被看出来**的事。
+
+    ## 合并之后行号要留着
+
+    `（该表第 1–3、5 行）` 正是"引用能不能表达表的一部分"那个问题的答案：
+    **能，而且必须能**。否则合并会把"引用了整张表"与"引用了其中 8 行"
+    渲染成同一句话——而这两件事在"证据够不够"上完全不同，
+    约定 78 那个缺口（8 行当整表合计）就住在它们的差别里。
+
+    SQL 侧同理：一次查询的多行原先也渲染成同一句（只有指纹没有行号）。
+    """
+    groups: dict[str, list[Evidence]] = {}
+    for item in items:
+        # 分组键就是**渲染出来的那句出处**：合并的条件正是"读起来是同一个地方"。
+        # 另立一套键（比如按 `locator` 的某几个字段）会与渲染逻辑各说各话，
+        # 而漂移的症状是"合并了但看起来没合并"——反过来也一样。
+        groups.setdefault(_cite(item), []).append(item)
+    return "；".join(f"{base}{_merged_suffix(members)}" for base, members in groups.items())
+
+
+def _merged_suffix(members: Sequence[Evidence]) -> str:
+    """合并掉的那些证据**多出来的信息**：哪些行 / 一共几条。
+
+    只列行号与条数，不列 id：引用是给人读的，id 在结构化证据里。
+    """
+    rows = [
+        int(row[0])
+        for item in members
+        if _table_row(item) is not None and (row := _table_row(item))
+    ]
+    if rows:
+        caption = members[0].locator.get("table_caption")
+        name = f"表「{caption}」" if isinstance(caption, str) and caption else "该表"
+        return f"（{name}第 {_ranges(rows)} 行）"
+    # `result_slice` 是 **0 基**的（它是给程序切数组用的），而人读的行号从 1 起——
+    # 与 `tools/sql/evidence.py` 的标题（`结果第 {index + 1} 行`）保持同一个口径。
+    # 不加这个 1，引用里会出现「结果第 0 行」，而那一行不存在。
+    slices = [int(slice_[0]) + 1 for item in members if (slice_ := _result_slice(item)) is not None]
+    if slices:
+        return f"（结果第 {_ranges(slices)} 行）"
+    # 既不是表格行也不是 SQL 行，却仍然撞在同一句出处上——说明它们确实是
+    # 同一处的多个块。**如实说有几条**，不要让合并把"2 条"说得像"1 条"。
+    return f"（{len(members)} 条）" if len(members) > 1 else ""
+
+
+def _table_row(item: Evidence) -> tuple[int, int] | None:
+    row = item.locator.get("table_row")
+    if isinstance(row, list) and len(row) == 2 and all(isinstance(v, int) for v in row):
+        return int(row[0]), int(row[1])
+    return None
+
+
+def _result_slice(item: Evidence) -> tuple[int, int] | None:
+    value = item.locator.get("result_slice")
+    if isinstance(value, list) and len(value) == 2 and all(isinstance(v, int) for v in value):
+        return int(value[0]), int(value[1])
+    return None
+
+
+def _ranges(values: Sequence[int]) -> str:
+    """`[1, 2, 3, 5]` → `1–3、5`。
+
+    连续区间压成一段：8 个行号逐个列出来没人看，而"第 1–3、5 行"
+    一眼就知道是"这张表的一头一尾加一行"。
+    """
+    ordered = sorted(set(values))
+    if not ordered:  # 调用方都判过非空，这里是防"以后多一个调用方"
+        return ""
+    parts: list[str] = []
+    start = previous = ordered[0]
+    for value in ordered[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        parts.append(f"{start}–{previous}" if start != previous else str(start))
+        start = previous = value
+    parts.append(f"{start}–{previous}" if start != previous else str(start))
+    return "、".join(parts)
+
+
 def _cite(evidence: Evidence) -> str:
     """一条证据 → 人能读的出处。
 
@@ -162,8 +250,13 @@ def _cite(evidence: Evidence) -> str:
         # 后者在 `section_path` 是字符串时会把它逐字符拆开。
         path = locator.get("section_path")
         section = " > ".join(str(part) for part in path) if isinstance(path, list) else ""
+        # **标题里已经含了这段章节时不要再拼一遍**：文档证据的 `title` 是
+        # 「文档名 > 末级章节」（见 `tools/rag/evidence._title`），而
+        # `section_path` 是完整路径——两者常常拼成「《A > B》（A > B）」，
+        # 读起来像渲染坏了，而它只是同一个地方被说了两遍。
+        suffix = f"（{section}）" if section and section not in evidence.title else ""
         page = f"，第 {locator['page_no']} 页" if locator.get("page_no") else ""
-        return f"《{evidence.title}》{f'（{section}）' if section else ''}{page}"
+        return f"《{evidence.title}》{suffix}{page}"
     if evidence.source_type == "SQL":
         fingerprint = str(locator.get("sql_fingerprint", ""))[:12]
         return f"业务数据库查询 {fingerprint}"
