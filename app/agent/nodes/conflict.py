@@ -21,7 +21,7 @@ SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
 **这份清单就是面试口径**：被问"冲突检测做了多少"时，答案是
 「一类（VALUE）做了，四类没做，各缺什么前提写在这里」，而不是"做了冲突检测"。
 
-## 一个实测出来的关键约束：**两边的维度集合必须一致**
+## 一个实测出来的关键约束：**两个方向的维度都要对上**
 
 第一版只把"表里的第一个维度列"当作范围，于是这样一张表会出事：
 
@@ -33,24 +33,34 @@ SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
 于是拿 764.63 万去对华东季度总额 1.12 亿，报出**相对差 93%** 的"冲突"——
 而两个数压根不是一回事。
 
-判据在**文档侧**：表格的维度列超过一个时，那一行是比"按一个维度汇总"更细的
-切片，而 SQL 那边的粒度**从证据上看不出来**——它是 `SELECT SUM(net_amount)
-WHERE region='华东'` 这种带 WHERE 的标量聚合时，结果集只有一个聚合列，
-`Evidence.scope` 是空的，粒度只存在于 SQL 文本里。所以：
+判据在 `_comparable` 里，两个方向各遍历一次：
 
 | 文档表格 | SQL 证据 | 比不比 |
 |---|---|---|
 | 单维度（区域），华东 | `scope` 含 region_name=华东 | ✅ 共有维度取值相同 |
 | 单维度（区域），华东 | `scope={}`（WHERE 里筛的华东） | ✅ 无法反驳，比 |
 | 单维度（区域），华南 | `scope` 含 region_name=华东 | ⛔ 取值不同 |
-| 三维度（区域/渠道/产品线） | 任意 | ⛔ 粒度更细，比了就是假冲突 |
+| 三维度（区域/渠道/产品线） | 任意 | ⛔ 文档行更细，比了就是假冲突 |
+| 单维度（产品线），全公司 | `scope` 含 region=华东 + product_line | ⛔ SQL 更细，比的是两个总体 |
 
-**用"文档侧只有一个维度列"而不是"两边维度集合相等"**：后者看着更严格，
-但它会把上面第二行那种**真冲突**也挡掉——而那条正是 `demo-cross` 的headline。
-这是实测出来的：先写成集合相等，跑一遍发现真冲突没了。
+**最后一行是后补的**（2026-09-22 实测）：原先只判"文档行比 SQL 更细"这**一个
+方向**，反方向没有挡。于是文档里**全公司**口径的「产品线表现」表被拿去对
+**华东**的库值——两边产品线相同、`any(...)` 对一个空迭代恒为假——报出相对差
+**499.55%** 的假冲突。**SQL 点比文档行多一个维度，说明它更细**，
+而更细的数与更粗的行比的是两个不同的总体。
+
+**判据不是"两边维度集合相等"**：那个看着更严格，但会把上表第二行那种
+**真冲突**也挡掉——而那条正是 `demo-cross` 的 headline。这是实测出来的：
+先写成集合相等，跑一遍发现真冲突没了。真正的规则是**两个方向各遍历一次**，
+而空 `scope` 两边都遍历零个键、恒为真——**放行**。
 
 这条比"识别合计行"更根本，而且不需要语料做任何改动——
 **表里没有合计标记时，"这一行跨了几个维度"就是可比的判据**。
+
+⚠️ **放行的方向是有代价的，如实记下**：SQL 侧范围真的未知时（`scope={}`，
+可能是 `WHERE` 里的标量聚合，也可能是真没有范围限定的全量聚合），文档的
+每一行都会照比。**多报看得出来**（读者会问"华南这行凭什么对华东的库值"），
+**漏报看不出来**——所以取舍是往多报那边倒的。
 
 
 文档表头写的是 `净销售额（万元）`，SQL 证据带的是 `metric_code=net_sales`。
@@ -147,17 +157,11 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
             for base in sql_points:
                 if claim.metric_code != base.metric_code:
                     continue
-                # 判据在文档侧，见模块 docstring 的那张表。
+                # 判据见模块 docstring 的那张表。
                 # **多维度列 = 明细行**，拿它去对任何汇总值都是假冲突。
                 if len(claim.scope) > 1:
                     continue
-                # 共有维度上取值必须相同。SQL 的 `scope` 为空时不比这一项——
-                # 那说明它的粒度在 WHERE 里，从证据上看不出来。
-                if (
-                    claim.scope
-                    and base.scope
-                    and any(base.scope.get(key) != value for key, value in claim.scope.items())
-                ):
+                if not _comparable(claim, base):
                     continue
                 difference = _difference(claim.value, base.value)
                 if difference is None:
@@ -172,9 +176,9 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
 class _Point:
     """一个可比较的数值点（`(指标, 维度集合, 数值)`）。
 
-    `scope` 是**维度字典**而不是单个字符串：可比性取决于"两边的维度集合
-    是否相同"，而单个字符串表达不了"这一行同时被区域、渠道、产品线限定"。
-    把三个维度里最早出现的那个当成范围，正是那个 93% 假冲突的来源。
+    `scope` 是**维度字典**而不是单个字符串：可比性取决于两边的维度对不对得上
+    （见 `_comparable`），而单个字符串表达不了"这一行同时被区域、渠道、
+    产品线限定"。把三个维度里最早出现的那个当成范围，正是那个 93% 假冲突的来源。
     """
 
     __slots__ = ("evidence_id", "matched_by", "metric_code", "scope", "value")
@@ -230,6 +234,49 @@ def _sql_dimensions(item: Evidence) -> dict[str, str]:
     而那表现为"冲突检测突然不工作了"，不指向这里。
     """
     return {key: str(value) for key, value in item.scope.items() if key != "data_scope"}
+
+
+def _comparable(claim: _Point, base: _Point) -> bool:
+    """文档的某一**行**与 SQL 的某一个**点**是不是同一个总体。
+
+    ## 两个方向各遍历一次，而它们不是同一件事
+
+    - **文档侧的键 → SQL 侧查得到且相等**（约定 41 立的规矩）：文档行若比
+      SQL 点多一个维度，它是 SQL 结果的**明细**，拿一行去对汇总是假冲突；
+    - **SQL 侧的键 → 文档侧也要有且相等**（本判据补的那一半）：反过来，
+      SQL 点比文档行多一个维度时它更细，两者比的是**两个不同的总体**。
+
+    第二半是实测补上的（2026-09-22）：文档「产品线表现」表是**全公司**口径
+    （`{product_line: 智能家居}`），SQL 查的是**华东**
+    （`{region: 华东, product_line: 智能家居}`）。只判第一半时，
+    `any(...)` 对 SQL 侧多出来的 `region` 键一无所知，判为可比，
+    报出相对差 **499.55%** 的假冲突。
+
+    ## 任一侧为空 → 放行，这是**有意**的
+
+    `SELECT SUM(net_amount) WHERE region_name='华东'` 这类标量聚合的结果集
+    只有一个聚合列，`_scope_of` 从列名里取不到 `region`，粒度只存在于 SQL
+    文本里。空 `scope` 是"**我们不知道它的粒度**"，不是"它没有粒度"——
+    按"不知道就不比"处理，`demo-cross` 那条真冲突会一起消失，
+    而那条正是这个双源切片存在的理由。**判据不能写成"两边维度集合相等"**：
+    那是**试过并回退过**的写法
+    （见 `test_an_unscoped_sql_aggregate_still_compares`）。
+
+    代价如实记下：SQL 侧范围真未知时，文档的每一行都会被比对
+    （`test_without_a_sql_side_scope_every_row_still_compares` 钉住 5 条）。
+    **宁可多报**——多报看得出来（读者会问"华南这行凭什么对华东的库值"），
+    漏报看不出来。
+
+    ⚠️ 这条放行**两个方向都适用**，因此它挡不住下面这一种情形：文档行
+    与 SQL 点**都不是空的、但维度互不相干**（一个只有 `product_line`、
+    另一个只有 `region`）。那要靠"SQL 侧多出的键在文档侧也得有"来判——
+    而那正是本函数存在的理由，它只在这条放行之后生效。
+    """
+    if not claim.scope or not base.scope:
+        return True
+    return all(claim.scope.get(k) == v for k, v in base.scope.items()) and all(
+        base.scope.get(k) == v for k, v in claim.scope.items()
+    )
 
 
 def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
@@ -401,6 +448,10 @@ def _build_conflict(
             "tolerance": difference["tolerance"],
             "matched_by": claim.matched_by,
             "scope": claim.scope,
+            # **SQL 侧的粒度也要进明细**：判"可比"要两个方向的维度都对上，
+            # 而原先只记了文档侧，于是"凭什么拿这一行对那个库值"在产物上
+            # 看不出来——那条 499.55% 的假冲突正是这么溜过去的（`_comparable`）。
+            "database_scope": dict(base.scope),
         },
         possible_explanations=(
             "口径不同：报告中的「销售额」按含税 − 折扣列示、未扣退货冲减，"

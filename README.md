@@ -58,7 +58,7 @@ make demo      # 另一个终端：跑固化下来的九条问题
 | 重排阈值 | `make calibrate-rerank` | 有答案 0.1364–0.9989 vs 不存在 0.0008–0.0125 → 取 **0.07** |
 | 语料缺陷注入 | `make verify-corpus` | **10/10 类**（其中 2 类只验证了语料侧，见下） |
 | **Agent 端到端** | `make eval-agent` | **稳定用例 19/19**，观察用例 1/1（工具选择 / 冲突 / 审查 / 澄清各 5 条，需 `make run`） |
-| 全量检查 | `make check` | **844 单测 + 104 集成** |
+| 全量检查 | `make check` | **848 单测 + 104 集成** |
 
 > **重排是默认关闭的**（`.env` 里 `RERANKER_ENABLED`），上表两行 Recall@8 是同一份
 > 语料与金标下的开/关对比：提升全部来自 `rag-06` 那条**同义词误拒**
@@ -300,6 +300,8 @@ LOOP__MAX_TOTAL_STEPS=30
 | **Reranker 默认关闭**（已实现，需配置启用） | 关闭时检索用 RRF 融合后的 Top-8 直接出证据；打开才走 cross-encoder 重排 | 已实现 11.7 第 ⑥⑦ 步（`app/tools/rag/reranker.py`，`BAAI/bge-reranker-v2-m3` 云服务）。**本机跑不了本地重排**：Ollama 无 rerank 端点（实测 404），本地 cross-encoder 与 7.6GB 内存不相称；11.7 第 ⑧ 步「邻近块扩展」仍后置 |
 | **SSE 重放暂走 Redis Stream** | 断线重连在流保留期（1 小时）内可完整补齐，超出窗口只能拿到 `snapshot` + `replay_lost=true` | 18.3 的「MySQL 权威重放」要先把 Worker 的每条事件**先落 `agent_trace_event` 取 sequence 再 XADD**，而现在的轨迹是收尾时批量落的（两批事件不是同一批）；合并已登记 |
 | **冲突检测只做 VALUE 一类** | 口径 / 时点 / 范围 / 来源四类没做，各有各的缺前提（见 `app/agent/nodes/conflict.py` 的清单） | Phase 9 |
+| **语料缺陷：带范围报告的「产品线表现」表分子分母不同源** | `SR-EC-2025Q3`（华东）那张表的分子是全公司、分母是华东，实测「占比」列 = **187.4%**，自相矛盾 | `scripts/gen_corpus.py` 的 `line_rows` 少传了报告自身的 `region`/`channel`（`region_rows`/`channel_rows` 都传了）。修它要把**文档级范围**灌进 payload——与时间粒度那条同一条管道，合并做。见 CLAUDE.md【后续扩展】 |
+| **已知误报：冲突检测缺时间粒度** | 配对规则里没有"期间"，2025 年 8 月的库值会被拿去和「上半年合计」「全年」的表格行比，实测报出 4 条 157%–1133% 的假冲突 | Phase 9。修法要加「文档统计期间」（`configs/corpus_manifest.yaml` 的 `report.period` 现在被生成器丢掉了），连带新写 `reindex` 命令 + 全量重入库；与 13.4 的 TIME 冲突同源，合并做。勘察结论见 CLAUDE.md【后续扩展】 |
 | **已知误报：表格的合计行与分项行不分** | 实测里一张表的分项行被当成区域合计去比，报出过 92% 的"差异" | 需要表格的合计标记或指标口径的 `grain`；模型能在 `claims` 里自己纠正，检测器这一层还不能 |
 | **Reviewer 只做确定性检查** | 14.1 的第二阶段（模型审查）与 `RETRY` / `CLARIFY` 两个状态没做 | Phase 8 完整版 |
 | 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |

@@ -160,8 +160,9 @@ def test_a_multi_dimension_table_is_not_compared_to_a_region_total() -> None:
     就比了，于是拿 764.63 万去对华东季度总额 1.12 亿，报出**相对差 93%** 的
     "冲突"——而两个数压根不是一回事。
 
-    判据是**维度集合相等**：SQL 证据的 `scope` 键就是它的粒度，
-    文档表格的维度列给出另一份。这条比"识别合计行"更根本，
+    判据是**文档侧的维度列超过一个**：SQL 那边的粒度未必全在结果列里
+    （标量聚合的 `scope` 是空的），所以只能从文档侧判"这一行是不是比
+    按一个维度汇总更细"。这条比"识别合计行"更根本，
     而且不需要语料做任何改动。
     """
     catalog = _catalog(_metric("net_sales", "净销售额"))
@@ -337,3 +338,62 @@ def test_without_a_sql_side_scope_every_row_still_compares() -> None:
     )
 
     assert len(conflicts) == 5
+
+
+#: 一张**只有产品线一个维度列**的表——表头里没有区域列，所以它表达的是
+#: **全公司**口径（`claim.scope` 只有 `{product_line: …}`）。
+_PRODUCT_LINE_TABLE = """2025年第三季度经营分析 > 五、产品线表现
+表：分产品线净销售额
+产品线 | 净销售额（万元）
+智能家居 | 12,334.70"""
+
+
+def test_a_coarser_document_row_is_not_compared_to_a_finer_sql_point() -> None:
+    """**SQL 点比文档行多一个维度 → 不比**（约定 41 的另一个方向）。
+
+    实测踩到的（2026-09-22）：文档「产品线表现」表是**全公司**口径
+    （表头只有产品线列，`claim.scope = {product_line: 智能家居}`），
+    而 SQL 查的是**华东**
+    （`base.scope = {region: 华东, product_line: 智能家居}`）。
+
+    原先的判据只遍历**文档侧**的键，`base` 侧多出来的 `region` 无人过问，
+    于是判为可比，报出相对差 **499.55%** 的假冲突——而两个数比的是
+    两个不同的总体（全公司 vs 华东）。**SQL 更细**这一侧原先没有挡。
+
+    只加约束不加对照的话，一次"全都不比了"的改动也能让这条通过，
+    所以下面有一条对照用例断言"该比的照比"。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    finer = _sql_evidence(111_967_031.73).model_copy(
+        update={"scope": {"region": "华东", "product_line": "智能家居"}}
+    )
+
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_PRODUCT_LINE_TABLE, title="2025年第三季度经营分析"), finer],
+        catalog=catalog,
+    )
+
+    assert conflicts == ()
+
+
+def test_a_coarser_document_row_still_compares_when_the_sql_side_is_coarse_too() -> None:
+    """对照：**SQL 侧也只有产品线时照比**——那条是真冲突。
+
+    与上一条的差别只有 SQL 侧的 `scope`：这条没有 `region`。
+    两条合起来才钉住"多出来的那个维度"是判据本身，而不是别的东西。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    same_grain = _sql_evidence(111_967_031.73).model_copy(
+        update={"scope": {"product_line": "智能家居"}}
+    )
+
+    conflicts = detect_value_conflicts(
+        [_document_evidence(_PRODUCT_LINE_TABLE, title="2025年第三季度经营分析"), same_grain],
+        catalog=catalog,
+    )
+
+    assert len(conflicts) == 1
+    # **两个方向的粒度都进明细**：判"可比"要两边都对上，只记文档侧的话，
+    # "凭什么拿这一行对那个库值"在产物上看不出来（499.55% 那条就是这么溜过去的）
+    assert conflicts[0].detected_difference["scope"] == {"product_line": "智能家居"}
+    assert conflicts[0].detected_difference["database_scope"] == {"product_line": "智能家居"}
