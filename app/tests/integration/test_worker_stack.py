@@ -271,8 +271,20 @@ async def test_full_loop_through_a_real_worker(
         )
     assert trace_ids == {task.trace_id}
     assert started[0] == "supervisor"
-    # 简单查询的路径：supervisor → sql → reflect → conflict → analysis → reviewer → final
-    assert started == ["supervisor", "sql", "reflect", "conflict", "analysis", "reviewer", "final"]
+    # 简单查询的路径：
+    # supervisor → sql → reflect → conflict → analysis → reviewer → retry_router → final
+    # `retry_router` 在**正常路径上也跑一次**（读审查结论、决定要不要重试），
+    # 不重试时什么都不改就直接去 `final`。
+    assert started == [
+        "supervisor",
+        "sql",
+        "reflect",
+        "conflict",
+        "analysis",
+        "reviewer",
+        "retry_router",
+        "final",
+    ]
     # **每个进入都有一个离开**：卡住的节点在只有离开事件的轨迹上看不出来
     assert [row.node for row in trace if row.event_type != "node.started"] == started
     assert all(row.duration_ms is not None for row in trace if row.event_type != "node.started")

@@ -37,6 +37,7 @@ START → supervisor ─┬─(sql)──→ sql ──┐
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -47,6 +48,7 @@ from app.agent.nodes.analysis import build_analysis_node
 from app.agent.nodes.conflict import build_conflict_node
 from app.agent.nodes.final import build_final_node
 from app.agent.nodes.reflect import build_reflect_node
+from app.agent.nodes.retry_router import build_retry_router_node
 from app.agent.nodes.reviewer import build_reviewer_node
 from app.agent.nodes.supervisor import build_supervisor_node
 from app.agent.nodes.tool_nodes import build_rag_node, build_sql_node, deadline_for
@@ -71,6 +73,7 @@ _NODE_REFLECT = "reflect"
 _NODE_CONFLICT = "conflict"
 _NODE_ANALYSIS = "analysis"
 _NODE_REVIEWER = "reviewer"
+_NODE_RETRY_ROUTER = "retry_router"
 _NODE_FINAL = "final"
 
 #: `Route` → 节点名。`CLARIFY` / `FAIL` 都收敛到 `final`：
@@ -82,6 +85,10 @@ _TARGETS: dict[Route, str] = {
     Route.ANALYSIS: _NODE_CONFLICT,
     Route.CLARIFY: _NODE_FINAL,
     Route.FAIL: _NODE_FINAL,
+    #: 作废整份计划回 supervisor（`retry_router` 的 `REPLAN`）。**只回这里，
+    #: 不回别处**：`_after_supervisor` 的候选列表里有 supervisor 的出口，
+    #: 而从别处进 supervisor 会让"supervisor 只跑一次"这条前提失效。
+    Route.REPLAN: _NODE_SUPERVISOR,
 }
 
 
@@ -122,6 +129,54 @@ def _after_reflect(state: AgentState) -> str:
     """
     route = route_dispatch(state)
     return _TARGETS[route]
+
+
+def _over_step_budget(state: AgentState, limit: int) -> bool:
+    """总步数超限（详设 5.4 的 `max_total_steps`）——**最后一道护栏**。
+
+    判据是**"已经跑了多少步"**而不是"绕了多少圈"：回边写错时绕圈的症状正是
+    步数停不下来，而"圈数"在 State 里没有载体（`plan_revision` 只数演进，
+    补证与 replan 都不加它）。`step_results` 的键是 step_id，而每次重试都
+    **追加新步骤**（`retry_router._next_step_id`），所以它数得准。
+
+    ⚠️ 在它之前唯一的护栏是 LangGraph 的 `recursion_limit`，而那条路走到底
+    的产物是 `INTERNAL_ERROR` + `trace_incomplete` + 五张表全空——**一次
+    "什么东西坏了"的收尾，而不是一个说得清的结论**。这条护栏的意义就是
+    让"用尽了"走正常出口（受限回答），而不是让它变成一次内部错误。
+
+    ⚠️ **它不到 `final`，到 `conflict`**：那里才有正常的收尾链
+    （`conflict → analysis → reviewer → final`）。直接去 `final` 会拿到
+    `analysis is None` 的失败答案——而超限不是失败，是"不再尝试新的取证路径"
+    （FR-REV-002 业务规则 3 的原话）。
+    """
+    return len(state.get("step_results") or {}) >= limit
+
+
+def _after_retry(state: AgentState) -> str:
+    """`retry_router -> ?`：`retry_route` 说去哪就去哪；没有就收工去 `final`。
+
+    **它读 `retry_route` 而不是从 State 推**：`retry_target=analysis`
+    （重跑分析）与"不重试了"在 State 上长得一模一样——两者都没有 PENDING
+    步骤——条件边推不出来。这条偏离要在 `nodes/retry_router.py` 的模块说明里。
+    """
+    route = state.get("retry_route")
+    return _NODE_FINAL if route is None else _TARGETS[route]
+
+
+def _guard(route: Callable[[AgentState], str], settings: Settings) -> Callable[[AgentState], str]:
+    """把「总步数超限」这道护栏套在一条回边的判据上。
+
+    **套在回边上，不套在每个节点里**：会绕圈的只有回边，而节点有八个——
+    在八个地方各判一次，漏掉的那个就是绕不完的那一条（同 `tracing.traced`
+    用包装器而不是每个节点里写一遍的理由）。
+    """
+
+    def guarded(state: AgentState) -> str:
+        if _over_step_budget(state, settings.loop.max_total_steps):
+            return _NODE_CONFLICT
+        return route(state)
+
+    return guarded
 
 
 def _add_node(
@@ -179,13 +234,14 @@ def build_graph(
     _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog), events)
     _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway), events)
     _add_node(graph, _NODE_REVIEWER, build_reviewer_node(), events)
+    _add_node(graph, _NODE_RETRY_ROUTER, build_retry_router_node(), events)
     _add_node(graph, _NODE_FINAL, build_final_node(), events)
 
     graph.add_edge(START, _NODE_SUPERVISOR)
     graph.add_conditional_edges(
         _NODE_SUPERVISOR,
         _after_supervisor,
-        [_NODE_SQL, _NODE_RAG, _NODE_ANALYSIS, _NODE_FINAL],
+        [_NODE_SQL, _NODE_RAG, _NODE_ANALYSIS, _NODE_CONFLICT, _NODE_FINAL],
     )
     graph.add_edge(_NODE_SQL, _NODE_REFLECT)
     graph.add_edge(_NODE_RAG, _NODE_REFLECT)
@@ -193,7 +249,7 @@ def build_graph(
     # 那条任务循环的回边。本版没有 `plan_extend` 节点，演进由 `reflect` 直接改写计划。
     graph.add_conditional_edges(
         _NODE_REFLECT,
-        _after_reflect,
+        _guard(_after_reflect, settings),
         [_NODE_SQL, _NODE_RAG, _NODE_CONFLICT],
     )
     # 详设 6.1 的顺序是 `evidence_aggregate → conflict_detect → analysis`：
@@ -204,7 +260,15 @@ def build_graph(
     # **草稿**（`analysis_result`），而不是渲染后的 Markdown——
     # 渲染会丢掉结构（claim 与引用的对应关系），从文本反推回结构是错的方向。
     graph.add_edge(_NODE_ANALYSIS, _NODE_REVIEWER)
-    graph.add_edge(_NODE_REVIEWER, _NODE_FINAL)
+    # 详设 6.6.1：`reviewer → retry_router → Tool/analysis`。
+    # **`retry_router` 是节点而不是光一个条件边**：它要消耗预算、要追加步骤，
+    # 而条件边是纯函数，写不了 State（见 `nodes/retry_router.py`）。
+    graph.add_edge(_NODE_REVIEWER, _NODE_RETRY_ROUTER)
+    graph.add_conditional_edges(
+        _NODE_RETRY_ROUTER,
+        _guard(_after_retry, settings),
+        [_NODE_SQL, _NODE_RAG, _NODE_CONFLICT, _NODE_SUPERVISOR, _NODE_FINAL],
+    )
     graph.add_edge(_NODE_FINAL, END)
     return graph.compile()
 

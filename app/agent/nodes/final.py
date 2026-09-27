@@ -39,10 +39,20 @@ def build_final_node() -> Callable[[AgentState], Any]:
             # supervisor 之前就失败了（模型不可用 / 计划非法）：
             # **不要编一个答案**，把已经发生的错误如实说出去。
             answer = _failure_answer(state)
-        elif review is not None and review.status == "FAIL":
+        elif review is not None and review.status == "CLARIFY":
+            # 14.3：需要用户定口径 / 时间 / 范围。
+            answer = _clarify_answer(review)
+        elif review is not None and review.status in ("FAIL", "RETRY"):
             # 14.3 的一票否决：**结论没有依据时不把答案放出去**。
             # 这类答案看起来和别的答案一样，只是那句结论是空口说的，
             # 而人会拿它去做决定——拦住它是 Reviewer 存在的全部意义。
+            #
+            # **`RETRY` 也走这里**，虽然是理论上的：`retry_router` 在正常路径上
+            # 一定会把它接走（接了就去重跑，接不走就降级成 CLARIFY / FAIL）。
+            # 但万一它到了这里，**按 FAIL 处置而不是照常渲染**——RETRY 的含义
+            # 正是"这条答案还不该发出去"，渲染出去等于把一次没跑完的重试
+            # 当成结论。多这一条分支的代价是一行，少它的代价是一条
+            # 看起来完全正常的错误答案。
             answer = _blocked_answer(analysis, review)
         else:
             answer = _render(analysis, evidence, state, review)
@@ -72,6 +82,30 @@ def _blocked_answer(analysis: AnalysisResult, review: Any) -> str:
         lines.append("## 补充说明")
         lines.extend(f"- {item}" for item in analysis.limitations)
     return "\n".join(lines)
+
+
+def _clarify_answer(review: Any) -> str:
+    """审查要求澄清时的答案（14.3 的 CLARIFY）。
+
+    **与 `supervisor` 的澄清是同一种答案**（都是"请你补一句"），但理由不同：
+    那一种是**问题本身没说清**（"上个季度"是哪一年），这一种是**答到一半
+    发现继续不下去了**——例如缺的是一整类信息，而补证预算已经用尽。
+    两者的用户动作一样（补一句话），所以渲染成一个形状。
+
+    ⚠️ **本版还产不出它**：`reviewer` 不填 `clarification_question`，
+    而 `retry_router` 的降级（14.4）在没有澄清问题时是 FAIL 不是 CLARIFY。
+    这条分支是为第二阶段（模型审查）先铺的，见【后续扩展】。
+    """
+    question = review.clarification_question or "请补充必要的信息"
+    return "\n".join(
+        [
+            "在给出结论前，需要你先确认一点。",
+            "",
+            f"> {question}",
+            "",
+            f"> 审查：{review.status}（{review.reason_code}）",
+        ]
+    )
 
 
 def _render(

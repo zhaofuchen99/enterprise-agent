@@ -106,7 +106,15 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
             "task_list": task_list,
             "current_step_index": 0,
             "plan_revision": state.get("plan_revision", 0),
+            # **三份预算是三份，不是一个**（FR-REV-002 业务规则 1：相互独立、
+            # 不可借用）。`state.get(..., 配置)` 而不是直接写配置值：
+            # 重新规划会让 supervisor 跑第二次，那一次**不能把已消耗的预算
+            # 重置回满额**——否则"replan 一次就回满血"可以被无限绕。
             "expansions_left": state.get("expansions_left", settings.loop.max_expansions),
+            "review_retries_left": state.get(
+                "review_retries_left", settings.loop.max_reviewer_evidence
+            ),
+            "replans_left": state.get("replans_left", settings.loop.max_replans),
             "errors": [],
             "next_route": _route_for(task_list[0]),
         }

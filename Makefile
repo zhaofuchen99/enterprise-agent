@@ -19,8 +19,11 @@ bootstrap:  ## 首次启动：创建 .env 与虚拟环境
 	@echo "完成。下一步：make up"
 
 up:  ## 启动有状态组件（redis / agent-mysql / business-mysql / qdrant / minio）
-	$(COMPOSE) up -d
-	@echo "等待健康检查通过…"
+	@# `--wait` 是**真的等**，不是打一行字。原先这里只 echo 一句"等待健康检查通过…"
+	@# 就往下走，于是紧接着的 `make migrate` 会撞上还在启动的 MySQL，报
+	@# `Lost connection to MySQL server during query` —— 那条错误指向连接配置，
+	@# 而真实原因只是"再等十几秒就好"（从零启动实测踩到）。
+	$(COMPOSE) up -d --wait
 	@$(COMPOSE) ps
 
 rag-up:  ## 兼容旧写法：确保 Qdrant 已启动（它已并入默认 up，此目标可省略）

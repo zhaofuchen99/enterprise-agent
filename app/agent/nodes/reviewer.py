@@ -28,9 +28,11 @@
 而人拿它去做决定。所以本节点在 `status=FAIL` 时让 `final` 输出"审查未通过"
 而不是把原答案放出去（见 `nodes/final.py`）。
 
-`RETRY` / `CLARIFY` 不产出：前者要 `retry_router` 与预算，后者要
-WAITING_CLARIFICATION 的状态位与续跑入口，两者都属 Phase 8。
-**这不是"没检查"，是"检查了但只能整体通过或整体拦下"**，登记在案。
+`CLARIFY` 仍不产出：它要 WAITING_CLARIFICATION 的状态位与续跑入口。
+
+`RETRY` **已产出**（Phase 8）：判据见 `_retry_target`——只认"标成 FACT 的结论
+没有引用，而两路取证还有一路没查过"。路由由 `nodes/retry_router.py` 决定，
+本节点只负责**说清缺什么**，不决定去哪（14.3 明写"Reviewer 不直接指定 SQL"）。
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from typing import Any
 from app.agent.schemas.analysis import AnalysisResult
 from app.agent.schemas.plan import StepStatus
 from app.agent.schemas.review import ReviewIssue, ReviewResult
-from app.agent.state import AgentState
+from app.agent.state import AgentState, unconsulted_source
 from app.domain.evidence import ConflictSeverity
 
 #: 答案里**不该出现**的字段名与值（19.2 的脱敏纪律）。
@@ -96,7 +98,12 @@ def review(analysis: AnalysisResult, state: AgentState) -> ReviewResult:
     issues.extend(_check_sensitive(answer_text))
 
     blocking = [item for item in issues if item.severity == "BLOCKING"]
-    status = "FAIL" if blocking else "PASS"
+    # **RETRY 优先于 FAIL**：14.3 的判定表里 RETRY 排在 FAIL 前面，而两者的
+    # 前提不同——FAIL 是"这条答案不发出去了"，RETRY 是"还差一步，先去补"。
+    # 有预算且补得到时当然选后者：直接拦下等于把一条**本来能救回来**的答案扔掉。
+    target = _retry_target(analysis, state)
+    retrying = target is not None and state.get("review_retries_left", 0) > 0
+    status = "RETRY" if retrying else ("FAIL" if blocking else "PASS")
     return ReviewResult(
         status=status,
         score=_score(issues),
@@ -109,9 +116,36 @@ def review(analysis: AnalysisResult, state: AgentState) -> ReviewResult:
             for claim in analysis.claims
             if not claim.evidence_ids
         ),
-        retry_target=None,
+        retry_target=target if retrying else None,
         reason_code=_reason(status, blocking),
     )
+
+
+def _retry_target(analysis: AnalysisResult, state: AgentState) -> str | None:
+    """14.3 的 RETRY 判据：**存在可通过一次 Tool 修复的问题**。
+
+    本版只认一种：**标成 `FACT` 的结论没有任何引用，而两路取证还有一路没查过**。
+    这时"去把那一路查了"是一次有明确收益的动作——证据补回来之后，
+    `analysis` 要么能给这条结论找到依据，要么证明它确实无据，**两种结果
+    都比现在好**。
+
+    ## 为什么不"任何 FAIL 都先重试一次"
+
+    **重试必须能改变结果**。两路都查过之后还没有依据，再补只是把同一个
+    动作重做一遍——14.3 明写"Reviewer 不得以'文风不够好'为由触发昂贵
+    Tool 重试"，理由是重试要花真钱（一次 SQL 生成 + 一次执行）与真时间。
+
+    所以这里的判据是**"还有一路没查过"**（`state.unconsulted_source`），
+    而不是"有没有 BLOCKING"。两者不等价：`REQUIRED_STEP_NOT_RUN`
+    同样 BLOCKING，但它是流程出了问题（计划里的必需步骤没跑），
+    补一路取证解决不了——那该按 14.3 的"关键数据源不可用"判 FAIL。
+    """
+    uncited_fact = any(claim.kind == "FACT" and not claim.evidence_ids for claim in analysis.claims)
+    if not uncited_fact:
+        return None
+    route = unconsulted_source(state)
+    # `Route` 的取值与 14.4 的 `retry_target` 逐字相同（`"sql"` / `"rag"`）
+    return None if route is None else route.value
 
 
 def _check_required_steps(state: AgentState) -> list[ReviewIssue]:
@@ -303,6 +337,11 @@ def _score(issues: list[ReviewIssue]) -> int:
 def _reason(status: str, blocking: list[ReviewIssue]) -> str:
     if status == "PASS":
         return "GROUNDED" if not blocking else "PASS_WITH_ISSUES"
+    if status == "RETRY":
+        # **RETRY 的原因码要指向"要补什么"，不是"哪里不合格"**：
+        # 读这个码的人是在排查"为什么多跑了一轮"，而那个问题的答案是
+        # "结论缺引用、还有一路没查"——`CLAIM_WITHOUT_EVIDENCE` 只说了一半。
+        return "CLAIM_WITHOUT_EVIDENCE_RETRY"
     return blocking[0].code if blocking else "UNKNOWN"
 
 

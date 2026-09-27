@@ -62,7 +62,13 @@ class Route(StrEnum):
 
     SQL = "sql"
     RAG = "rag"
+    #: ⚠️ 落到 **`conflict`** 而不是 `analysis`（`_TARGETS` 里那条映射）。
+    #: 冲突检测要的是"证据都到齐了"这个时点，路由回这里时会重跑它再进
+    #: `analysis`——重试补完证据之后，冲突也确实该重新算一遍。
     ANALYSIS = "analysis"
+    #: 作废整份计划回到 `supervisor`（详设 14.4 的 `REPLAN`）。
+    #: **它不是一个循环**：换的是计划，不是"再试一次同一个动作"。
+    REPLAN = "replan"
     CLARIFY = "clarify"
     FAIL = "fail"
 
@@ -159,14 +165,28 @@ class AgentState(TypedDict, total=False):
     #: 【Phase 9 未接】多源冲突检测
     conflicts: list[Scalar]
     analysis_result: AnalysisResult | None
-    #: 【Phase 8 未接】Reviewer
+    #: `ReviewResult`（标成 `Scalar` 是为了避开与 `schemas.review` 的循环引用）
     review_result: Scalar
+    #: `retry_router` 的判定结果（详设 14.4）。**条件边的唯一依据**。
+    #:
+    #: 为什么不像 `reflect` 那样"由条件边从更新后的 State 推出来"：
+    #: `retry_target=analysis`（重跑分析）与"不重试了，去 final"在 State 上
+    #: **长得一模一样**（两者都没有 PENDING 步骤），条件边推不出来。
+    #: 见 `nodes/retry_router.py` 的模块说明。
+    retry_route: Route | None
 
     # ---------------------------------------------------------- 收敛与产出
     errors: Annotated[list[AgentError], merge_errors]
-    #: 【Phase 7 未接】四类循环预算尚只用到 `max_expansions`，
-    #: 完整实现见详设 6.6.1（四类相互独立、不可借用）
+    #: **计划演进**剩余次数（详设 6.6.1 第一类）。执行阶段的 `reflect` 与
+    #: 审查阶段的 `retry_target=expand` 共用这一份——两者之和不超过配置值，
+    #: 这是 14.3 明写的（避免"执行阶段激进 + 审查阶段再来一轮"）。
     expansions_left: int
+    #: **Reviewer 补证**剩余次数（第二类，`max_reviewer_evidence`）。
+    #: 约束 `reviewer → retry_router → Tool/analysis` 那条回边。
+    review_retries_left: int
+    #: **重新规划**剩余次数（第三类，`max_replans`）。它**不是循环**：
+    #: 作废整份计划回到 supervisor，只在计划本身不可执行时用。
+    replans_left: int
     execution_status: TaskStatus
     final_answer: str | None
     answer_payload: dict[str, Any] | None
@@ -189,6 +209,89 @@ def pending_steps(state: AgentState) -> list[TaskStep]:
 
 def has_pending_step(state: AgentState) -> bool:
     return bool(pending_steps(state))
+
+
+#: 两路取证工具：**工具名 ↔ 路由值 ↔ 补它时给步骤写的目标说明**。
+#:
+#: **这张表只写一处**。读它的地方有三个：`reflect` 的"该补哪一路"、
+#: `retry_router` 的补证步骤、`reviewer` 的"还有哪一路没查过"。
+#: 三处各写一份的症状是**"某类补证再也不发生"**——没有任何地方会报错，
+#: 只是行为静默地少了一种（同 `tools/sql/schemas.SCOPE_COLUMNS` 的理由，
+#: 那里写的是"漂移时的症状是某类冲突再也检不出来"）。
+COMPLEMENTS: tuple[tuple[str, str, Route, str], ...] = (
+    (
+        "sql_query",
+        "rag_retrieve",
+        Route.RAG,
+        "从企业制度与报告知识库补查该问题涉及的规定与解释",
+    ),
+    (
+        "rag_retrieve",
+        "sql_query",
+        Route.SQL,
+        "从业务数据库补查该问题涉及的指标数值",
+    ),
+)
+
+
+def missing_complement(sources: set[str]) -> tuple[str, str] | None:
+    """已跑过的工具集合 → **该补的那一路**：`(工具名, 目标说明)`。
+
+    没有可补的（两路都跑了、或两路都没跑）时返回 `None`。
+    `reflect` 与 `reviewer` 问的是同一个问题："还差哪一路没查"。
+    """
+    for already, missing, _route, objective in COMPLEMENTS:
+        if already in sources and missing not in sources:
+            return missing, objective
+    return None
+
+
+def unconsulted_source(state: AgentState) -> Route | None:
+    """**还没查过的那一路**（`Route.SQL` / `Route.RAG`）；两路都查过或都没查过时 None。
+
+    给 `reviewer` 用：一条结论没有引用时，"去补一路证据"与"重跑分析"
+    是两种处置，而**只有前者可能改变结果**——证据没变，重跑分析只会
+    得到同样的结论。
+
+    "都没查过"与"都查过了"都返回 None，但含义不同：前者是计划本身有问题
+    （不在"补证"能解决的范围内），后者是补也无处可补。
+    """
+    done = executed_sources(state)
+    for already, _missing, route, _objective in COMPLEMENTS:
+        if already in done and _missing not in done:
+            return route
+    return None
+
+
+def route_for_tool(tool: str) -> Route | None:
+    """工具名 → 它对应的路由值（`sql_query` → `Route.SQL`）。"""
+    for already, _missing, route, _objective in COMPLEMENTS:
+        if already == tool:
+            return route
+    return None
+
+
+def tool_for_route(route: Route) -> str:
+    """路由值 → **要跑的那个**工具名。**不在表里直接抛**：那说明调用方传错了。
+
+    ⚠️ 返回的是 `_missing` 而不是 `_already`：这张表一行读作
+    "跑过 A 之后该补 B"，而 `route` 指的是 **B**。
+    返回 `_already` 的症状是**补证步骤去重跑了同一条路**——
+    任务照跑、结果照有，只是那一轮什么都没补到。
+    """
+    for _already, missing, known, _objective in COMPLEMENTS:
+        if known == route:
+            return missing
+    raise ValueError(f"{route} 不是一条取证路由")
+
+
+def objective_for_route(route: Route) -> str:
+    """补那一路时给步骤写的目标说明。**不写具体 SQL**——14.3 明写
+    "Reviewer 不得直接指定 SQL"，它只说清要补什么。"""
+    for _already, _missing, known, objective in COMPLEMENTS:
+        if known == route:
+            return objective
+    raise ValueError(f"{route} 不是一条取证路由")
 
 
 def executed_sources(state: AgentState) -> set[str]:

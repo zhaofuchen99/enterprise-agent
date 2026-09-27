@@ -47,16 +47,11 @@ from collections.abc import Callable
 from typing import Any
 
 from app.agent.schemas.plan import ProgressAssessment, TaskStep
-from app.agent.state import AgentState, executed_sources, pending_steps
+from app.agent.state import AgentState, executed_sources, missing_complement, pending_steps
 
-#: 补哪一路：已跑过的那路 → 该补的那路。
-#: **只在这里定义一次**：`_plan` 里的数据源与工具映射在 supervisor，
-#: 而这里要的是"互补"，两者是不同的关系，混在一起会写出
-#: "补一路但补的是同一路"这种不会报错的错。
-_COMPLEMENT: dict[str, tuple[str, str]] = {
-    "sql_query": ("rag_retrieve", "从企业制度与报告知识库补查该问题涉及的规定与解释"),
-    "rag_retrieve": ("sql_query", "从业务数据库补查该问题涉及指标的数值"),
-}
+# 互补关系（"sql 空则该补 rag"）**表在 `state.COMPLEMENTS`，不在这里**。
+# `reviewer` 问的是同一个问题（"还有哪一路没查过"），而两处各写一份的症状是
+# **"某类补证再也不发生"**——没有任何地方会报错，只是行为静默地少了一种。
 
 
 def build_reflect_node() -> Callable[[AgentState], Any]:
@@ -136,11 +131,12 @@ def _assess(state: AgentState) -> ProgressAssessment:
 
 
 def _missing_complement(sources: set[str]) -> tuple[str, str] | None:
-    """该补的那一路；没有可补的（或预算不足）时返回 None。"""
-    for tool, complement in _COMPLEMENT.items():
-        if tool in sources and complement[0] not in sources:
-            return complement
-    return None
+    """该补的那一路；没有可补的（或预算不足）时返回 None。
+
+    **表在 `state.COMPLEMENTS`**：`reviewer` 问的是同一个问题，
+    两处各写一份的话，"某类补证再也不发生"不会有任何症状。
+    """
+    return missing_complement(sources)
 
 
 def _next_step_id(state: AgentState) -> str:

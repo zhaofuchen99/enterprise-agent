@@ -614,9 +614,22 @@ async def test_every_node_leaves_a_started_and_a_leave_event(settings: Settings)
     events = state["trace_events"]
     started = [event for event in events if event.event_type == "node.started"]
     leaves = [event for event in events if event.event_type != "node.started"]
-    # 简单查询的路径：supervisor → sql → reflect → conflict → analysis → reviewer → final
-    # （`conflict` 与 `reviewer` 是确定性节点，同样会在轨迹里留下痕迹）
-    expected = ["supervisor", "sql", "reflect", "conflict", "analysis", "reviewer", "final"]
+    # 简单查询的路径：
+    # supervisor → sql → reflect → conflict → analysis → reviewer → retry_router → final
+    # （`conflict` / `reviewer` / `retry_router` 都是确定性节点，同样留下痕迹）
+    # `retry_router` 在**正常路径上也跑一次**：它读审查结论、决定要不要重试，
+    # 不重试时什么都不改，直接去 `final`。这是有意的——把"要不要重试"这件事
+    # 放在一个能被轨迹看见的地方，而不是藏在一个条件边函数里。
+    expected = [
+        "supervisor",
+        "sql",
+        "reflect",
+        "conflict",
+        "analysis",
+        "reviewer",
+        "retry_router",
+        "final",
+    ]
     assert [event.node for event in started] == expected
     # **事件是成对的**：只有离开事件的话，一个卡住的节点在轨迹上
     # 表现为"什么都没发生"，与"压根没跑到"长得一样
@@ -650,3 +663,62 @@ async def test_a_node_reporting_failure_is_recorded_as_node_failed(settings: Set
     # 失败之后仍要走到 `final`（由它给出一句面向用户的说明），
     # 因此记的是 failed 而不是"图在这里断了"
     assert leaves[-1].node == "final"
+
+
+# ---------------------------------------------------------------- ⑨ 审查驱动的重试
+
+
+async def test_a_review_retry_actually_runs_and_the_loop_stops(settings: Settings) -> None:
+    """审查要求补证 → 真的去查了没查过的那一路 → 回路停下（详设 14.3 / 14.4）。
+
+    ## 为什么这条必须在图上测
+
+    单元用例钉的是 `choose_retry` 的判据与预算的加减，**测不到"边接对了没有"**：
+    `_after_retry` 返回一个不在候选列表里的节点名时，LangGraph 抛的是
+    "Found edge starting at unknown node"——一个只在真的跑一次图时才会出现的错。
+
+    ## 脚本为什么是两份分析
+
+    `FakeModelGateway` 的脚本**按调用顺序弹出**，而 `supervisor` 与 `analysis`
+    都调模型。第一份分析刻意产出一条**没有引用的 FACT**（那是本版唯一的
+    重试触发），补证之后第二份不再产出它——于是回路走完一轮就收敛。
+
+    ⚠️ 这条用例同时钉住"**回路会停**"：真跑飞了的话，它不会给出错误答案，
+    而是撞上 `recursion_limit` 抛 `GraphRecursionError`——**这条用例会直接失败**，
+    这正是想要的。
+    """
+    from app.agent.schemas.analysis import AnalysisResult
+
+    uncited = AnalysisResult.model_validate(
+        {
+            "direct_answer": "华东 Q3 净销售额为 1.12 亿元。",
+            "refused": False,
+            "claims": [
+                {"text": "华东 Q3 净销售额为 1.12 亿元", "kind": "FACT", "evidence_ids": []}
+            ],
+        }
+    )
+    # 第二份**没有任何结论**：`refused` 与 `claims` 都合规，于是审查 PASS。
+    # 不构造"有引用的 FACT"是为了不必伪造一个合法的 `evd_` id——
+    # 那会让这条用例同时依赖 `_check_evidence_exists`，而它与重试无关。
+    after_retry = AnalysisResult.model_validate(
+        {"direct_answer": "补证后重新组织。", "refused": False, "claims": []}
+    )
+    sql, rag = FakeTool("sql_query"), FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(
+        settings,
+        [_intent(["sql"])],
+        sql_tool=sql,
+        rag_tool=rag,
+        analyses=[uncited, after_retry],
+    )
+
+    state = await _invoke(settings, graph)
+
+    assert len(rag.calls) == 1, "补证步骤真的跑到了没查过的那一路"
+    assert len(sql.calls) == 1, "已经查过的那一路不该重跑"
+    assert state["review_result"].status == "PASS"
+    assert state["review_retries_left"] == 0, "补证预算花掉一次"
+    # **补证不是计划演进**：它是同一份计划里多跑一步，不是换一份计划
+    assert state["plan_revision"] == 0
+    assert [step.tool for step in state["task_list"]] == ["sql_query", "rag_retrieve"]
