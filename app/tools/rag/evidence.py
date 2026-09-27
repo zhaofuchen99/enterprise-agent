@@ -148,8 +148,13 @@ def _evidence_of(chunk: RetrievedChunk, *, question: str, retrieved_at: datetime
         # 见模块 docstring：分块不带指标 code，留空而不是按 logical_key 反推
         metric_code=None,
         definition_version=None,
-        # 同上：分块没有维度字段，硬塞会让 13.4 的维度比对多出对不上的键
-        scope={},
+        # **文档级范围**（《华东区域…专项分析》→ `{region: 华东}`），来自清单的
+        # `report.region` / `report.channel`。它不是"这条分块的维度"，
+        # 而是"这份文档说的是哪个总体"——同一个「分产品线」表头，
+        # 全公司报告与区域报告指的是两个总体，**表头里看不出来**。
+        # 冲突检测把它并进 claim 的 scope 再比，见 `conflict._document_points`。
+        scope=dict(meta.document_scope),
+        stat_period=meta.stat_period,
         reliability=_reliability(meta),
         # 对**正文**取哈希：同一段文字出现在两个版本里时，它们说的就是同一件事，
         # 13.4 第 1 步的"判同"要的正是这个粒度。版本差异由 locator 承担，

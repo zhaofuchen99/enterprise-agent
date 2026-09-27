@@ -408,6 +408,63 @@ async def test_same_version_with_new_content_is_rejected(
     assert "v1.0" in caught.value.message
 
 
+async def test_force_rebuilds_even_when_the_fingerprint_is_unchanged(
+    tmp_path: Path,
+    settings: Settings,
+    storage: LocalObjectStorage,
+    vector_store: InMemoryVectorStore,
+    documents: InMemoryKnowledgeDocumentRepository,
+    gateway: FakeModelGateway,
+    vocabulary: object,
+) -> None:
+    """`force=True` 是"**无条件重建**"，所以它必须排在幂等短路**之前**。
+
+    改的是**写进 payload 的东西**（新增一个字段、改一处序列化）时，文件一个
+    字节没动、指纹完全相同——幂等短路会把它判成"跳过"，于是**重建根本没发生**，
+    而命令是绿的、索引还是旧的。`reindex` 走的正是这条路（见 `cli._reindex`）。
+
+    与"不加 `force` 就跳过"成对：把 `force` 提到最前**不能**把幂等一起弄丢，
+    那会让每次 `make ingest` 都重算 88 篇的向量。
+    """
+    path = _write(tmp_path)
+    first = await _ingest(
+        path,
+        settings=settings,
+        storage=storage,
+        vector_store=vector_store,
+        documents=documents,
+        gateway=gateway,
+        vocabulary=vocabulary,
+    )
+    assert first.ok
+
+    again = await _ingest(
+        path,
+        settings=settings,
+        storage=storage,
+        vector_store=vector_store,
+        documents=documents,
+        gateway=gateway,
+        vocabulary=vocabulary,
+    )
+    assert again.skipped is True, "指纹没变、已发布 → 11.9 的幂等跳过仍然生效"
+
+    rebuilt = await _ingest(
+        path,
+        settings=settings,
+        storage=storage,
+        vector_store=vector_store,
+        documents=documents,
+        gateway=gateway,
+        vocabulary=vocabulary,
+        force=True,
+    )
+
+    assert rebuilt.skipped is False, "加了 force 就必须真的走一遍，而不是照旧跳过"
+    assert rebuilt.ok
+    assert rebuilt.chunk_count == first.chunk_count
+
+
 async def test_force_rebuild_replaces_content(
     tmp_path: Path,
     settings: Settings,
@@ -777,3 +834,47 @@ async def test_payload_round_trips_through_chunk_metadata(
     assert restored.effective_from == date(2025, 1, 1)
     assert restored.checksum and len(restored.checksum) == 64
     assert restored.status is DocumentStatus.ACTIVE
+
+
+async def test_payload_carries_the_document_level_period_and_scope(
+    tmp_path: Path,
+    settings: Settings,
+    storage: LocalObjectStorage,
+    vector_store: InMemoryVectorStore,
+    documents: InMemoryKnowledgeDocumentRepository,
+    gateway: FakeModelGateway,
+    vocabulary: object,
+) -> None:
+    """报告的**统计期间**与**文档级范围**必须进 payload。
+
+    这两个值只存在于**文档身份**上（清单的 `report:` 块），**不在表头里**：
+    同一个「分产品线」表头，全公司报告与区域报告说的是两个总体。
+    丢了它们的症状是冲突检测**把两个总体当成一个**（报假冲突）或反过来
+    （漏报），两者都不指向 payload——所以要有这条断言钉住它。
+
+    冒烟测试**不校验字段集合**（它只验"这块能不能被自己召回"），
+    而 `PAYLOAD_KEYS` 是没有调用方的死代码，因此**只有这条 round-trip
+    抓得住"新字段没写进 payload"**。
+    """
+    from app.tools.rag.metadata import ChunkMetadata
+
+    await _ingest(
+        _write(tmp_path),
+        settings=settings,
+        storage=storage,
+        vector_store=vector_store,
+        documents=documents,
+        gateway=gateway,
+        vocabulary=vocabulary,
+        metadata=_metadata(stat_period="2025-Q3", document_scope={"region": "华东"}),
+    )
+
+    hits = await vector_store.search_dense(
+        [0.1] * settings.embedding_dim,
+        limit=1,
+        chunk_filter=ChunkFilter(document_ids=("policy/east-china-channel-discount@v1.0",)),
+    )
+    restored = ChunkMetadata.from_payload(hits[0].payload)
+
+    assert restored.stat_period == "2025-Q3"
+    assert restored.document_scope == {"region": "华东"}

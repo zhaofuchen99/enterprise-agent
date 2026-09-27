@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
+import tempfile
 from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, date, datetime
 from functools import lru_cache
@@ -46,7 +48,9 @@ from app.tools.rag.ingestion import (
     DocumentMetadata,
     IngestionReport,
     ingest_document,
+    sha256_file,
 )
+from app.tools.rag.metadata import document_key
 from app.tools.rag.parser import SUFFIX_TO_FORMAT, ParsedDocument, parse_document
 from app.tools.rag.schemas import RagQueryArgs
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
@@ -61,6 +65,11 @@ HandlerResult = int | Coroutine[Any, Any, int]
 
 #: 语料目录。`chunk` 用它定位生成报告（取标题与文档键），找不到就退化成文件名。
 _CORPUS_ROOT = Path("data/corpus")
+
+#: 清单 `report:` 块里**算维度**的键。取值必须与证据 `scope` 的键逐字一致
+#: （`{"region": "华东"}`），否则并入 `claim.scope` 时对不上任何东西——
+#: 而"对不上"的表现是静默地不比，不是报错。
+_DOCUMENT_SCOPE_KEYS = ("region", "channel")
 
 
 async def _seed(settings: Settings, args: argparse.Namespace) -> int:
@@ -624,6 +633,141 @@ def _ingest_failure_count(reports: list[IngestionReport], failures: list[tuple[s
     return len(failures) - unsupported
 
 
+async def _reindex(settings: Settings, args: argparse.Namespace) -> int:
+    """从**归档原文**重建向量索引（11.9：collection 是可重建的派生数据）。
+
+    ## 它解决的是哪一个问题
+
+    `make ingest` 是幂等的，而**改了"写进 payload 的东西"时指纹恰恰不会变**
+    ——新增一个字段、改一处序列化，文件一个字节没动。于是幂等短路把它判成
+    "跳过"，**重建根本没发生**：命令全绿，索引还是旧的，
+    而下次检索读到的仍是旧字段——这个症状不指向这里。
+
+    ## 以归档原文为准，而且先对账
+
+    逐行比对 `knowledge_document.checksum` 与归档原文的 SHA-256，
+    不一致就**拒绝重建这一篇**并报出来。两者分叉说明这一版曾被原地重建过
+    而归档换了（`FORCE=1` 重建失败时的已知分叉，见 11.9 的落地记录）——
+    照着一份不知道是哪一版的归档重建，会造出一批**引用打得开、
+    内容却不是被引用那一段**的证据。
+
+    ## 它与 `make ingest FORCE=1` 的分工只有一条：**归档是不是最新的**
+
+    - 只改了代码（payload 字段、序列化）→ 用 `reindex`，它认归档；
+    - 改了语料生成器并重跑过 `make corpus --clean` → 用
+      `make ingest FORCE=1`，它认 `data/corpus/` 下的新文件，
+      而归档里存的仍是**入库那一刻**的旧内容。
+
+    两种情形用错命令的症状是一样的"跑完了但没变"，所以这里会把
+    "磁盘上的语料文件已与归档不同"的篇目**当场打出来**。
+    """
+    entries = _corpus_entries()
+    by_key = {f"{item['logical_key']}@{item['version']}": item for item in entries.values()}
+
+    engine = create_engine(settings)
+    redis = create_client(settings)
+    storage = build_object_storage(settings)
+    vector_store = build_vector_store(settings)
+    gateway = build_model_gateway(settings)
+    reports: list[IngestionReport] = []
+    failures: list[tuple[str, str]] = []
+    try:
+        sessions = create_session_factory(engine)
+        documents = SqlKnowledgeDocumentRepository(sessions)
+        records = await documents.list_documents()
+        if args.only:
+            wanted = {item.strip() for item in args.only.split(",") if item.strip()}
+            records = [
+                record
+                for record in records
+                if document_key(record.logical_key, record.version) in wanted
+                or record.logical_key in wanted
+            ]
+        if not records:
+            print("版本账本里没有可重建的文档（先跑 make ingest）")
+            return 1
+
+        vocabulary = await load_vocabulary(
+            SqlVocabRepository(sessions),
+            VersionedCache(redis, default_ttl_seconds=settings.rag.vocab_cache_ttl_seconds),
+            storage,
+            ttl_seconds=settings.rag.vocab_cache_ttl_seconds,
+        )
+        tokenizer = Tokenizer.from_settings(settings)
+        await vector_store.ensure_collection(dim=settings.embedding_dim)
+
+        print(f"重建索引：账本 {len(records)} 篇，以**归档原文**为准")
+        for index, record in enumerate(records, start=1):
+            # 用 `document_key` 而不是自己拼 `f"{logical_key}@{version}"`：
+            # 这个值同时是 chunk_id 的派生种子与向量库的删除选择器，
+            # 两处各拼一次就会在某个版本号写法上分叉（见 `metadata.document_key`）。
+            key = document_key(record.logical_key, record.version)
+            item = by_key.get(key)
+            if item is None:
+                failures.append((key, "语料报告里没有这一篇的元数据"))
+                print(f"[{index:3d}/{len(records)}] {key:36} 跳过：报告里无元数据")
+                continue
+            try:
+                data = await storage.get(record.storage_path)
+            except Exception as exc:
+                failures.append((key, f"归档读不到：{exc}"))
+                print(f"[{index:3d}/{len(records)}] {key:36} 失败：归档读不到")
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != record.checksum:
+                # **拒绝而不是照着重建**：这两个值分叉意味着归档不是被引用的那一版，
+                # 照它重建出来的证据会引用一段别的文字，而引用本身仍然打得开。
+                failures.append((key, "行的 checksum 与归档原文不一致"))
+                print(
+                    f"[{index:3d}/{len(records)}] {key:36} **拒绝**："
+                    f"行的 checksum {record.checksum[:12]}… ≠ 归档 {digest[:12]}…"
+                )
+                continue
+            # 判"磁盘上的语料是不是已经和归档分家了"。**用 try/except 而不是
+            # `Path.exists()`**：一来 `exists()` 在 async 里是阻塞调用（ASYNC240），
+            # 二来"先问在不在、再读"中间有个窗口，而这里要的只是"读得到就读"。
+            source = Path(item["path"])
+            try:
+                on_disk = sha256_file(source)
+            except OSError:
+                on_disk = None
+            if on_disk is not None and on_disk != record.checksum:
+                print(
+                    f"{'':10}注意：{source.name} 已与归档不同（语料重新生成过）。"
+                    "本次重建的是归档那一份；要用新内容请 `make ingest FORCE=1`"
+                )
+            # 归档落到临时文件：`ingest_document` 的入口收的是 Path，
+            # 而它自己要做的归档是幂等的（同一 key 覆盖同样的字节）。
+            # 后缀要保住——`validate_format` 按它判格式。
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / Path(record.storage_path).name
+                path.write_bytes(data)
+                report = await ingest_document(
+                    path,
+                    _metadata_from_entry(item),
+                    settings=settings,
+                    storage=storage,
+                    vector_store=vector_store,
+                    documents=documents,
+                    gateway=gateway,
+                    tokenizer=tokenizer,
+                    vocabulary=vocabulary,
+                    force=True,
+                )
+            reports.append(report)
+            if not report.ok:
+                failures.append((key, report.error_summary or "重建失败"))
+            print(f"[{index:3d}/{len(records)}] {_format_ingest_line(item['id'], report)}")
+    finally:
+        await gateway.aclose()
+        await vector_store.aclose()
+        await redis.aclose()
+        await engine.dispose()
+
+    _print_ingest_summary(reports, failures)
+    return 1 if _ingest_failure_count(reports, failures) else 0
+
+
 def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
     """语料报告的一条 → 入库元数据。
 
@@ -632,7 +776,13 @@ def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
     （Pydantic 会转），但转换失败时的报错落在"入库第 47 篇"上，
     而这一处是**所有文档的来源标记唯一产生的地方**——FR-SEARCH-001 的
     SOURCE 冲突判定全靠它。在这里转，错了就在启动时错。
+
+    报告的 `report` 块在这里拆成两个字段（`stat_period` / `document_scope`）：
+    它们是"这一版说的是哪段时间、哪个范围"，**冲突检测判"两边是不是同一个
+    总体"靠它们**。只认 `region` 与 `channel` 两个键——`report` 里另外那些
+    （`basis` / `cutoff` / `outlook`）不是维度，塞进 scope 会造出对不上的键。
     """
+    report: dict[str, Any] = item.get("report") or {}
     return DocumentMetadata(
         logical_key=item["logical_key"],
         version=item["version"],
@@ -644,6 +794,8 @@ def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
         effective_from=_parse_date(item.get("effective_from")),
         effective_to=_parse_date(item.get("effective_to")),
         published_at=_parse_datetime(item.get("published_at")),
+        stat_period=str(report["period"]) if report.get("period") else None,
+        document_scope={key: str(report[key]) for key in _DOCUMENT_SCOPE_KEYS if report.get(key)},
     )
 
 
@@ -1086,6 +1238,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     retrieve.set_defaults(as_of="", doc_type=[], department=[])
     sub.add_parser("verify-corpus", help="逐条检出 10 类缺陷注入（详细设计 6.7 的门禁）")
+    reindex = sub.add_parser(
+        "reindex",
+        help="从归档原文重建向量索引——改了写进 payload 的字段之后用它（`make ingest` 会全跳过）",
+    )
+    reindex.add_argument(
+        "--only", default="", metavar="KEY", help="只重建这些 logical_key 或 logical_key@version"
+    )
     args = parser.parse_args(argv)
 
     if args.command == "tokenize" and not args.text:
@@ -1116,6 +1275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chunk": _chunk,
         "vocab": _vocab,
         "ingest": _ingest,
+        "reindex": _reindex,
         "retrieve": _retrieve,
         "verify-corpus": _verify_corpus,
     }

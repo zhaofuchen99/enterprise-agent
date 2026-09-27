@@ -40,7 +40,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.knowledge import DocumentStatus, SourceKind
 from app.tools.rag.chunker import Chunk
@@ -89,6 +89,17 @@ class ChunkMetadata(BaseModel):
     effective_from: date | None = None
     effective_to: date | None = None
     published_at: datetime | None = None
+    #: **统计期间**记号（`2025-Q3` / `2025-08` / `2025` / `2025-H1`），
+    #: 来自清单的 `report.period`。报告"这一版说的是哪一段时间"。
+    #: **与 `effective_from/to` 是两件事**：那是生效区间，报告类文档没有它，
+    #: 只有统计期间——而冲突检测要的是后者（13.4 第 5 步的 TIME）。
+    #: `None` 表示**没有**（制度、产品资料），**不是**"不限期间"。
+    stat_period: str | None = None
+    #: **文档级**维度范围（《华东区域2025年第三季度专项分析》→ `{"region": "华东"}`）。
+    #: 它不在表头里、而在文档身份上：同一个「分产品线」表头，全公司报告里是
+    #: 公司口径、区域报告里是区域口径，**光看表头分不出来**。漏掉它的后果是
+    #: 把同一个总体当成两个，或者反过来把两个总体当成一个。
+    document_scope: dict[str, str] = Field(default_factory=dict)
     #: 发布态（PROCESSING / ACTIVE / FAILED / ARCHIVED），见模块 docstring 的偏离 1
     status: DocumentStatus = DocumentStatus.PROCESSING
     classification: str = "INTERNAL"
@@ -148,6 +159,8 @@ def metadata_for(
     effective_from: date | None = None,
     effective_to: date | None = None,
     published_at: datetime | None = None,
+    stat_period: str | None = None,
+    document_scope: dict[str, str] | None = None,
     status: DocumentStatus = DocumentStatus.PROCESSING,
 ) -> ChunkMetadata:
     """`Chunk` + 文档级元数据 → 一块的 `ChunkMetadata`。
@@ -174,6 +187,11 @@ def metadata_for(
         effective_from=effective_from,
         effective_to=effective_to,
         published_at=published_at,
+        stat_period=stat_period,
+        # **拷一份而不是直接引用调用方的 dict**：这个模型是 frozen 的，
+        # 但里面这个 dict 不是——入库时调用方复用它、事后改一下，
+        # 已经写进 payload 的那份会跟着变，而那是"入库之后 payload 还会动"。
+        document_scope=dict(document_scope or {}),
         status=status,
         classification=classification,
         source_kind=source_kind,

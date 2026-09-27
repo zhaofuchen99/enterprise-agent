@@ -143,6 +143,12 @@ class DocumentMetadata(BaseModel):
     effective_from: date | None = None
     effective_to: date | None = None
     published_at: datetime | None = None
+    #: 统计期间记号（报告的 `report.period`）。**与 `effective_from/to` 是两件事**，
+    #: 见 `ChunkMetadata.stat_period`。
+    stat_period: str | None = None
+    #: 文档级维度范围（报告的 `report.region` / `report.channel`）。见
+    #: `ChunkMetadata.document_scope`——它决定了"这个表头说的是哪个总体"。
+    document_scope: dict[str, str] = Field(default_factory=dict)
     created_by: str | None = None
 
     @property
@@ -651,6 +657,8 @@ async def _vectorize(
             effective_from=state.metadata.effective_from,
             effective_to=state.metadata.effective_to,
             published_at=state.metadata.published_at,
+            stat_period=state.metadata.stat_period,
+            document_scope=state.metadata.document_scope,
             status=DocumentStatus.PROCESSING,
         )
         points.append(
@@ -805,12 +813,21 @@ def _resume_or_reject(
 ) -> IngestionReport | None:
     """幂等命中 → 返回现有结果；同版本不同内容 → 报错；其余 → None（继续入库）。
 
-    三种情形分开判，顺序不能换：
-    1. 内容与版本都相同且**已发布** → 11.9 的"相同指纹重复上传直接返回现有结果"；
-    2. 内容不同但版本相同且没给 `force` → 拒绝（见模块 docstring 决定 3）；
-    3. 其余（上一次失败要重试、`--force` 重建）→ 继续走完整流程。
+    四种情形分开判，**`force` 排在最前**：
+
+    1. `--force`：**无条件重建这一版**。它必须排在幂等短路之前——否则
+       "文件一个字节没变、只是想把索引重建一遍"这条最需要它的路径反而用不上它。
+       那正是 `reindex` 要走的路径：改的是**写进 payload 的东西**
+       （新增字段、改了序列化），指纹自然完全相同，于是被短路成"跳过"，
+       而**重建根本没发生**——命令全绿，索引还是旧的。
+    2. 内容与版本都相同且**已发布** → 11.9 的"相同指纹重复上传直接返回现有结果"；
+    3. 内容相同但**没发布成功**（上一次 FAILED 或半途而废）→ 重试；
+    4. 内容不同但版本相同且没给 `force` → 拒绝（见模块 docstring 决定 3）。
     """
     if existing is None:
+        return None
+    if force:
+        logger.info("--force：无条件重建 %s", metadata.document_id)
         return None
     if existing.checksum == checksum:
         if existing.status is DocumentStatus.ACTIVE:
@@ -832,8 +849,6 @@ def _resume_or_reject(
                 started_at=datetime.now(UTC),
                 finished_at=datetime.now(UTC),
             )
-        return None
-    if force:
         return None
     raise AgentError(
         ErrorCode.INVALID_ARGUMENT,

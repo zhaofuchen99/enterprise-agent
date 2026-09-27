@@ -397,3 +397,112 @@ def test_a_coarser_document_row_still_compares_when_the_sql_side_is_coarse_too()
     # "凭什么拿这一行对那个库值"在产物上看不出来（499.55% 那条就是这么溜过去的）
     assert conflicts[0].detected_difference["scope"] == {"product_line": "智能家居"}
     assert conflicts[0].detected_difference["database_scope"] == {"product_line": "智能家居"}
+
+
+# ------------------------------------------------------------------ 统计期间
+
+
+def test_a_row_from_another_period_is_not_compared() -> None:
+    """**跨期间的数不可比**——表格行是它那个期间的**合计**。
+
+    实测（2026-09-22）：这一条缺失时，问「2025年8月直营渠道净销售额」会把
+    8 月的库值拿去和《上半年经营回顾》《年度经营分析》《Q1 经营分析》
+    《下半年经营展望》的同类表格比，报出 4 条 **157%–1133%** 的假冲突
+    （只有 1 条是真的——8 月那份月报）。
+
+    `_sql_evidence` 的 `event_time` 是 2025Q3，所以文档侧说 8 月的那一行
+    与它**不同期**：数字不同是应该的。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    august = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-08"})
+    same_quarter = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-Q3"})
+
+    assert detect_value_conflicts([august, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+    # 对照：同期的那一行照比——只加约束不加对照的话，
+    # 一次"期间对不上就全不比"的改动也能让上面那条通过
+    assert (
+        len(detect_value_conflicts([same_quarter, _sql_evidence(111_967_031.73)], catalog=catalog))
+        == 1
+    )
+
+
+@pytest.mark.parametrize("period", ["2025-H1", "2025-H2", "2025", "2025-Q1", "2025-07"])
+def test_periods_that_merely_contain_the_query_period_are_still_skipped(period: str) -> None:
+    """**取「相等」而不是「相交」**：包含关系不算同期。
+
+    H1 / 全年 / H2 都**包含** 8 月，按"相交"判的话它们会全部放行——
+    而它们说的是三个不同的期间。这条正是"别把判据写成区间重叠"的钉子。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    containing = _document_evidence(_TABLE).model_copy(update={"stat_period": period})
+
+    assert (
+        detect_value_conflicts([containing, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+    )
+
+
+def test_an_unknown_period_still_compares() -> None:
+    """**期间未知 → 放行**。`None` 是"不知道它的期间"，不是"它不限期间"。
+
+    与空 `scope` 同一条取舍：收紧成"不知道就不比"会丢掉真冲突，而漏报
+    看不出来。代价是没有时间条件的查询会与任何报告照比——**宁可多报**。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+
+    assert (
+        len(
+            detect_value_conflicts(
+                [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
+            )
+        )
+        == 1
+    )
+
+
+def test_a_query_whose_range_is_not_a_period_has_no_period() -> None:
+    """归不到规范跨度的区间**没有期间**（不是"硬凑一个"）。
+
+    九个月、同比查询包出来的 15 个月、没有时间条件——都落在这里。
+    硬凑一个记号会让一条跨期的比对照常发生，而它看起来完全正常。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    nine_months = _sql_evidence(111_967_031.73).model_copy(
+        update={
+            "event_time": TimeRange(
+                start=datetime(2025, 1, 1, tzinfo=UTC), end=datetime(2025, 10, 1, tzinfo=UTC)
+            )
+        }
+    )
+    monthly = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-08"})
+
+    # SQL 侧期间未知 → 放行（多报方向），所以这条**照比**
+    assert len(detect_value_conflicts([monthly, nine_months], catalog=catalog)) == 1
+
+
+def test_the_document_level_scope_is_merged_into_every_row() -> None:
+    """**文档身份上的范围要并进每一行**——否则区域报告会被当成全公司。
+
+    `SR-EC`（《华东区域2025年第三季度专项分析》）的「分产品线」表**只有产品线列**
+    ——区域不在表头里，而在文档身份上。并进文档级范围之后，它才是"华东的各产品线"，
+    才能与华东的库值比；不并的话它会因为"少了 region 这个维度"而整张跳过，
+    而那是**漏报**：一条真冲突安静地不见了。
+
+    与 `test_a_coarser_document_row_is_not_compared_to_a_finer_sql_point` 成对：
+    同样是"文档行少一个维度"，**文档级范围能补上就不算少**，
+    补不上（真的是全公司口径）就跳过。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    regional = _document_evidence(_PRODUCT_LINE_TABLE, title="2025年第三季度经营分析").model_copy(
+        update={"scope": {"region": "华东"}}
+    )
+    finer = _sql_evidence(111_967_031.73).model_copy(
+        update={"scope": {"region": "华东", "product_line": "智能家居"}}
+    )
+
+    conflicts = detect_value_conflicts([regional, finer], catalog=catalog)
+
+    assert len(conflicts) == 1, "文档级范围补上了 region，两个方向就对得上了"
+    assert conflicts[0].detected_difference["scope"] == {
+        "region": "华东",
+        "product_line": "智能家居",
+    }

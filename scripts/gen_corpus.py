@@ -895,12 +895,20 @@ def render_report(spec: DocSpec, facts: Facts) -> list[Block]:
     tgt = target_sum(facts, months, region=region)
     ach, light = achieve(cur["net"], tgt)
 
-    # 分区域明细：报告与事实表口径不同，这里的「销售额」是含税−折扣
+    # 分区域明细：报告与事实表口径不同，这里的「销售额」是含税−折扣。
+    #
+    # **每张明细表都按报告自身的范围限定，只放开它正在枚举的那个维度**：
+    # 报告是「华东专项」时，分区域表仍要列全公司各区（否则"华东之外的区域"
+    # 这一行无从谈起），而分渠道表要限定在华东、分产品线表也要限定在华东。
+    # 漏掉这一步的症状**在产物里自证**：占比列的分子与分母不同源，
+    # 于是出现 187.4% 这种自相矛盾的数（见 `line_rows` 原来的写法）。
     region_rows = []
     for name in facts.regions:
-        a = aggregate(facts, months, region=name, cutoff=cutoff)
+        a = aggregate(facts, months, region=name, channel=channel, cutoff=cutoff)
         p = (
-            aggregate(facts, period_months(prev_period), region=name, cutoff=cutoff)
+            aggregate(
+                facts, period_months(prev_period), region=name, channel=channel, cutoff=cutoff
+            )
             if prev_period
             else {k: Decimal(0) for k in a}
         )
@@ -917,7 +925,7 @@ def render_report(spec: DocSpec, facts: Facts) -> list[Block]:
 
     channel_rows = []
     for name in facts.channels:
-        a = aggregate(facts, months, channel=name, cutoff=cutoff)
+        a = aggregate(facts, months, region=region, channel=name, cutoff=cutoff)
         channel_rows.append(
             (
                 name,
@@ -927,11 +935,21 @@ def render_report(spec: DocSpec, facts: Facts) -> list[Block]:
             )
         )
 
+    # **这里是那个 187.4% 的来源**：原来只传 `line=`，报告自身的 region/channel
+    # 丢了——于是「华东专项分析」里的这张表，分子是**全公司**该产品线的销售额，
+    # 分母是**华东**的合计，而列名写着「占比」。
     line_rows = []
     for name in facts.product_lines:
-        a = aggregate(facts, months, line=name, cutoff=cutoff)
+        a = aggregate(facts, months, region=region, channel=channel, line=name, cutoff=cutoff)
         p = (
-            aggregate(facts, period_months(prev_period), line=name, cutoff=cutoff)
+            aggregate(
+                facts,
+                period_months(prev_period),
+                region=region,
+                channel=channel,
+                line=name,
+                cutoff=cutoff,
+            )
             if prev_period
             else {k: Decimal(0) for k in a}
         )
@@ -2381,6 +2399,13 @@ def generate(
                 "effective_from": spec.effective_from,
                 "effective_to": spec.effective_to,
                 "published_at": spec.published_at,
+                # **`report` 块要原样带进产物**，不能只在生成数字时用一下就丢。
+                # 它里面的 `period` / `region` / `channel` 是报告的"这一版说的是
+                # 哪一段时间、哪个范围"——冲突检测要靠它们判"两边是不是同一个总体"，
+                # 而这两件事都**只存在于文档身份上、不在表头里**（同一个
+                # 「分产品线」表头，全公司报告与区域报告说的是两个总体）。
+                # 丢了它，检索回来的证据就不知道自己属于哪一期、哪个范围。
+                "report": dict(spec.raw.get("report") or {}),
                 "classification": spec.classification,
                 "defects": list(spec.defects),
                 "char_count": text_len,

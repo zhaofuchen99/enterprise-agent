@@ -94,6 +94,7 @@ from app.domain.evidence import (
     ConflictType,
     Evidence,
 )
+from app.domain.period import canonical_period, canonical_token
 
 #: 绝对容差（元）。13.4 第 4 步的默认值。
 _ABS_TOLERANCE = 1.0
@@ -142,8 +143,13 @@ def build_conflict_node(
 def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tuple[Conflict, ...]:
     """文档声称的数值 vs SQL 查出的数值（13.4 的 VALUE 一类）。
 
-    配对规则：**指标 + 维度范围**都相同才比。
-    指标由表头经目录映射得到，维度从表格的维度列读出（`区域` → `华东`）。
+    配对规则：**指标 + 维度范围 + 统计期间**都对得上才比。
+    指标由表头经目录映射得到，维度由**文档级范围**（《华东区域…专项分析》
+    → `{region: 华东}`）与表格的维度列合起来给出（`区域` → `华东`）。
+
+    期间那一项见 `_same_period`：**跨期间的数不可比**，而这一条是实测补的
+    （2025 年 8 月的库值曾被拿去和《上半年经营回顾》《年度经营分析》的
+    同类表格比，报出 4 条 157%–1133% 的假冲突）。
     """
     sql_points = [point for item in evidence if (point := _sql_point(item)) is not None]
     if not sql_points:
@@ -157,11 +163,12 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
             for base in sql_points:
                 if claim.metric_code != base.metric_code:
                     continue
-                # 判据见模块 docstring 的那张表。
-                # **多维度列 = 明细行**，拿它去对任何汇总值都是假冲突。
-                if len(claim.scope) > 1:
-                    continue
+                # 判据见模块 docstring 的那张表。**"多维度列 = 明细行"那一条
+                # 在 `_document_points` 里判**——它说的是"表格有几个维度列"，
+                # 与文档级范围无关，放在这里会连文档级范围一起数进去。
                 if not _comparable(claim, base):
+                    continue
+                if not _same_period(claim, base):
                     continue
                 difference = _difference(claim.value, base.value)
                 if difference is None:
@@ -181,7 +188,7 @@ class _Point:
     产品线限定"。把三个维度里最早出现的那个当成范围，正是那个 93% 假冲突的来源。
     """
 
-    __slots__ = ("evidence_id", "matched_by", "metric_code", "scope", "value")
+    __slots__ = ("evidence_id", "matched_by", "metric_code", "period", "scope", "value")
 
     def __init__(
         self,
@@ -190,11 +197,15 @@ class _Point:
         scope: dict[str, str],
         value: float,
         matched_by: str,
+        period: str | None = None,
     ) -> None:
         self.evidence_id = evidence_id
         self.metric_code = metric_code
         self.scope = scope
         self.value = value
+        #: **统计期间**记号（`2025-Q3`），`None` 表示**不知道**。
+        #: 未知不等于"不限期间"——两者在 `_same_period` 里处置相反。
+        self.period = period
         #: `exact`（表头就是指标名）或 `alias`（命中了别名）。
         #: **它决定了这条冲突有多硬**，见模块 docstring 的陷阱说明。
         self.matched_by = matched_by
@@ -222,7 +233,61 @@ def _sql_point(item: Evidence) -> _Point | None:
     value = _to_float(raw)
     if value is None:
         return None
-    return _Point(item.id, item.metric_code, _sql_dimensions(item), value, "exact")
+    return _Point(
+        item.id,
+        item.metric_code,
+        _sql_dimensions(item),
+        value,
+        "exact",
+        period=_sql_period(item),
+    )
+
+
+def _sql_period(item: Evidence) -> str | None:
+    """SQL 证据的**统计期间**：`event_time` 正好是一个规范跨度时给出记号。
+
+    归不出来就返回 `None`（**期间未知**），而未知不等于"不限期间"。
+    归不出来是常态、不是异常：
+
+    - `order_date >= '2025-01-01' AND < '2025-10-01'`（九个月）——
+      题目要的就是九个月，它不对应任何一种记号；
+    - **同比查询**：`_extract_time_range` 取的是 WHERE 里全部时间谓词的
+      min/max 包络，两个 `CASE WHEN` 各一个季度，包出来是 15 个月；
+    - 压根没有时间条件。
+
+    **不要为了"总能给出一个期间"去硬凑**：凑出来的记号会让一条跨期的比对
+    照常发生，而它看起来完全正常（同 `_comparable` 里"空 scope 是不知道、
+    不是没有"那条）。
+    """
+    if item.event_time is None:
+        return None
+    return canonical_period(item.event_time.start.date(), item.event_time.end.date())
+
+
+def _same_period(claim: _Point, base: _Point) -> bool:
+    """两边的数是不是**同一期**的数（13.4 第 5 步 TIME 的判据）。
+
+    ## 取「相等」而不是「相交」
+
+    表格里那一行是它那个期间的**合计**——跨期间不可比。按"相交"判的话
+    《上半年经营回顾》《年度经营分析》《下半年经营展望》全都包含 8 月，
+    照样会放行，而它们说的是三个不同的期间。实测（2026-09-22）：
+    这一条缺失时，2025 年 8 月的库值被拿去对上面四张表，
+    报出 4 条 **157%–1133%** 的假冲突（只有 1 条是真的）。
+
+    ## 任一侧未知 → 放行
+
+    与 `_comparable` 同一条取舍：`None` 是"**不知道它的期间**"，
+    不是"它不限期间"。按"不知道就不比"处理会丢掉真冲突，
+    而漏报看不出来。**宁可多报。**
+
+    ⚠️ 放行的代价是：**没有时间条件的查询**（`period=None`）与任何报告
+    都照比。要收紧它得先让 SQL 侧总能说清自己的期间，而那是生成侧的事
+    （见本模块 docstring 的「四类为什么不做」）。
+    """
+    if claim.period is None or base.period is None:
+        return True
+    return claim.period == base.period
 
 
 def _sql_dimensions(item: Evidence) -> dict[str, str]:
@@ -297,13 +362,26 @@ def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
         return []
     columns = _prefer_exact(columns)
 
+    #: **文档级范围**（《华东区域2025年第三季度专项分析》 → `{region: 华东}`）。
+    #: 它记在**文档身份**上而不在表头里，却决定了"这个表头说的是哪个总体"
+    #: ——同一个「分产品线」表头，全公司报告与区域报告说的是两个总体。
+    document_scope = {key: str(value) for key, value in item.scope.items()}
+
     points: list[_Point] = []
     for line in lines[1:]:
         cells = [cell.strip() for cell in line.split(_COLUMN_SEPARATOR)]
         # **整行的维度一起取**，不只是第一个：见模块 docstring
-        scope = {
+        row_scope = {
             key: cells[index] for index, key in dimension_indexes.items() if index < len(cells)
         }
+        # **「这一行跨了几个维度」只看表格的维度列**，不含文档级范围——
+        # 后者说的是"这份文档的范围"，不是"这一行比按一个维度汇总更细"。
+        # 把两者混起来数，区域报告里那张单维度表会被误判成明细行而整张跳过。
+        if len(row_scope) > 1:
+            continue
+        # 行取值优先于文档级范围（两者本该一致；不一致时行说的是更具体的那个，
+        # 与 `tools/sql/evidence._scope_of` 的取舍相同）
+        scope = {**document_scope, **row_scope}
         for position, column in enumerate(columns):
             if column is None or position >= len(cells):
                 continue
@@ -313,7 +391,16 @@ def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
                 continue
             # **单位只对非维度列生效**。维度列里也可能有数字（`省份数` 一列），
             # 但那一列的列名不是指标名，上面的 `_column_of` 已经把它滤掉了。
-            points.append(_Point(item.id, metric_code, scope, value * unit, matched_by))
+            points.append(
+                _Point(
+                    item.id,
+                    metric_code,
+                    scope,
+                    value * unit,
+                    matched_by,
+                    period=canonical_token(item.stat_period) if item.stat_period else None,
+                )
+            )
     return points
 
 

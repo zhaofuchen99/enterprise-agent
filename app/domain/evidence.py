@@ -72,6 +72,14 @@ class Evidence(BaseModel):
         metric_code: 对应指标目录的 code，冲突检测按它分组。
         definition_version: 指标口径版本。口径不同即 DEFINITION 冲突（13.4 第 5 步）。
         scope: 维度范围，如 `{"region": ["华东"]}`。SCOPE 冲突的比对依据。
+            文档证据带的是**文档级**范围（《华东区域…专项分析》→ `{region: 华东}`）：
+            它不在表头里，而在文档身份上，漏掉它的后果是"同一个总体被当成两个"。
+        stat_period: **统计期间**记号（`2025-Q3` / `2025-08` / `2025` / `2025-H1`），
+            13.4 第 5 步的 TIME 冲突比对的是它。**与 `event_time` 是两件事**：
+            后者是**生效区间**（制度写"有效期至 2025-06-30"），
+            而报告类文档的生效区间恒为空、统计期间才是它的"这一版说的是哪段时间"。
+            `None` 表示**不知道**（制度与产品资料没有统计期间）——
+            **不是**"不限期间"。判据里"不知道"要放行，见 `conflict._comparable`。
         reliability: 可靠性等级。
         content_hash: 证据内容的哈希，用于判同与去重。
         access_level: 访问级别（TBC-07 的 INTERNAL / CONFIDENTIAL）。
@@ -84,6 +92,7 @@ class Evidence(BaseModel):
     claim: str
     locator: dict[str, object]
     event_time: TimeRange | None = None
+    stat_period: str | None = None
     retrieved_at: datetime
     metric_code: str | None = None
     definition_version: str | None = None
