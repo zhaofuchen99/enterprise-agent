@@ -180,14 +180,18 @@ async def test_full_loop_through_a_real_worker(
     **模型换成替身，工具与数据库保持真实**：`app/tests/conftest.py` 把
     `MODEL_BASE_URL` 钉在不可解析的 `model.invalid`（刻意的——测试不该打
     真实服务、也不该花真钱），所以真模型在这一组里只可能失败。
-    替身返回三段脚本：①「只查 SQL」的意图 → ② 一条真实可跑的候选 SQL →
-    ③ 分析结论。于是 SQL 走的是**真校验器、真只读执行、真业务库**，
-    而模型那一段是确定性的。
+    替身返回**四段脚本**：①「只查 SQL」的意图 → ② 一条真实可跑的候选 SQL →
+    ③ 分析结论 → ④ 审查第二阶段的结论。于是 SQL 走的是**真校验器、真只读执行、
+    真业务库**，而模型那一段是确定性的。
+    ⚠️ 脚本必须**按真实调用顺序**排：漏一段的话，替身在对应那一步弹空，
+    而任务会以 `INTERNAL_ERROR` 收尾——报错指向"任务执行过程中出现内部错误"，
+    不指向脚本（实测踩过一次，加模型审查时）。
     """
     from sqlalchemy import select
 
     from app.agent.schemas.analysis import AnalysisResult
     from app.agent.schemas.plan import IntentResult
+    from app.agent.schemas.review import ModelReview
     from app.infrastructure.models.evidence import AgentTraceEvent
     from app.repositories.agent_repo import SqlAgentArtifactRepository
     from app.tests.fakes import FakeModelGateway
@@ -207,6 +211,11 @@ async def test_full_loop_through_a_real_worker(
             explanation="按季度汇总净销售额",
         ),
         AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。", refused=False),
+        # 审查的第二阶段也要一次模型调用（14.1）。**脚本必须按真实调用顺序排**：
+        # supervisor → sql 生成 → analysis → reviewer。少了这一项，
+        # 替身在审查那一步就弹空了，任务会以 `INTERNAL_ERROR` 收尾——
+        # 而报错指向 "任务执行过程中出现内部错误"，不指向脚本。
+        ModelReview(),
     ]
     monkeypatch.setattr(
         "app.worker.build_model_gateway", lambda _settings: FakeModelGateway(scripts)
@@ -443,6 +452,7 @@ async def test_events_from_a_real_worker_reach_a_subscriber_on_another_instance(
 
     from app.agent.schemas.analysis import AnalysisResult
     from app.agent.schemas.plan import IntentResult
+    from app.agent.schemas.review import ModelReview
     from app.api.stream import stream_frames
     from app.tests.fakes import FakeModelGateway
     from app.tools.sql.schemas import SqlCandidate
@@ -461,6 +471,11 @@ async def test_events_from_a_real_worker_reach_a_subscriber_on_another_instance(
             explanation="按季度汇总净销售额",
         ),
         AnalysisResult(direct_answer="2025 年 Q3 的净销售额已从销售事实表取得。", refused=False),
+        # 审查的第二阶段也要一次模型调用（14.1）。**脚本必须按真实调用顺序排**：
+        # supervisor → sql 生成 → analysis → reviewer。少了这一项，
+        # 替身在审查那一步就弹空了，任务会以 `INTERNAL_ERROR` 收尾——
+        # 而报错指向 "任务执行过程中出现内部错误"，不指向脚本。
+        ModelReview(),
     ]
     monkeypatch.setattr(
         "app.worker.build_model_gateway", lambda _settings: FakeModelGateway(scripts)

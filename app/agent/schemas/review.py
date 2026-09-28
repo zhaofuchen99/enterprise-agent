@@ -11,16 +11,23 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-#: 审查状态（14.3）。切片内只会产出 `PASS` 与 `FAIL`：
-#: `RETRY` 要有 `retry_router` 与那四类预算的完整版，`CLARIFY` 要有
-#: WAITING_CLARIFICATION 的状态位——两者都属 Phase 8，已登记。
+#: 审查状态（14.3）。四个取值都会产出：
+#: - `PASS` / `FAIL`：确定性六条（14.1 第一阶段）；
+#: - `RETRY`：`retry_router` 与四类预算（14.4）；
+#: - `CLARIFY`：模型审查给出澄清问题、而重试无路可走时。
+#: ⚠️ **`CLARIFY` 的状态位只到这里**：任务终态仍是 `SUCCEEDED`，
+#: 答案里是一句澄清问句。真正「停在澄清态等用户回复」要 API/SSE 侧的配套，
+#: 与 supervisor 的澄清是同一条登记项。
 ReviewStatus = Literal["PASS", "RETRY", "CLARIFY", "FAIL"]
 
 #: 问题严重度。**BLOCKING 的含义是"不得交给用户"**：
 #: 一条没有依据的结论看起来和别的结论一样，而它会被人拿去做决定。
 Severity = Literal["INFO", "WARNING", "BLOCKING"]
 
-#: 重试目标（14.4）。切片内恒为 None（不重试），字段留给 Phase 8。
+#: 重试目标（14.4）。
+#: ⚠️ **本版只有 `sql` / `rag` 会被真正产出**（`reviewer._retry_target`），
+#: `analysis` 路由得到但没有产出者，`expand` / `replan` / `search` 连落点都还没有
+#: ——见 `nodes/retry_router.py` 的模块说明。
 RetryTarget = Literal["sql", "rag", "search", "analysis", "expand", "replan"]
 
 
@@ -74,7 +81,72 @@ class ReviewResult(BaseModel):
         return tuple(item for item in self.issues if item.severity == "WARNING")
 
 
+class ModelReview(BaseModel):
+    """**模型审查**的结构化输出（14.1 第二阶段）。
+
+    14.1 把这一阶段要查的东西写死了四条：「是否回答问题、证据是否足够、
+    推断是否越界、限制是否清楚，以及应补哪类证据」。这里就是那四条 + 一条。
+
+    ## 为什么是**四个布尔**而不是让它自由写 issue
+
+    让它写 `code` 的话，"封闭取值"就只是一句约定——模型编一个 `NEW_CODE`
+    出来，`retry_router` 按 code 分流的那张表就静默地不认识它。
+    改成布尔之后，**code 由代码从布尔推出来**（`reviewer._model_issues`），
+    取值一定是本文件里那几个。
+
+    另一个好处是**判据可校准**：四个布尔各自撞板的比例能单独统计，
+    而一堆自由文本的 code 只能靠人读。
+
+    ## 它**不能**产出 `BLOCKING`
+
+    四个布尔只映射到 `WARNING`（见 `reviewer._model_issues`）。
+    理由不是"模型判不准"，而是**一条能独自否决答案的模型调用是单点故障**：
+    它会因为措辞、语气、偶发的过度保守而拦下一条本该发布的答案，
+    而这类拦截与真拦截长得一模一样。确定性的六条负责否决，
+    模型负责**要求补证据**——那是它可以被反驳、也应当被反驳的位置。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: 是否回答了用户问的那件事（问 A 答 B、只答了一半，都是 False）
+    question_answered: bool = True
+    #: 结论是否有足够证据支撑（不是"有没有引用"——那是第一阶段判的，
+    #: 而是"引用的那些够不够支持这句话"）
+    evidence_sufficient: bool = True
+    #: 推断是否越过证据（把相关性说成因果、把个别说成普遍）
+    inference_within_bounds: bool = True
+    #: 限制是否说清楚了（语料里没有、某一步失败、时点没给）
+    limitations_clear: bool = True
+    #: 该补哪一类证据（14.3）。**只填"重跑某一个工具没用"的情形**——
+    #: 「某个查询错了」那一类由第一阶段与 `<retry_target>` 的其他取值负责。
+    retry_target: RetryTarget | None = None
+    #: 要补什么，给人看的。**不写具体 SQL**（14.3 明写 Reviewer 不指定 SQL）。
+    retry_reason: str | None = None
+    #: 需要用户先定口径 / 时间 / 范围时填这里（14.3 的 CLARIFY）。
+    #: **它必须是问用户的、用户能回答的**，不是"请你提供更多信息"这种空话。
+    clarification_question: str | None = None
+
+    @property
+    def needs_retry(self) -> bool:
+        return self.retry_target is not None
+
+    @property
+    def failed_checks(self) -> tuple[str, ...]:
+        """没通过的那几条（字段名）。**顺序固定**，便于与日志比对。"""
+        return tuple(
+            name
+            for name in (
+                "question_answered",
+                "evidence_sufficient",
+                "inference_within_bounds",
+                "limitations_clear",
+            )
+            if not getattr(self, name)
+        )
+
+
 __all__ = [
+    "ModelReview",
     "RetryTarget",
     "ReviewIssue",
     "ReviewResult",

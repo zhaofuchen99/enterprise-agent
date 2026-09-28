@@ -163,21 +163,38 @@ def _run(
     sql_tool: FakeTool,
     rag_tool: FakeTool,
     analyses: list[Any] | None = None,
+    reviews: list[Any] | None = None,
+    skip_analysis_reply: bool = False,
 ) -> tuple[Any, FakeModelGateway, list[Any]]:
-    """跑一次图，返回（最终 State, sql 替身, rag 替身）。
+    """跑一次图，返回（最终 State, gateway, 脚本）。
 
-    **只给改写/意图的脚本**，分析那一步的响应按需追加：`FakeModelGateway`
-    的脚本是**按调用顺序**弹出的，而图里 supervisor 与 analysis 都会调它，
-    所以脚本必须按真实调用顺序排。
+    **只给意图的脚本，分析与审查的响应按需追加**：`FakeModelGateway` 的脚本是
+    **按调用顺序**弹出的，而图里 `supervisor`、`analysis`、`reviewer` 都会调它。
+
+    ⚠️ **顺序必须是"意图 → 分析 → 审查"**，而且**每份分析后面跟一份审查**
+    ——不能写成"所有分析 + 所有审查"。重试会让分析再跑一次，
+    真实的调用顺序是 `意图 → 分析 → 审查 → 分析 → 审查`，
+    而两段式的排法在第二次分析时就拿了审查的响应，报错会指向一个
+    与被测行为无关的地方。
+
+    ⚠️ `skip_analysis_reply`：**一条证据都没有时分析根本不调模型**
+    （见 `analysis.analysis` 的早返回——把空列表发过去，得到的大概率是
+    一段用常识补出来的答案）。那类用例的脚本里不该有"分析"那一位，
+    否则审查会去弹它，而 `ModelReview` 校验一个 `AnalysisResult` 报的错
+    指向 `fakes.py`——与被测行为毫无关系。
     """
     from app.agent.schemas.analysis import AnalysisResult
+    from app.agent.schemas.review import ModelReview
 
-    scripts: list[Any] = []
-    for intent in intents:
-        scripts.append(intent)
-    scripts.extend(
-        analyses or [AnalysisResult(direct_answer="测试结论", refused=False)] * len(intents)
+    scripts: list[Any] = list(intents)
+    planned_analyses = analyses or [AnalysisResult(direct_answer="测试结论", refused=False)] * len(
+        intents
     )
+    planned_reviews = reviews or [ModelReview()] * len(planned_analyses)
+    for index, review in enumerate(planned_reviews):
+        if not (skip_analysis_reply and index == 0):
+            scripts.append(planned_analyses[index])
+        scripts.append(review)
 
     gateway = FakeModelGateway(responses=scripts)
     graph = build_graph(settings, gateway=gateway, sql_tool=sql_tool, rag_tool=rag_tool)
@@ -302,7 +319,10 @@ async def test_expansion_does_not_loop_forever(settings: Settings) -> None:
     """
     sql = FakeTool("sql_query", empty_as_success=True)
     rag = FakeTool("rag_retrieve", source="DOCUMENT", empty=ErrorCode.NO_RELEVANT_KNOWLEDGE)
-    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+    # 两路都空 → 一条证据都没有 → `analysis` 早返回，**不调模型**
+    graph, _, _ = _run(
+        settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag, skip_analysis_reply=True
+    )
 
     state = await _invoke(settings, graph)
 
@@ -414,7 +434,9 @@ async def test_no_evidence_at_all_refuses_by_code_not_by_model(settings: Setting
     """
     sql = FakeTool("sql_query", empty_as_success=True)
     rag = FakeTool("rag_retrieve", source="DOCUMENT", empty=ErrorCode.NO_RELEVANT_KNOWLEDGE)
-    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+    graph, _, _ = _run(
+        settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag, skip_analysis_reply=True
+    )
 
     state = await _invoke(settings, graph)
 
@@ -473,7 +495,9 @@ async def test_hard_failure_is_reported_as_an_error_not_as_empty(settings: Setti
     """
     sql = FakeTool("sql_query", fail=ErrorCode.UPSTREAM_UNAVAILABLE)
     rag = FakeTool("rag_retrieve", source="DOCUMENT")
-    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+    graph, _, _ = _run(
+        settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag, skip_analysis_reply=True
+    )
 
     state = await _invoke(settings, graph)
 

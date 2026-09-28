@@ -26,7 +26,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 5 RAG | ✅ 完成 | **已完成**：⑦Qdrant collection 接入层（服务端 + 内存替身同契约）、③中文分词与稀疏向量（`Vocabulary` + `make tokenize`）、**①业务词典生成**（`make dict`，96 条，回读产物自检）、**②语料 88 篇 + 10 类缺陷注入**（含 4 份手工 Prompt Injection）、④PDF/DOCX 工具链、**⑥`parser.py` + `chunker.py`**（四格式解析 + 清洗 + 分块，`make chunk`；全语料 **1871** 块，页眉页脚零泄漏、跨页表格表头还原）、**③后半词表**（`rag_vocab` 仓储 + 构建 + 快照，`make vocab`；2781 词条）、**④`s3` 存储实现**（与 local 同一份契约测试）、**⑤`ingestion.py` + ⑪入库幂等**（11.1 的九步全流程 + `make ingest`；`knowledge_document` 仓储、`ChunkMetadata` 双向映射、发布前抽样冒烟、失败整批回滚、原文件与入库报告归档）。全语料实测：**发布 83 篇 / 幂等跳过 3 篇 / 扫描件标记不支持 2 篇 / 0 失败，冒烟 249/249 全中**；Qdrant 点数 1871 与 `make chunk` 的汇总**逐块一致**（两条独立路径互为对照）、**⑧`retriever.py` + ⑩`NO_RELEVANT_KNOWLEDGE`**（11.7 的九步去掉第 ⑥⑧ 步；Query Rewrite 含降级、标量过滤、双路召回、单次 RRF、两判据相关性门禁、文档证据；`make retrieve`）。**⑫金标 20 条 + Recall@8**（`configs/eval_rag_golden.yaml` + `make eval-rag`）、**`verify-corpus` 门禁**（`make verify-corpus`，10 类缺陷逐条检出）。**实测**：Recall@8 **19/20 = 95%**（门禁 ≥85%）、定位一致率 17/20 = 85%、`verify-corpus` **10/10**（其中 2 类只验证了语料侧，冲突检出属 Phase 9）。**⑨Reranker 已实现并校准（2026-09-18）**：`tools/rag/reranker.py`（11.7 第 ⑥⑦ 步）+ 网关 `rerank`（Cohere 契约，硅基流动/Jina 兼容）+ `make calibrate-rerank`。选型 `BAAI/bge-reranker-v2-m3`（云）。阈值 `RAG__RERANK_SCORE_THRESHOLD=0.07` 由实测分布定：有答案 20 条 0.1364–0.9989、语料中不存在 3 条 0.0008–0.0125，**差一个数量级**。**实测开/关对比**（同一份金标与语料）：Recall@8 **95.0% → 100.0%**（19/20 → 20/20）、定位一致率 **85% → 95%**，提升全部来自 rag-06（同义词误拒）被语义判据救回；3 条应拒答的仍然拒答、`verify-corpus` 仍 **10/10**。**默认关闭**（关掉与失败走同一条降级路径）。**11.7 第 ⑧ 步「邻近块扩展」仍然后置**——重排分已经有了，缺的是存储层"按定位取相邻块"的能力 |
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
-| 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**未做**：`CLARIFY` 仍无产出者（要 WAITING_CLARIFICATION 状态位）、14.1 的**第二阶段模型审查**、`retry_target=expand`（要 `plan_extend` 节点）——各自登记在案 |
+| 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**14.1 的第二阶段（结构化模型审查）也接上了**（2026-09-27 晚）：四条判断落成结构化输出，issue 的 code **由代码从布尔推出来**（模型不写自由文本 code），**一律 WARNING——模型不能独自把答案拦下**（见约定 105）。`CLARIFY` 从此有了产出者。**仍未做**：`retry_target=expand`（要 `plan_extend` 节点）、`WAITING_CLARIFICATION` 状态位 ——已登记 |
 | 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
 | 13 评测（**40 题口径**，切片内四类） | ✅ 完成 | **Agent 端到端评测集 20 条**（`configs/eval_agent_golden.yaml` + `make eval-agent`）：Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5。判据与 `make demo` **共用一份**（`scripts/agent_harness.py`），避免"演示判对、评测判错"。加上已有的 SQL 10 + RAG 20 = **50 条**（冲刺方案 §6 的 40 题口径，RAG 按 115 口径交了 20 所以超发）。**走 HTTP**（HTTP → 限流 → 队列 → Worker → 图 → 查详情），组件层测不到的就是这一层。**未判定单独计数且计入分母**（排除的话，系统大面积失败时通过率反而上升）；观察用例（`stability: model-dependent`，1 条）不进门禁。**实测稳定用例 19/19 + 观察用例 1/1**。⚠️ 它跑第一轮就发现了三个真缺陷（冲突检测的**时间粒度**与**维度比较单向**、以及**语料生成器的明细表漏传报告自身的范围**，实测报出 157%–1133% / 499% / 占比 187.4%）——**2026-09-27 三条全部修掉**（见约定 93/97/98/99）。**同日复跑**（语料 `2026.09.27-1`，全量重建）：稳定用例 **19/19**、观察 1/1、无失败项；`verify-corpus` 10/10、`eval-rag` 20/20（定位一致 19/20）、`calibrate-rerank` 0.1350 vs 0.0127（阈值 0.07 仍成立）、`make demo` 9/9。⚠️ 复跑前**重启了 `make run`**——见约定 100 |
@@ -873,6 +873,37 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     `retry_budget_exhausted`**：不记的话，"审查要求补证但没补"与"审查压根没要求"
     在产物上长得一样，而前者要查为什么打满，后者说明判据该收紧。
 
+105. **模型审查只记 `WARNING`——否决权留给确定性检查**（`reviewer._MODEL_CHECKS`）。
+    14.1 的第二阶段判的是「引用的那些**够不够**支持这句话」，那是语义；
+    但它**不能独自把答案拦下**。理由是**单点故障**：一条能独自否决的模型调用
+    会因为措辞、语气、偶发的过度保守而拦下一条本该发布的答案，
+    而那种拦截与真拦截在产物上长得一模一样。
+    分工因此是：**确定性的六条负责否决（判事实：引用不存在、字段泄露），
+    模型负责要求补证据（判尺度）**——后者是可以被反驳、也应当被反驳的位置。
+    ⚠️ 但**记了 WARNING 就不能再给 `GROUNDED`**：`GROUNDED` 是 Reviewer 能给出的
+    最强结论，它要求两阶段都没话说（`_reason` 的 `model_found_issues`）。
+    ✅ **这条设计第一次跑评测就被验出来了**：`agent-review-05`（归因题）报
+    `INFERENCE_OVERREACH`，而同一条问题**下一次跑又是零 issue**——模型那一侧的
+    判断本来就会飘。**飘的是 issue 列表，不是状态码**（四个 WARNING 加几条都不改变
+    `PASS`），所以那条用例改钉状态码、不钉 issue 列表。
+    ⚠️ **推论**：任何钉 `expect_review_issue_codes: []` 的用例都只在**事实型**问题上
+    稳定；归因 / 推断型问题不要钉它，否则门禁会变成随机红——而随机红的门禁很快
+    就会被忽略。
+
+106. **模型审查的输出是四个布尔，`code` 由代码推出来**
+    （`schemas/review.ModelReview` + `reviewer._model_issues`）。
+    让模型写 `code` 的话，"封闭取值"就只是一句约定——它编一个 `NEW_CODE` 出来，
+    `retry_router` 按 code 分流的那张表静默地不认识它。
+    改成布尔还有个好处：**四个判断各自撞板的比例能单独统计**，
+    而一堆自由文本的 code 只能靠人读。
+    ⚠️ **降级必须留痕**：模型不可用时记一条 `MODEL_REVIEW_UNAVAILABLE` 的 INFO 继续
+    （工具故障不等于答案有问题，判 FAIL 会让一次网络抖动变成"未通过发布检查"，
+    而那个结论是**关于答案的**）。不记的话，一次模型侧的故障会让所有答案都少一道
+    检查，而产物上完全看不出来——约定 35 说的那类静默。
+    ⚠️ **`ReviewResult.clarification_question` 只在 `CLARIFY` 时带出去**：
+    `RETRY` / `FAIL` 时它没有落点，而 `final` 的 FAIL 分支会渲染 `blocking`——
+    带着一句问话会让被拦下的答案看起来像在跟用户对话。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -906,7 +937,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | ~~**同义词导致的误拒**（金标 rag-06）~~ | **已由重排器解掉**（2026-09-18）：重排生效时拒答由逐候选的重排分判，词汇判据退为诊断信息（见约定 57 与 `test_reranking_can_overrule_the_unseen_topic_criterion`）。**待金标复核**：`make calibrate-rerank` 的分数分布要能证明它没有反过来放过不该答的问题 |
 | **冲突检测的另外四类**（DEFINITION / TIME / SCOPE / SOURCE）：前提分别是文档侧 `metric_code`+`scope`、文档统计期间、方向判定，见 `nodes/conflict.py` 的清单 | Phase 9 |
 | **表格的合计行 vs 分项行**：多维度列的明细行已经被挡住（约定 41），但**单维度列**的表里若既有合计行又有分项行，仍然分不出来——需要表格的合计标记或指标口径的 `grain` | Phase 9 |
-| **Reviewer 第二阶段（模型审查）**：是否回答问题、证据是否足够、推断是否越界（14.1 后半）。⚠️ **它是「更多重试触发」的唯一来源**：现在只有「FACT 结论没有引用、且还有一路没查过」一类能触发 `RETRY`（`nodes/reviewer.py::_retry_target`），而 14.3 里 `retry_target=expand`（缺一整类信息）与 `replan` 都是**语义判断**，确定性检查给不出来。**它也是「缺陷答案阻断召回率 ≥ 90%」（开发流程 6.10 的门禁）能测量的前提**——没有它就没有「缺陷答案」的定义。14.4 的 `retry_router` 与四类预算**已交付** | Phase 8 完整版 |
+| ~~**Reviewer 第二阶段（模型审查）**~~ **已交付（2026-09-27，见约定 105/106）**：14.1 的四条判断落成结构化输出（`schemas/review.ModelReview`），模型**只能记 WARNING**、不能独自否决，但可以给 `retry_target` 与 `clarification_question`——后者让 `CLARIFY` 第一次有了产出者。⚠️ **还没做完的那一块**：`retry_target=expand`（「缺一整类信息」）仍然没有落点——它要 `plan_extend` 节点由它生成具体步骤（14.3 明写 Reviewer 不指定 SQL），而本版没有那个节点，`choose_retry` 里能路由但走不到。**做它还会顺带让 `plan_deltas` 非空**，而那是 `任务循环与自适应下钻` 那 15 条评测能写的前提。**开发流程 6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」现在可测了**（有「缺陷答案」的定义了），但还没写那组用例 | 下一项 |
 | ~~`reindex` 接口~~ **已完成（2026-09-27）**：`make reindex`（`app/cli.py::_reindex`），以**归档原文**为准逐篇重建，重建前比对行的 `checksum` 与归档的 SHA-256，不一致**拒绝重建那一篇**。与 `make ingest FORCE=1` 的分工见约定 96 | ✅ 本次 |
 | 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |
 | Qdrant 的 `set_payload` 跨分片无事务保证 → 发布窗口内读者可能看到同一版本的部分 chunk。要严格就需把状态位提到文档级（见详设 11.1 的落地记录第 4 条） | 语料规模上去再评估 |
@@ -928,7 +959,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
 | ~~SSE 订阅端点与订阅令牌~~ | **已完成（2026-09-19，提前）**：端点 + 令牌 + 双通道 + 心跳 + `done` + 降级路径，节点级事件也进了同一条流。**注**：重放暂走 Redis Stream（约定 68），18.3 的 MySQL 权威重放仍待合并 |
 | ~~`/trace` 接口与节点埋点~~ | **已完成（2026-09-18，提前）**：节点级埋点 + 17.4 的接口。**工具级事件与 `include_tools` 仍未做**，见上方【后续扩展】 |
-| ~~评测集扩到 40 题~~ **已完成（2026-09-22）**：Agent 端到端 20 条 + 既有 SQL 10 / RAG 20 = **50 条**。**SQL 安全类 100% 阻断率的判定标准没缩**（28 条校验器用例照旧）。**未做的两类**：`异常恢复与重试`（⚠️ `retry_router` **已就绪（2026-09-27）**，但「异常恢复」要的是**模型层面**的缺陷答案，而当前能触发的重试只有一类确定性判据——这一类要等 14.1 的第二阶段）、`任务循环与自适应下钻` 15 条（7.5 要求断言 `plan_deltas` / `revision_no` / `trigger_finding_id`，而切片内 `reflect` 是确定性演进、`plan_deltas` 恒空——现在写只能断言"没退化成死循环"）。115 条的完整版仍待做 | ✅ 本次 |
+| ~~评测集扩到 40 题~~ **已完成（2026-09-22）**：Agent 端到端 20 条 + 既有 SQL 10 / RAG 20 = **50 条**。**SQL 安全类 100% 阻断率的判定标准没缩**（28 条校验器用例照旧）。**未做的两类**：`异常恢复与重试`（⚠️ `retry_router` **与模型审查都已就绪（2026-09-27）**，但「异常恢复」要的是**模型层面**的缺陷答案，而当前能触发的重试只有一类确定性判据——这一类要等 14.1 的第二阶段）、`任务循环与自适应下钻` 15 条（7.5 要求断言 `plan_deltas` / `revision_no` / `trigger_finding_id`，而切片内 `reflect` 是确定性演进、`plan_deltas` 恒空——现在写只能断言"没退化成死循环"）。115 条的完整版仍待做 | ✅ 本次 |
 | ~~**语料生成器：按报告自身范围限定的表，只限定了「正在枚举的那个维度」**~~ **已交付（2026-09-27，见约定 97）**：`render_report` 的三张明细表现在都是「报告自身的范围 + 正在枚举的那个维度」——`region_rows` 只放开 region、`channel_rows` 只放开 channel、`line_rows` 两个都带上。产物自证：`SR-EC-2025Q3`（华东）的「分产品线经营情况」从 **21,057.87 万元 / 占比 187.4%**（分子全公司、分母华东）变成 **3,813.24 万元 / 占比 34.0%**，占比列加起来是 100%。清单 `version` 已升到 `2026.09.27-1`（内容变 = 语料变）。⚠️ 只影响**带范围的报告**（`SR-EC-*` / `SR-CH-*`），全公司报告不受影响 | ✅ 本次 |
 | ~~**冲突检测的时间粒度**~~ **已交付（2026-09-27，见约定 97/98）**：`report.period` 现在从清单一路进 payload（`ChunkMetadata.stat_period` → `Evidence.stat_period`），判据是 `conflict._same_period` 的**期间相等**（不取相交），换算规则只在 `app/domain/period.py`。归不上规范跨度就按**期间未知**放行（九个月、同比包出来的 15 个月、无时间条件——都是多报方向）。重建路径是新写的 `make reindex`（认归档原文 + checksum 对账），`--force` 也修成真正的「无条件重建」（见约定 95）。本次复跑数字见进度表。 | ✅ 本次 |
 | ~~**冲突检测的维度比较是单向的**~~ **已交付（2026-09-27，见约定 93）**：判据改成 `_comparable` 里**两个方向各遍历一次**（原先只遍历文档侧的键），499.55% 那条假冲突消失；空 `scope` 仍然放行，`demo-cross` 的真冲突与两条放行用例都还在。⚠️ 下面这条与它**不同源**——时间粒度那条是缺信息，这条是判据写反了 | ✅ 本次 |

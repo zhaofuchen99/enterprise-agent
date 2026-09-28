@@ -279,16 +279,22 @@ def test_a_blocking_conflict_must_be_disclosed() -> None:
 # ---------------------------------------------------------------- 别的路径
 
 
-def test_no_analysis_result_passes_with_an_info_issue() -> None:
+async def test_no_analysis_result_passes_with_an_info_issue() -> None:
     """没有分析结果（更早的节点就失败了）**不判 FAIL**。
 
     `final` 对这两种情形的渲染完全不同（`_failure_answer` vs `_blocked_answer`）；
     把它们混成一类会让"没跑成"看起来像"跑成了但结论没依据"。
+
+    ⚠️ 这一条**根本不该调到模型**：没有分析结果时第二阶段无从谈起，
+    而它要是调了，`FakeModelGateway` 的脚本会被多弹一个——症状是
+    后面那条用例拿到的响应错位，而报错指向那边。
     """
     from app.agent.nodes.reviewer import build_reviewer_node
+    from app.tests.fakes import FakeModelGateway
 
-    node = build_reviewer_node()
-    outcome = node({"evidence": []})
+    gateway = FakeModelGateway(responses=[])
+    node = build_reviewer_node(gateway)
+    outcome = await node({"evidence": []})
 
     assert outcome["review_result"].status == "PASS"
     assert outcome["review_result"].reason_code == "NO_ANALYSIS"

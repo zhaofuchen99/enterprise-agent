@@ -233,7 +233,7 @@ def build_graph(
     _add_node(graph, _NODE_REFLECT, build_reflect_node(), events)
     _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog), events)
     _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway), events)
-    _add_node(graph, _NODE_REVIEWER, build_reviewer_node(), events)
+    _add_node(graph, _NODE_REVIEWER, build_reviewer_node(gateway), events)
     _add_node(graph, _NODE_RETRY_ROUTER, build_retry_router_node(), events)
     _add_node(graph, _NODE_FINAL, build_final_node(), events)
 
