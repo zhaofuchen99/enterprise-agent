@@ -46,11 +46,19 @@ class TaskEventType(StrEnum):
     #: open_question_count。**18.2 明写它（连同 plan.updated）不允许省略**：
     #: 「本系统任务循环能力对用户可见的载体」
     PROGRESS_ASSESSED = "progress.assessed"
-    #: 计划被演进（`reflect` 追加了步骤）。data: revision_no、added_steps、
-    #: skipped_steps、trigger_finding_id、reason。**生产者是 `reflect` 而不是
-    #: 18.2 写的 `plan_extend`**：切片内没有 `plan_extend` 节点，演进由
-    #: `reflect` 直接改计划（见 `agent/graph.py` 的偏差清单）
+    #: 计划被演进（`plan_extend` 追加了步骤）。data: revision_no、added_steps、
+    #: skipped_steps、trigger_finding_id、reason。生产者与 18.2 写的一致。
     PLAN_UPDATED = "plan.updated"
+    #: **本次演进提出的步骤一步都没通过校验**（`plan_extend`，详设 6.6.3）。
+    #: data: reasons（被拒的步骤与原因）。
+    #:
+    #: ⚠️ **18.2 的清单里没有这一类**，是本实现补的：6.6.3 明写"记录
+    #: `plan_extend_rejected` 事件到轨迹"，却没定义它叫什么、data 是什么。
+    #:
+    #: **不报错是对的，但完全静默不行**：那时"模型提了没通过的步骤"与
+    #: "模型压根没提"在产物上长得一样，而两者的处置完全不同——
+    #: 前者要放宽校验或改 prompt，后者说明这个任务本来就不需要下钻。
+    PLAN_EXTEND_REJECTED = "plan_extend.rejected"
     #: 进入/离开一个可见节点（`agent/tracing.py` 的包装器）。
     #: 离开时带 status 与 duration_ms；进入时 duration_ms 为空（给它 0 会被读成"瞬间完成"）
     NODE_STARTED = "node.started"

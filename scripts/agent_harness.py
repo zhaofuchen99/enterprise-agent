@@ -216,7 +216,8 @@ def evaluate(case: dict[str, Any], detail: dict[str, Any]) -> Verdict:
     | `expect_clarification` | 步骤为空（澄清不产出步骤） |
     | `expect_numbers` | 答案正文里的金额，按单位还原 |
     | `expect_limitations_contain` | `limitations`（其中"代码生成的"那一部分才该被钉） |
-    | `expect_review_*` | `review`（Reviewer-lite 的 `ReviewResult`） |
+    | `expect_review_*` | `review`（`ReviewResult`，两阶段审查的结论） |
+    | `expect_plan_*` | `plan_revision` / `plan_deltas` / `steps[].origin` |
     | `expect_progress_decision` | `progress_decision`（`reflect` 的最终判定） |
     """
     if detail.get("status") != "SUCCEEDED":
@@ -311,22 +312,142 @@ def evaluate(case: dict[str, Any], detail: dict[str, Any]) -> Verdict:
     if verdict := _check_review(case, detail.get("review")):
         return verdict
 
+    if verdict := _check_plan(case, detail):
+        return verdict
+
     return Verdict(
         True,
         f"走了 {sorted(sources)}" + (f"，检出 {len(conflicts)} 条冲突" if conflicts else ""),
     )
 
 
+def _check_plan(case: dict[str, Any], detail: dict[str, Any]) -> Verdict | None:
+    """任务循环的断言（详设 7.5 / 22.10）。**没写 `expect_plan_*` 就跳过**。
+
+    22.10.5 明写循环类问题"至少 15 条，按 `loop_expectation` 校验"。
+    本层的这几个字段是它的最小可判定集：
+
+    | 字段 | 读的字段 | 回答的问题 |
+    |---|---|---|
+    | `expect_plan_revision` | `plan_revision` | **不该**下钻时是 0（精确） |
+    | `expect_plan_revision_min` | `plan_revision` | **该**下钻时至少几次（下限） |
+    | `expect_plan_delta_count` | `plan_deltas` | 演进了几次（精确，用于 0） |
+    | `expect_extended_tools_contain` | `steps[].origin == EXTENDED` | 下钻到了哪一路（**包含**） |
+    | `expect_max_steps` | `len(steps)` | 有没有越界 |
+    | `expect_trigger_finding_linked` | `plan_deltas[].trigger_finding_id` | 反查得到发现吗 |
+
+    ## 为什么"该演进"钉下限、"不该演进"钉精确
+
+    演进有**两个触发源**：`reflect` 的确定性判定（SQL 空 → 补 RAG）与
+    审查第二阶段的 `retry_target=expand`。前者是代码判的，每次必发生；
+    **后者是模型判的，同一题两次跑可以不一样**——实测（2026-09-28）
+    一条「查不到的期间」的问题跑出**两次**演进：第一步确定性补了 RAG，
+    审查又判了一次"缺一整类信息"，模型路再加 3 步。
+
+    所以"反正会演进"的那一类**只能钉下限与包含**；钉精确值等于把
+    "模型这次怎么想的"固化成门禁，而随机红的门禁很快就会被忽略。
+    反过来，"**不该**演进"那几条是稳的——单源查询与澄清压根没有
+    可补的一路，模型再想加也没有由头，所以那里钉精确的 0。
+
+    这与 `expect_sources`（精确）和 `expect_extended_tools_contain`
+    （包含）的差别是同一条理由：**能精确的地方精确，模型插得进手的地方
+    只钉方向**。
+
+    `expect_trigger_finding_linked` 对应 22.10.3 的「每个 `origin=EXTENDED`
+    的步骤都能反查到存在的 `finding_id`」——**它同时查两个方向**：
+    有新增步骤的 delta 必须有触发源，而那个源必须真的在推理链里。
+    只查前者的话，一个指向不存在 id 的值照样通过（而它看起来完全正常）。
+    """
+    keys = (
+        "expect_plan_revision",
+        "expect_plan_revision_min",
+        "expect_plan_revision_max",
+        "expect_plan_delta_count",
+        "expect_extended_tools_contain",
+        "expect_max_steps",
+        "expect_trigger_finding_linked",
+    )
+    if all(case.get(key) is None for key in keys):
+        return None
+
+    revision = detail.get("plan_revision") or 0
+    deltas = detail.get("plan_deltas") or []
+    steps = detail.get("steps") or []
+    extended = {step["tool"] for step in steps if step.get("origin") == "EXTENDED"}
+
+    if (wanted := case.get("expect_plan_revision")) is not None and revision != wanted:
+        return Verdict(False, f"**计划演进次数不符**：期望 {wanted}，实际 {revision}")
+
+    if (floor := case.get("expect_plan_revision_min")) is not None and revision < floor:
+        return Verdict(False, f"**该演进却没有演进**：plan_revision={revision} < {floor}")
+
+    # 上限是 22.10.4 那条预算共用的端到端形态：`reflect` 的演进与
+    # `retry_target=expand` **共用同一份 `expansions_left`**（14.3 原文），
+    # 两者之和不得超过配置值。绕过它只有一条路——某条路自己扣了别的预算，
+    # 而"四类预算各自独立"正是 FR-REV-002 业务规则 1 的要求。
+    if (ceiling := case.get("expect_plan_revision_max")) is not None and revision > ceiling:
+        return Verdict(
+            False, f"**演进次数超出预算**：{revision} > {ceiling}（两类演进共用同一份预算）"
+        )
+
+    if (wanted := case.get("expect_plan_delta_count")) is not None and len(deltas) != wanted:
+        return Verdict(
+            False,
+            f"**演进记录条数不符**：期望 {wanted}，实际 {len(deltas)}——"
+            f"「计划变了」与「变了却没留记录」是两件事",
+        )
+
+    if missing := [
+        tool for tool in (case.get("expect_extended_tools_contain") or []) if tool not in extended
+    ]:
+        return Verdict(False, f"**没往这几路下钻**：{missing}（下钻出来的只有 {sorted(extended)}）")
+
+    if (limit := case.get("expect_max_steps")) is not None and len(steps) > limit:
+        return Verdict(False, f"**总步数越界**：{len(steps)} > {limit}")
+
+    if case.get("expect_trigger_finding_linked"):
+        unlinked = [
+            delta.get("revision_no")
+            for delta in deltas
+            if delta.get("added_step_ids") and not delta.get("trigger_finding_id")
+        ]
+        if unlinked:
+            return Verdict(
+                False,
+                f"**下钻步骤反查不到催生它的发现**（revision {unlinked}）"
+                f"——「因为查空了所以补了一路」这句话在产物上不成立",
+            )
+        chain = {item.get("finding_id") for item in detail.get("investigation_chain") or []}
+        dangling = [
+            delta["trigger_finding_id"]
+            for delta in deltas
+            if delta.get("trigger_finding_id") and delta["trigger_finding_id"] not in chain
+        ]
+        if dangling:
+            return Verdict(False, f"**触发源指向不存在的发现**：{dangling}")
+
+    return None
+
+
 def _review_or(case: dict[str, Any], detail: dict[str, Any], ok: Verdict) -> Verdict:
-    """模式类用例（拒答 / 澄清）通过后，**仍要判审查**。
+    """模式类用例（拒答 / 澄清）通过后，**仍要判审查与计划**。
 
     深挖一层的原因：这两条路径都会提前 `return`，于是写在后面的
-    `expect_review_*` 会**永远不被检查**——写了却从不生效的断言比没有断言
-    更糟，因为它看起来是有保障的。审查与模式正交，所以单独走一步。
+    `expect_review_*` 与 `expect_plan_*` 会**永远不被检查**——写了却从不
+    生效的断言比没有断言更糟，因为它看起来是有保障的。这两组与模式正交，
+    所以单独走一步。
+
+    **计划那一组同样正交**，而且它的值正是这类用例该钉的：
+    拒答与澄清都不该发生演进，`expect_plan_revision: 0` 是最有信息量的
+    一条断言——它挡的是"澄清路上莫名其妙多跑了一步"。
 
     它同时也是一条真断言：**拒答的任务不能被审查拦下**（拒答不是失败）。
     """
-    return _check_review(case, detail.get("review")) or ok
+    if verdict := _check_review(case, detail.get("review")):
+        return verdict
+    if verdict := _check_plan(case, detail):
+        return verdict
+    return ok
 
 
 def _check_review(case: dict[str, Any], review: Any) -> Verdict | None:

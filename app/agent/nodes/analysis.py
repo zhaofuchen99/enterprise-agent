@@ -163,21 +163,37 @@ def _with_resolved_ids(
 
 
 def _chain(state: AgentState) -> tuple[InvestigationStep, ...]:
-    """`findings` → 推理链（详设 13.5：**由代码组装，不由模型生成**）。
+    """`findings` + `plan_deltas` → 推理链（详设 13.5：**由代码组装**）。
 
-    这一版没有 `plan_deltas`（演进记录），所以 `triggered_step_id` 恒为
-    `None`——链上只有"查了什么"，还没有"因为发现了什么所以又查了什么"。
-    接 `plan_extend` 时补这一列，形状不用改。
+    "因为发现了什么，所以又查了什么"由 `PlanDelta.trigger_finding_id` 给出：
+    它指向催生那次演进的那条发现，而 `added_step_ids` 是被它引出的步骤。
+    接上之前 `triggered_step_id` 恒为 `None`，链上只有"查了什么"。
+
+    ⚠️ **指不到就是没有**：从**审查**那条路进来的演进（"缺一整类信息"）
+    触发源是一句审查结论，`findings` 里没有对应物，`trigger_finding_id` 为空。
+    那时这一列留空是如实的——编一个最近的 finding 会让链上多出一条
+    "因为发现了 X 所以查了 Y"的因果，而它并不存在。
     """
-    return tuple(
-        InvestigationStep(
-            order=index,
-            finding_id=finding.id,
-            finding_statement=finding.statement,
-            evidence_ids=finding.evidence_ids,
+    introduced = {
+        delta.trigger_finding_id: delta.added_step_ids[0]
+        for delta in state.get("plan_deltas") or []
+        if delta.trigger_finding_id and delta.added_step_ids
+    }
+    objectives = {step.id: step.objective for step in state.get("task_list") or []}
+    steps: list[InvestigationStep] = []
+    for index, finding in enumerate(state.get("findings") or [], start=1):
+        triggered = introduced.get(finding.id)
+        steps.append(
+            InvestigationStep(
+                order=index,
+                finding_id=finding.id,
+                finding_statement=finding.statement,
+                triggered_step_id=triggered,
+                triggered_objective=objectives.get(triggered) if triggered else None,
+                evidence_ids=finding.evidence_ids,
+            )
         )
-        for index, finding in enumerate(state.get("findings") or [], start=1)
-    )
+    return tuple(steps)
 
 
 def _pipeline_limitations(state: AgentState) -> tuple[str, ...]:

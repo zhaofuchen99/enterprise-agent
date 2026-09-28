@@ -17,7 +17,8 @@ import pytest
 
 from scripts.eval_agent import CATEGORIES, GOLDEN_PATH, load_cases
 
-#: 冲刺方案 §6 定的口径：`Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5`。
+#: 冲刺方案 §6 定的口径：`Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5`，
+#: 加上 2026-09-28 补的 `任务循环 5`。
 #: 写死在测试里而不是从 YAML 数出来——**从被测对象推期望值等于没测**。
 _EXPECTED_PER_CATEGORY = 5
 
@@ -31,13 +32,13 @@ def _cases() -> list[dict[str, Any]]:
     return load_cases(GOLDEN_PATH)
 
 
-def test_the_set_has_twenty_cases() -> None:
-    """总量：四类各 5 条 = 20 条。
+def test_the_set_has_the_planned_number_of_cases() -> None:
+    """总量：五类各 5 条 = 25 条。
 
     数字要能被断言，不能只看总数——总数对了而分布错了（比如 12+5+2+1），
     某一类的通过率就没有意义了。
     """
-    assert len(_cases()) == 20
+    assert len(_cases()) == len(CATEGORIES) * _EXPECTED_PER_CATEGORY
 
 
 def test_every_category_has_the_planned_number_of_cases() -> None:
@@ -78,6 +79,48 @@ def test_conflict_category_asserts_both_directions() -> None:
 
     assert detects, "没有任何一条用例要求检出冲突"
     assert clean, "没有任何一条用例要求**不**报冲突（防误报的方向没有覆盖）"
+
+
+def test_loop_category_asserts_both_directions() -> None:
+    """任务循环这一类必须**两个方向都有**：该下钻时下钻了，以及不该下钻时没动。
+
+    与冲突那一类同一条理由（`test_conflict_category_asserts_both_directions`）：
+    只钉"演进了"的话，一个"见着空结果就无脑补一路"的实现会全绿——
+    而**过度下钻同样是缺陷**，只是它的症状是白花时间，看起来完全正常。
+
+    ⚠️ 这里同时拦一类**假断言**：`expect_plan_revision_min: 0` 看着像
+    "钉了下限"，其实恒真（版本号不会是负数）。真要说"不该演进"，
+    只有 `expect_plan_revision: 0`（精确）或 `expect_plan_delta_count: 0`
+    算数——**一个恒真的断言比没有断言更糟**，因为它看起来是有保障的。
+    """
+    loop_cases = [case for case in _cases() if case["category"] == "loop"]
+
+    expands = [case for case in loop_cases if case.get("expect_plan_revision_min")]
+    idle = [
+        case
+        for case in loop_cases
+        if case.get("expect_plan_revision") == 0 or case.get("expect_plan_delta_count") == 0
+    ]
+
+    assert expands, "没有任何一条用例要求发生演进"
+    assert idle, "没有任何一条用例要求**不**演进（防过度下钻的方向没有覆盖）"
+
+
+def test_a_loop_case_that_expects_an_expansion_does_not_only_use_a_floor() -> None:
+    """钉下限的用例必须**同时钉住上界或来源**，不能只说"至少一次"。
+
+    只写 `expect_plan_revision_min: 1` 的话，一个"每次都把两路都调一遍"
+    的实现照样全绿——而那种实现根本不需要循环，它把 §8.4 第③条
+    要验的东西绕过去了。上界（预算）与下钻来源（`origin=EXTENDED`）
+    才是"这一步是补出来的"的证据。
+    """
+    for case in _cases():
+        if not case.get("expect_plan_revision_min"):
+            continue
+        assert case.get("expect_plan_revision_max") or case.get("expect_extended_tools_contain"), (
+            f"{case['id']} 只钉了演进次数的下限——"
+            f"再加一条上界或 `expect_extended_tools_contain`，否则它验不出循环"
+        )
 
 
 def test_rejection_and_clarification_are_both_covered() -> None:

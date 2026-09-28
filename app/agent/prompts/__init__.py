@@ -14,6 +14,7 @@ from typing import Final
 
 from app.agent.prompts.analysis import ANALYSIS_PROMPT
 from app.agent.prompts.base import PromptTemplate, PromptVariableError
+from app.agent.prompts.plan_extend import PLAN_EXTEND_PROMPT
 from app.agent.prompts.review import REVIEW_PROMPT
 from app.agent.prompts.smoke import SMOKE_PROMPT
 from app.agent.prompts.supervisor import SUPERVISOR_PROMPT
@@ -30,11 +31,13 @@ ALL_PROMPTS: Final[tuple[PromptTemplate, ...]] = (
     SUPERVISOR_PROMPT,
     ANALYSIS_PROMPT,
     REVIEW_PROMPT,
+    PLAN_EXTEND_PROMPT,
 )
 
 __all__ = [
     "ALL_PROMPTS",
     "ANALYSIS_PROMPT",
+    "PLAN_EXTEND_PROMPT",
     "REVIEW_PROMPT",
     "SMOKE_PROMPT",
     "SUPERVISOR_PROMPT",

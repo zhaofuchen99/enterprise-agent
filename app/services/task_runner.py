@@ -317,6 +317,7 @@ class TaskRunner:
                 # （见 `agent_repo._trace_row` 的说明）
                 trace_id=task.trace_id,
                 steps=outcome.steps,
+                revisions=outcome.revisions,
                 tool_calls=outcome.tool_calls,
                 evidence=outcome.evidence,
                 conflicts=outcome.conflicts,

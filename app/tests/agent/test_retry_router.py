@@ -96,13 +96,21 @@ class TestBudgetIsolation:
         )
 
     def test_expand_needs_the_expansion_budget(self) -> None:
-        """`expand` 要的是 `expansions_left`（14.3 明写它与执行阶段共用一份）。"""
+        """`expand` 要的是 `expansions_left`（14.3 明写它与执行阶段共用一份）。
+
+        **它不许借 `review_retries_left`**：那个还满着，而预算为 0 时结果
+        仍是"不重试"。借了的话四类预算的计数就不再各自可信——
+        排查时看到"补证用了 0 次"，而它其实靠借来的预算跑过。
+        """
         review = _review(retry_target="expand")
 
-        # 本版**没有 `plan_extend` 节点**，所以即便预算够也不路由出去——
-        # 但"预算不够"与"没有落点"是两件事，前者的判据仍要成立
         assert (
             choose_retry(review, review_retries_left=9, expansions_left=0, replans_left=9) is None
+        )
+        # 预算够 → 交给 `plan_extend`（14.3：由它决定具体步骤）
+        assert (
+            choose_retry(review, review_retries_left=9, expansions_left=1, replans_left=9)
+            is Route.EXPAND
         )
 
 
@@ -180,6 +188,28 @@ def test_an_unroutable_retry_with_a_question_becomes_clarify() -> None:
     )
 
     assert update["review_result"].status == "CLARIFY"
+
+
+def test_expand_only_routes_and_touches_no_budget() -> None:
+    """`expand` 只写路由，**两样预算一个都不动**。
+
+    - 不追加步骤：那是 `plan_extend` 的事（14.3 "Reviewer 不直接指定 SQL"）；
+    - 不扣 `review_retries_left`：它花的是 `expansions_left` 那一份；
+    - 不扣 `expansions_left`：由 `plan_extend` 扣——而且**它是入口扣**，
+      理由见 `nodes/plan_extend.py`（被拒的演进不追加步骤，若这里扣、
+      那里也扣，或哪都不扣，`retry_router → plan_extend → …` 那条闭合回路
+      就绕不完，而 `_guard` 数的是 `step_results`，它永远不涨）。
+    """
+    update = build_retry_router_node()(
+        _state(review_result=_review(retry_target="expand", missing_evidence=("渠道维度的明细",)))
+    )
+
+    assert update["retry_route"] is Route.EXPAND
+    assert "task_list" not in update, "步骤由 plan_extend 生成"
+    assert "review_retries_left" not in update
+    assert "expansions_left" not in update
+    # 它也不能被降级：路由是成功的，"预算耗尽"才是降级那条路
+    assert "review_result" not in update
 
 
 def test_a_passing_review_changes_nothing() -> None:

@@ -17,7 +17,7 @@ import pytest
 from pydantic import BaseModel
 
 from app.agent.schemas.analysis import AnalysisResult
-from app.agent.schemas.plan import IntentResult
+from app.agent.schemas.plan import IntentResult, PlanExtension
 from app.infrastructure.model_gateway import build_json_contract
 from app.tools.rag.schemas import QueryRewrite
 from app.tools.sql.schemas import SqlCandidate
@@ -69,7 +69,7 @@ def test_a_real_time_range_is_accepted() -> None:
 
 #: 真的会被送进 `invoke_structured` 的那几个 Schema。**示例必须对每一个都自洽**，
 #: 否则模型照着示例填出来的东西必然过不了校验（这就是那次故障的机制）。
-_REAL_SCHEMAS = (IntentResult, SqlCandidate, AnalysisResult, QueryRewrite)
+_REAL_SCHEMAS = (IntentResult, SqlCandidate, AnalysisResult, QueryRewrite, PlanExtension)
 
 
 @pytest.mark.parametrize("schema", _REAL_SCHEMAS, ids=lambda s: s.__name__)

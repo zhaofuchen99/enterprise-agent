@@ -137,6 +137,21 @@ def _normalize(state: AgentState, step: TaskStep, result: ToolResult) -> dict[st
                 evidence_ids=tuple(item.id for item in result.evidence),
             )
         ]
+    elif empty:
+        # **「这一步查空了」也是一个发现**，而且它是 `reflect` 判定演进时
+        # 唯一依据的那一个（`_assess` 只在有 `empty` 结果时才提"补一路"）。
+        # 不给它留记录的话：`plan_extend` 找不到可以指的 `trigger_finding_id`
+        # ——而 22.10.3 的「每个 `origin=EXTENDED` 的步骤都能反查到存在的
+        # `finding_id`」就写不出来。**没有发现可指**与**有发现但没记**，
+        # 在产物上是同一副样子。
+        update["findings"] = [
+            Finding(
+                id=new_id(IdPrefix.FINDING),
+                statement=f"{step.objective}：按当前条件未取得结果"
+                + (f"（{result.error.code}）" if result.error else ""),
+                step_id=step.id,
+            )
+        ]
     # 见模块 docstring：空结果是事实、其余失败是错误，两者去处不同
     if result.error is not None and not empty:
         update["errors"] = [_as_agent_error(result.error)]

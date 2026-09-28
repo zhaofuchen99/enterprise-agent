@@ -2,13 +2,18 @@
 
 ```text
 START → supervisor ─┬─(sql)──→ sql ──┐
-                    ├─(rag)──→ rag ──┼→ reflect ─┬─(还有待执行)──→ dispatch（回到上面两路）
-                    └─(analysis)─────┘           └─(收敛)──────────→ analysis → final → END
+                    ├─(rag)──→ rag ──┼→ reflect ─┬─(该补一路)──→ plan_extend ──┐
+                    └─(analysis)─────┘           ├─(还有待执行)───────────────→│（回到上面两路）
+                                                 └─(收敛)──→ conflict → analysis
+                                                              → reviewer → retry_router
+                                                                           ├─(重试)──→ 回到上面
+                                                                           └─(收工)──→ final → END
 ```
 
-八个节点：`supervisor / sql / rag / reflect / conflict / analysis / reviewer / final`。
-（§8.1 的最小集是六个；`conflict` 是 §8.3 第 6 项「Evidence（含简化冲突检测）」、
-`reviewer` 是第 7 项「Reviewer-lite」按详设 6.1 加上的。）
+九个节点：`supervisor / sql / rag / reflect / plan_extend / conflict /
+analysis / reviewer / retry_router / final`（§8.1 的最小集是六个；
+`conflict` 是 §8.3 第 6 项、`reviewer` 是第 7 项，`plan_extend` 与
+`retry_router` 是详设 6.6.1 的任务循环与 14.4 的重试路由）。
 **`dispatch` 不是节点，是条件边函数**——详设 6.1 里它单独成节点是因为
 计划可能有多条带依赖的步骤；本版的计划是"每条数据源一步、互不依赖"，
 "找下一步"就退化成一个纯函数（`route_dispatch`），
@@ -24,12 +29,13 @@ START → supervisor ─┬─(sql)──→ sql ──┐
 | `sql_prepare/generate/validate/execute` | 合进 `sql` 节点 | 七个子步骤活在 `SqlQueryTool` 内部 |
 | `rag_rewrite/retrieve/rerank` | 合进 `rag` 节点 | 同上 |
 | `normalize_tool_result` | 合进 `sql`/`rag` 节点 | `nodes/tool_nodes._normalize` |
-| `plan_extend` | 无（`reflect` 直接改计划） | 【后续扩展】模型的 EXPAND 判定 |
+| `plan_extend` | **`plan_extend` 节点** | 校验只做前提已具备的那几条，见 `nodes/plan_extend.py` |
 | `conflict_detect` | **`conflict` 节点（切片版）** | 只做 VALUE 一类 |
 | | | 四类缺前提的理由见 `nodes/conflict.py` |
-| `reviewer` | **`reviewer` 节点（第一阶段）** | 确定性检查；模型审查属 Phase 8 |
-| `retry_router` | 无 | 【Phase 8】`RETRY` / `CLARIFY` 两个状态要有预算与续跑入口 |
+| `reviewer` | **`reviewer` 节点（两阶段）** | 确定性六条 + 14.1 第二阶段的模型审查 |
+| `retry_router` | **`retry_router` 节点** | 14.4 的逐字实现，五个目标都有落点 |
 | `clarify` | 无 | 澄清以答案文本表达，状态位见【后续扩展】 |
+| `evidence_aggregate` | 无 | 证据由 `tool_nodes._normalize` 直接汇聚，没有单独的聚合步 |
 
 **这份表是面试口径的一部分**：说"做了最小 Graph"时，被问"详设里那 20 个节点呢"
 要能一条条说清它们去哪了，而不是笼统地说"简化了"。
@@ -47,6 +53,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.agent.nodes.analysis import build_analysis_node
 from app.agent.nodes.conflict import build_conflict_node
 from app.agent.nodes.final import build_final_node
+from app.agent.nodes.plan_extend import build_plan_extend_node
 from app.agent.nodes.reflect import build_reflect_node
 from app.agent.nodes.retry_router import build_retry_router_node
 from app.agent.nodes.reviewer import build_reviewer_node
@@ -56,7 +63,14 @@ from app.agent.schemas.plan import StepStatus
 from app.agent.state import AgentState, Route, pending_steps
 from app.agent.tracing import EventPublisher, traced
 from app.core.config import Settings
-from app.domain.task import ReviewRecord, StepRecord, Task, TaskOutcome, TaskStatus
+from app.domain.task import (
+    PlanRevisionRecord,
+    ReviewRecord,
+    StepRecord,
+    Task,
+    TaskOutcome,
+    TaskStatus,
+)
 from app.infrastructure.model_gateway import ModelGateway
 from app.infrastructure.observability import span
 
@@ -70,6 +84,7 @@ _NODE_SUPERVISOR = "supervisor"
 _NODE_SQL = "sql"
 _NODE_RAG = "rag"
 _NODE_REFLECT = "reflect"
+_NODE_PLAN_EXTEND = "plan_extend"
 _NODE_CONFLICT = "conflict"
 _NODE_ANALYSIS = "analysis"
 _NODE_REVIEWER = "reviewer"
@@ -82,6 +97,9 @@ _NODE_FINAL = "final"
 _TARGETS: dict[Route, str] = {
     Route.SQL: _NODE_SQL,
     Route.RAG: _NODE_RAG,
+    #: 计划演进（`retry_target=expand`）。14.3 明写"由 `plan_extend` 决定
+    #: 具体步骤，而不是由 Reviewer 直接指定 SQL"。
+    Route.EXPAND: _NODE_PLAN_EXTEND,
     Route.ANALYSIS: _NODE_CONFLICT,
     Route.CLARIFY: _NODE_FINAL,
     Route.FAIL: _NODE_FINAL,
@@ -90,6 +108,39 @@ _TARGETS: dict[Route, str] = {
     #: 而从别处进 supervisor 会让"supervisor 只跑一次"这条前提失效。
     Route.REPLAN: _NODE_SUPERVISOR,
 }
+
+
+#: 直线路径上的节点数（含余量）：`supervisor → sql/rag → reflect` 这一段
+#: 是固定的，加上 `conflict → analysis → reviewer → retry_router → final` 的收尾。
+_FIXED_NODES = 12
+
+#: 每绕一圈回边最多多走几个节点：`plan_extend`/工具 + `reflect` +
+#: `conflict` + `analysis` + `reviewer` + `retry_router`。
+_NODES_PER_LOOP = 7
+
+
+def _recursion_limit(settings: Settings) -> int:
+    """LangGraph 的递归上限（超级步计数）。
+
+    **从循环预算推出来，不写死。** 它原来是一个硬编码的 25，而循环那边
+    现在有三种会绕圈的预算（演进、Reviewer 补证、重新规划）——写死的话，
+    某天把 `LOOP__MAX_EXPANSIONS` 从 2 调到 3 就可能撞上它，而撞上它的
+    产物是 `INTERNAL_ERROR` + `trace_incomplete` + 五张产出表全空
+    （约定 102 记的那副样子）：**排查方向会跑到"图坏了"上，而真正的原因
+    是一个配置项**。
+
+    它仍然是**最后一道兜底**，管的是"回边写错、绕不完"；语义上的界是
+    四类循环预算与 `_over_step_budget` 那道护栏。所以这里的余量给得宽：
+    撞上它意味着代码有问题，不是一个正常结局。
+
+    **不设它的话**，回边写错会一直绕到进程 OOM，而那时看到的是内存曲线。
+    """
+    cycles = (
+        settings.loop.max_expansions
+        + settings.loop.max_replans
+        + settings.loop.max_reviewer_evidence
+    )
+    return _FIXED_NODES + _NODES_PER_LOOP * cycles
 
 
 def route_dispatch(state: AgentState) -> Route:
@@ -122,13 +173,31 @@ def _after_supervisor(state: AgentState) -> str:
 
 
 def _after_reflect(state: AgentState) -> str:
-    """`reflect → ?`：还有待执行就继续，否则收敛到 `conflict`（再进 `analysis`）。
+    """`reflect → ?`：判了 EXPAND 就去演进，还有待执行就继续，否则收敛。
+
+    **判 EXPAND 时要先看 `progress_assessment`，不能只看 `route_dispatch`**：
+    `reflect` 已经不再自己追加步骤（那是 `plan_extend` 的事），所以此刻
+    `task_list` 里还没有那一步，`route_dispatch` 会直接说"没有待执行的"
+    而收敛到 `conflict`——**演进就永远不发生**，而任务照跑照结束，
+    只是 `plan_deltas` 恒空、`expansions_left` 恒为初值。
 
     **收敛的出口是 `conflict` 而不是 `analysis`**：冲突检测要的是
     "全部证据都到齐了"这个时点，而它就在 `reflect` 判 SUFFICIENT 的那一刻。
     """
-    route = route_dispatch(state)
-    return _TARGETS[route]
+    assessment = state.get("progress_assessment")
+    if assessment is not None and assessment.decision == "EXPAND" and assessment.proposed_steps:
+        return _NODE_PLAN_EXTEND
+    return _TARGETS[route_dispatch(state)]
+
+
+def _after_plan_extend(state: AgentState) -> str:
+    """`plan_extend → ?`：新步骤下来就分派，被拒了就收敛。
+
+    **两条出口只是同一个 `route_dispatch` 的两种结果**：步骤全被拒时
+    没有 PENDING 步骤，它自然回 `ANALYSIS`（落到 `conflict`）——
+    那正是 6.6.3 的"按 SUFFICIENT 收敛"。
+    """
+    return _TARGETS[route_dispatch(state)]
 
 
 def _over_step_budget(state: AgentState, limit: int) -> bool:
@@ -231,6 +300,7 @@ def build_graph(
     _add_node(graph, _NODE_SQL, build_sql_node(settings, sql_tool), events)
     _add_node(graph, _NODE_RAG, build_rag_node(settings, rag_tool), events)
     _add_node(graph, _NODE_REFLECT, build_reflect_node(), events)
+    _add_node(graph, _NODE_PLAN_EXTEND, build_plan_extend_node(settings, gateway), events)
     _add_node(graph, _NODE_CONFLICT, build_conflict_node(catalog), events)
     _add_node(graph, _NODE_ANALYSIS, build_analysis_node(gateway), events)
     _add_node(graph, _NODE_REVIEWER, build_reviewer_node(gateway), events)
@@ -245,11 +315,19 @@ def build_graph(
     )
     graph.add_edge(_NODE_SQL, _NODE_REFLECT)
     graph.add_edge(_NODE_RAG, _NODE_REFLECT)
-    # **回边**：`reflect → sql/rag` 就是详设 6.1 里 `reflect -> plan_extend -> dispatch`
-    # 那条任务循环的回边。本版没有 `plan_extend` 节点，演进由 `reflect` 直接改写计划。
+    # **回边**：`reflect → plan_extend → sql/rag` 就是详设 6.1 的
+    # `reflect -> plan_extend -> dispatch`。三个节点都在了，形状与图一致。
     graph.add_conditional_edges(
         _NODE_REFLECT,
         _guard(_after_reflect, settings),
+        [_NODE_PLAN_EXTEND, _NODE_SQL, _NODE_RAG, _NODE_CONFLICT],
+    )
+    # 详设 6.1 的 `plan_extend → dispatch`：`dispatch` 在本版是条件边函数
+    # （`route_dispatch`），所以这里直接接它。**被拒时也走这条边**——
+    # 那时没有 PENDING 步骤，`route_dispatch` 自然给 `ANALYSIS`。
+    graph.add_conditional_edges(
+        _NODE_PLAN_EXTEND,
+        _guard(_after_plan_extend, settings),
         [_NODE_SQL, _NODE_RAG, _NODE_CONFLICT],
     )
     # 详设 6.1 的顺序是 `evidence_aggregate → conflict_detect → analysis`：
@@ -267,7 +345,14 @@ def build_graph(
     graph.add_conditional_edges(
         _NODE_RETRY_ROUTER,
         _guard(_after_retry, settings),
-        [_NODE_SQL, _NODE_RAG, _NODE_CONFLICT, _NODE_SUPERVISOR, _NODE_FINAL],
+        [
+            _NODE_SQL,
+            _NODE_RAG,
+            _NODE_CONFLICT,
+            _NODE_SUPERVISOR,
+            _NODE_PLAN_EXTEND,
+            _NODE_FINAL,
+        ],
     )
     graph.add_edge(_NODE_FINAL, END)
     return graph.compile()
@@ -319,6 +404,7 @@ class TaskGraph:
             "findings": [],
             "task_list": [],
             "plan_revision": 0,
+            "plan_deltas": [],
         }
         with span(
             "agent.graph",
@@ -326,11 +412,7 @@ class TaskGraph:
         ) as current:
             result: dict[str, Any] = await self._graph.ainvoke(
                 initial,
-                # 递归上限：图的正常路径最多 6 个节点 + 一次演进（2 步），
-                # 给 25 是留足余量又能在"回边失控"时立刻停住。
-                # **不设它的话，回边写错会一直绕到进程 OOM**，
-                # 而那时看到的是内存曲线而不是"图跑飞了"。
-                config={"recursion_limit": 25},
+                config={"recursion_limit": _recursion_limit(self._settings)},
             )
             current.set_attribute("agent.steps", len(result.get("step_results") or {}))
             current.set_attribute("agent.evidence", len(result.get("evidence") or []))
@@ -354,8 +436,9 @@ class TaskGraph:
             plan=_plan_digest(final_state),
             payload=final_state.get("answer_payload"),
             trace_events=tuple(final_state.get("trace_events") or ()),
-            # 五张表的行，一次带出去（见 `TaskOutcome` 的说明）
+            # 六张表的行，一次带出去（见 `TaskOutcome` 的说明）
             steps=_step_records(final_state),
+            revisions=_revision_records(final_state),
             tool_calls=tuple(final_state.get("tool_calls") or ()),
             evidence=tuple(final_state.get("evidence") or ()),
             conflicts=tuple(final_state.get("conflicts") or ()),
@@ -378,8 +461,24 @@ def _plan_digest(state: AgentState) -> dict[str, Any]:
     """
     results = state.get("step_results") or {}
     assessment = state.get("progress_assessment")
+    introduced = _origin_index(state)
     return {
         "revision": state.get("plan_revision", 0),
+        # 计划演进的记录一并进摘要：**"计划为什么变成这样"是读这份摘要的
+        # 人要回答的问题之一**，而只有 steps 的话，看得出多了一步、
+        # 看不出它为什么被加进来。同时它是 `trigger_finding_id` 唯一的出口
+        # ——那个 id 在 `steps` 里只对一个 EXTENDED 步骤有意义。
+        "deltas": [
+            {
+                "revision_no": delta.revision_no,
+                "trigger": delta.trigger,
+                "trigger_finding_id": delta.trigger_finding_id,
+                "added_step_ids": list(delta.added_step_ids),
+                "skipped_step_ids": list(delta.skipped_step_ids),
+                "reason": delta.reason,
+            }
+            for delta in state.get("plan_deltas") or []
+        ],
         "steps": [
             {
                 "id": step.id,
@@ -388,12 +487,48 @@ def _plan_digest(state: AgentState) -> dict[str, Any]:
                 "status": results[step.id].status.value if step.id in results else "PENDING",
                 "empty": results[step.id].empty if step.id in results else False,
                 "summary": results[step.id].summary if step.id in results else "",
+                "origin": "EXTENDED" if step.id in introduced else "PLANNER",
+                "revision_no": introduced.get(step.id, 0),
             }
             for step in state.get("task_list") or []
         ],
         "decision": assessment.decision if assessment is not None else None,
         "reason": assessment.reason if assessment is not None else None,
     }
+
+
+def _origin_index(state: AgentState) -> dict[str, int]:
+    """`step_id` → **引入它的那一版计划号**（16.6 的 `origin` / `revision_no`）。
+
+    判据是"这个 id 出现在哪一条 `PlanDelta.added_step_ids` 里"：
+    在 → `EXTENDED`，不在 → 最初那一版（0，`PLANNER`）。
+
+    **不能用任务的终值代替**（这里原先就是那么写的）：那样每次演进都会把
+    **所有**步骤（含初始那几条）标成新版本，于是"哪些步骤是下钻出来的"
+    在表里查不到——而表看起来完全正常。开发流程 7.5 的循环类评分
+    正是靠这个区分。
+
+    ## 一处如实记下的不精确：`retry_router` 补的那一步
+
+    14.4 的重试会给计划追加一个新步骤（"补证"），而它**不在任何 delta 的
+    `added_step_ids` 里**——补证不是计划演进，`plan_revision` 不升、
+    `plan_deltas` 也不记。于是它落成 `PLANNER` / `revision_no=0`，
+    而它既不是初始计划里的、也不是第 0 版引入的。
+
+    16.6 给 `origin` 的三个取值（`PLANNER` / `EXTENDED` / `REPLAN`）里
+    没有第四个位置可放，而**多造一个取值就是改 16.6 的枚举**——
+    那是要回写文档的偏离，不该顺手做。当前取值对 7.5 要问的那个问题
+    （"哪些步骤是下钻出来的"）恰好是对的：补证步骤**不该**被算作下钻。
+    代价是 `revision_no` 那一列对这几行没有意义，已登记。
+    """
+    index: dict[str, int] = {}
+    for delta in state.get("plan_deltas") or []:
+        for step_id in delta.added_step_ids:
+            # **先到先得**：同一个 id 不会被两条 delta 收录
+            # （`plan_extend` 只分配未被占用的 id），所以这里取第一条即是
+            # 它被引入的那一版。
+            index.setdefault(step_id, delta.revision_no)
+    return index
 
 
 def _step_records(state: AgentState) -> tuple[StepRecord, ...]:
@@ -403,6 +538,7 @@ def _step_records(state: AgentState) -> tuple[StepRecord, ...]:
     只落计划的话，读的人看不出"那一步其实没查到东西"。
     """
     results = state.get("step_results") or {}
+    introduced = _origin_index(state)
     return tuple(
         StepRecord(
             step_key=step.id,
@@ -418,14 +554,35 @@ def _step_records(state: AgentState) -> tuple[StepRecord, ...]:
                 if step.id in results
                 else None
             ),
-            # **`origin` 恒为 PLANNER**：切片内没有 plan_extend，
-            # 演进由 reflect 直接追加步骤。接 Phase 7 时这里要按
-            # `plan_deltas` 区分 EXTENDED，否则"哪些步骤是下钻出来的"
-            # 在表里查不到——而开发流程 7.5 正是靠它做循环类评分的。
-            origin="PLANNER",
-            revision_no=state.get("plan_revision", 0),
+            origin="EXTENDED" if step.id in introduced else "PLANNER",
+            revision_no=introduced.get(step.id, 0),
         )
         for step in state.get("task_list") or []
+    )
+
+
+def _revision_records(state: AgentState) -> tuple[PlanRevisionRecord, ...]:
+    """`plan_deltas` → `agent_plan_revision` 的行（16.6）。
+
+    `budget_snapshot` 取**收尾时**的余额。它回答的是"这次演进之后还剩多少"，
+    而"这次绕圈是不是借了别的预算"要靠与上一行的差额看——四类预算各自独立
+    是 FR-REV-002 业务规则 1 的要求，而余额快照是唯一能复盘它的东西。
+    """
+    return tuple(
+        PlanRevisionRecord(
+            revision_no=delta.revision_no,
+            trigger_type=delta.trigger,
+            trigger_finding_id=delta.trigger_finding_id,
+            added_step_ids=delta.added_step_ids,
+            skipped_step_ids=delta.skipped_step_ids,
+            reason=delta.reason,
+            budget_snapshot={
+                "expansions_left": state.get("expansions_left", 0),
+                "review_retries_left": state.get("review_retries_left", 0),
+                "replans_left": state.get("replans_left", 0),
+            },
+        )
+        for delta in state.get("plan_deltas") or []
     )
 
 

@@ -341,6 +341,20 @@ def _payload(
             for step_id, result in (state.get("step_results") or {}).items()
         },
         "plan_revision": state.get("plan_revision", 0),
+        # 计划演进的记录。**它回答的是"计划为什么变成这样"**：哪一版加了
+        # 哪几步、由哪个中间发现催生、当时预算还剩多少。只有 `plan_revision`
+        # 一个数字的话，看得出变过、看不出为什么变。
+        "plan_deltas": [
+            delta.model_dump(mode="json") for delta in (state.get("plan_deltas") or [])
+        ],
+        # 推理链（13.5）。**它一直在 `AnalysisResult` 里算出来却从不外传**：
+        # 不进 payload 的话，"因为查空了所以补了一路"这件事在 API 上
+        # 完全看不到，而它正是任务循环对外的样子。
+        "investigation_chain": (
+            [step.model_dump(mode="json") for step in analysis.investigation_chain]
+            if analysis
+            else []
+        ),
         # 审查结论进 payload：API 与前端要能看到"这条答案经过检查、结论如何"
         "review": (
             state["review_result"].model_dump(mode="json")

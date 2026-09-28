@@ -20,11 +20,25 @@
 而 SQL 按条件查不到数据——这时 `reflect` 补一路 RAG 去找制度/报告里的解释。
 它不需要模型，却是货真价实的"根据结果决定下一步"。
 
+## 它只出判定，不改计划
+
+判 `EXPAND` 时它把要补的那一步放进 `ProgressAssessment.proposed_steps`，
+由条件边送到 `plan_extend` 去校验与合入——详设 6.6.3 的原话是
+「`plan_extend` 是循环中唯一能修改 `task_list` 的节点」。
+
+**这里曾经自己追加步骤**（`task_list` / `plan_revision` / `expansions_left`
+三样一起写）。搬走的原因是两个写者会漂移：症状是
+「`plan_deltas` 说有一步、`task_list` 里没有」，而两边都看不出来。
+搬走之后 `plan_deltas` 才有了**确定性**的生产者——而那是循环类评测
+能写成硬断言（而不是观察用例）的前提。
+
 ## 三处刻意不做的判定
 
 - **不接模型的 `EXPAND`**：接上之后，判定就依赖云模型连通性，
   而「循环是否收敛」是四条验收标准里第③条的核心，不该由外部服务决定。
   详设 6.3 也明写「模型的判定**不直接采信**」，要过一遍代码。
+  演进换到 `plan_extend` 之后这一点**没变**：那条路上收到的是现成的
+  `proposed_steps`，只做校验与合入，不问模型。
 - **不实现 `BLOCKED`**：它的定义是"证据缺口属于权限或数据不存在，
   工具无法补齐"——那需要区分"查不到因为没权限"与"查不到因为真没有"，
   前者要读 Tool 的错误类别（`ACCESS_DENIED`）。切片内两路工具都还没产出过
@@ -47,7 +61,13 @@ from collections.abc import Callable
 from typing import Any
 
 from app.agent.schemas.plan import ProgressAssessment, TaskStep
-from app.agent.state import AgentState, executed_sources, missing_complement, pending_steps
+from app.agent.state import (
+    AgentState,
+    executed_sources,
+    missing_complement,
+    next_step_id,
+    pending_steps,
+)
 
 # 互补关系（"sql 空则该补 rag"）**表在 `state.COMPLEMENTS`，不在这里**。
 # `reviewer` 问的是同一个问题（"还有哪一路没查过"），而两处各写一份的症状是
@@ -64,23 +84,28 @@ def build_reflect_node() -> Callable[[AgentState], Any]:
 
     def reflect(state: AgentState) -> dict[str, Any]:
         assessment = _assess(state)
-        update: dict[str, Any] = {
+        # **判完就完了**：`task_list` / `plan_revision` / `expansions_left`
+        # 三样都交给 `plan_extend` 写（详设 6.6.3：它是唯一能改计划的节点）。
+        #
+        # 这里曾经自己追加步骤。搬走不是为了少一层——而是**两个写者会漂移**：
+        # 各写一份"追加步骤 + 升 revision + 扣预算"，某天其中一份改了规则，
+        # 症状是「`plan_deltas` 说有一步、`task_list` 里没有」，
+        # 而两边都看不出来。
+        #
+        # **它仍然不调模型**：`_assess` 的 `decision` 只看 State 里的事实，
+        # 所以"循环会不会收敛"照样不依赖云模型连通性——见模块 docstring。
+        # 演进换成 `plan_extend` 之后这一点没变：那条路上收到的是现成的
+        # `proposed_steps`，只做校验与合入，不问模型。
+        #
+        # **节点不写 `next_route`**：路由由条件边从更新后的 State 推出来
+        # （`graph._after_reflect`）。两处各算一次的话，它们会在
+        # 某次改动后分叉，而症状是"判定说继续、实际却去了 analysis"。
+        return {
             "progress_assessment": assessment,
             # `open_questions` 整体替换（详设 7.2）：新判定覆盖旧判定，
             # 避免已解决的问题无限累积
             "open_questions": list(_open_questions(state, assessment)),
         }
-        if assessment.decision == "EXPAND" and assessment.proposed_steps:
-            # **`task_list` 在这里被整体替换**——详设 7.2 只允许 Planner /
-            # PlanExtend / Replan 改写它，`reflect` 是这一版里 planner 的代理
-            # （确定性演进），所以这是允许的两处之一。
-            update["task_list"] = [*(state.get("task_list") or []), *assessment.proposed_steps]
-            update["expansions_left"] = max(0, state.get("expansions_left", 0) - 1)
-            update["plan_revision"] = state.get("plan_revision", 0) + 1
-        # **节点不写 `next_route`**：路由由条件边从更新后的 State 推出来
-        # （`graph.route_after_reflect`）。两处各算一次的话，它们会在
-        # 某次改动后分叉，而症状是"判定说继续、实际却去了 analysis"。
-        return update
 
     return reflect
 
@@ -140,18 +165,13 @@ def _missing_complement(sources: set[str]) -> tuple[str, str] | None:
 
 
 def _next_step_id(state: AgentState) -> str:
-    """演进步骤的 id。
+    """本节点提出的那一步的 id。
 
-    **序号接着计划往下排**，不是从 1 重来：`step_results` 是按 step_id 索引的，
-    重用一个已经存在的 id 会让新步骤的结果覆盖旧步骤的（`merge_step_results`
-    的设计就是"新值覆盖"）。这类覆盖不报错，只会让"这一步跑了两次"
-    这种事后无从分辨。
+    **实现搬去了 `state.next_step_id`**：`retry_router` 与 `plan_extend`
+    问的是同一个问题，三份各写一份的症状是某天其中一份改了规则，
+    而撞号只在那一条路径上发生。
     """
-    used = {step.id for step in state.get("task_list") or []}
-    index = len(used) + 1
-    while f"step_{index:02d}" in used:  # pragma: no cover - 正常路径不会进循环
-        index += 1
-    return f"step_{index:02d}"
+    return next_step_id(state)
 
 
 def _open_questions(state: AgentState, assessment: ProgressAssessment) -> tuple[str, ...]:

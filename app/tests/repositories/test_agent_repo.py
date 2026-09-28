@@ -23,7 +23,7 @@ from app.domain.evidence import (
     Evidence,
     TimeRange,
 )
-from app.domain.task import ReviewRecord, StepRecord, ToolCallRecord
+from app.domain.task import PlanRevisionRecord, ReviewRecord, StepRecord, ToolCallRecord
 from app.domain.trace import NodeTrace
 from app.repositories.agent_repo import (
     AgentArtifactRepository,
@@ -116,6 +116,18 @@ def _conflict() -> Conflict:
     )
 
 
+def _revision() -> PlanRevisionRecord:
+    return PlanRevisionRecord(
+        id="tsk_0000000000000000000003",
+        revision_no=1,
+        trigger_type="EXTEND",
+        trigger_finding_id="fnd_0000000000000000000001",
+        added_step_ids=("step_02",),
+        reason="sql_query 未取得有用结果，补一路 rag_retrieve",
+        budget_snapshot={"expansions_left": 1, "review_retries_left": 1, "replans_left": 1},
+    )
+
+
 def _review() -> ReviewRecord:
     return ReviewRecord(
         id="evd_0000000000000000000009",
@@ -171,18 +183,19 @@ async def test_saving_twice_replaces_instead_of_appending(
     assert stored[0].claim == "重投之后"
 
 
-async def test_all_five_tables_are_written_in_one_call(
+async def test_all_six_tables_are_written_in_one_call(
     make_repo: Callable[[], AgentArtifactRepository],
 ) -> None:
-    """五张表一次写齐。
+    """六张表一次写齐。
 
-    **分五次写会让它们有机会不一致**（证据落了、冲突没落），
+    **分六次写会让它们有机会不一致**（证据落了、冲突没落），
     而那种不一致不会报错，只会让复盘看到的图景缺一块。
     """
     repo = make_repo()
     await repo.save(
         _TASK,
         steps=[_step()],
+        revisions=[_revision()],
         tool_calls=[_tool_call()],
         evidence=[_evidence()],
         conflicts=[_conflict()],
@@ -190,13 +203,38 @@ async def test_all_five_tables_are_written_in_one_call(
     )
 
     # 内存实现直接看属性；SQL 实现只能通过证据与"不抛异常"来验证——
-    # 那五张表各自的查询入口属 Phase 9 的任务详情，这里只保证写入路径通。
+    # 那几张表各自的查询入口属 Phase 9 的任务详情，这里只保证写入路径通。
     assert await repo.list_evidence(_TASK)
     if isinstance(repo, InMemoryAgentArtifactRepository):
         assert repo.steps[_TASK] == [_step()]
+        assert repo.revisions[_TASK] == [_revision()]
         assert repo.tool_calls[_TASK] == [_tool_call()]
         assert repo.conflicts[_TASK] == [_conflict()]
         assert repo.reviews[_TASK] == _review()
+
+
+async def test_plan_revisions_are_replaced_too_not_appended(
+    make_repo: Callable[[], AgentArtifactRepository],
+) -> None:
+    """**`agent_plan_revision` 也要整体替换。**
+
+    它是上面那条"重投不残留两批"的一个具体面，单独拎出来测，是因为这张表
+    的清理**极容易被漏掉**：它原先根本不在 `_clear` 的清单里（因为当时
+    没有写入方）。漏掉它的症状不是报错，而是重投之后表里同时留着
+    两批 `revision_no=1` 的行——而 `(task_id, revision_no)` 是唯一键，
+    第二批**会直接插入失败**，把一个"忘了清表"的问题报成"唯一的冲突"。
+    """
+    repo = make_repo()
+    await repo.save(_TASK, revisions=[_revision()])
+    second = _revision().model_copy(update={"id": "tsk_0000000000000000000004"})
+    await repo.save(_TASK, revisions=[second])
+
+    if isinstance(repo, InMemoryAgentArtifactRepository):
+        assert repo.revisions[_TASK] == [second]
+    else:
+        # SQL 实现只能验"没炸"——若 `_clear` 漏了这张表，
+        # 第二次写会撞 `uk_plan_revision_no` 而抛出来。
+        assert second.revision_no == 1
 
 
 async def test_saving_without_evidence_still_clears_the_previous_batch(

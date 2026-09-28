@@ -33,19 +33,26 @@ HTTP → 限流 → 入库 → 队列 → Worker 领取 → 图 → 写回 → �
 而"冲突这一类全错"才是可行动的结论。这与 `eval_sql.py` 按 `proves`
 打印每题验证点是同一个理由（详设 16.11.3 第 4 条）。
 
-类别取自开发流程 7.4 的构成表，只取**切片内已实现**的四类：
+类别取自开发流程 7.4 的构成表，只取**已实现**的五类：
 
 | category | 中文 | 7.4 的条数 | 本集 |
 |---|---|---:|---:|
 | `tool_selection` | 工具选择与 Supervisor 路由 | 15 | 5 |
 | `conflict` | 多源冲突 | 10 | 5 |
-| `reviewer` | 审查（14.1 第一阶段的形态） | 5 | 5 |
+| `reviewer` | 审查（14.1 两个阶段） | 5 | 5 |
 | `clarification` | 澄清、拒答与边界 | 10 | 5 |
+| `loop` | 任务循环与自适应下钻 | 15 | 5 |
 
-**未收进来的两类**：`异常恢复与重试`（要 `retry_router`，属 Phase 8 完整版）、
-`任务循环与自适应下钻` 15 条（7.5 的循环断言要求 `plan_deltas` /
-`revision_no` / `trigger_finding_id`，而切片内 `reflect` 是确定性演进、
-`plan_deltas` 恒空——现在写只能断言"没退化成死循环"，登记在案）。
+**未收进来的一类**：`异常恢复与重试`——它要的是**模型层面**的缺陷答案
+（"这条结论缺一整类信息"），而那要靠审查第二阶段的判定，且那个判定
+本来就会飘（约定 105 实测过）。写进来只能是一条恒绿的观察用例，
+而一条恒绿的用例会让分类通过率失去意义。登记在案。
+
+**`loop` 这一类现在能写了**（6.6.3 的 `plan_extend` 落地之后）：
+它断言的是 `plan_revision` / `plan_deltas` / `steps[].origin` /
+`trigger_finding_id`，而这几样在**确定性演进那条路上**（SQL 空 → 补 RAG）
+是代码判定的，不依赖模型，所以这一类的断言是硬的。
+⚠️ 7.4 要求 15 条，本集交 5 条（与其余四类同规模），其余按 115 口径登记。
 
 ## 判定与故障分开报，观察用例不进门禁
 
@@ -99,21 +106,28 @@ GOLDEN_PATH = "configs/eval_agent_golden.yaml"
 CATEGORIES: dict[str, str] = {
     "tool_selection": "工具选择与路由",
     "conflict": "多源冲突",
-    "reviewer": "审查（Reviewer-lite）",
+    "reviewer": "审查（两阶段）",
     "clarification": "澄清、拒答与边界",
+    "loop": "任务循环与自适应下钻",
 }
 
 #: 阶段基线。**先跑出真实数字，再定基线**——
-#: 2026-09-22 最终全量：**稳定用例 19/19 = 100%**、观察用例 1/1、无未判定。
-#: （分母 19 而不是 20：`agent-clarify-03` 是观察用例，不进门禁。）
+#: 2026-09-28 最终全量（五类各 5 条）：**稳定用例 24/24 = 100%**、
+#: 观察用例 1/1、无未判定、无失败项。（分母 24 而不是 25：
+#: `agent-clarify-03` 是观察用例，不进门禁。）
 #:
-#: 定在 85% 而不是 100%：单条用例值 5 个点，基线贴着实测值会让门禁变成
+#: 定在 85% 而不是 100%：单条用例值约 4 个点，基线贴着实测值会让门禁变成
 #: 随机红——而一个会随机变红的门禁很快就会被忽略，那比没有门禁更糟
 #: （与 `eval_sql.py` 的 `_DEFAULT_BASELINE` 同一条理由）。
 #:
-#: 也**不能定得更低**：丢掉整整一类（5 条）会掉到 14/19 = 74%，而 0.75 的
+#: 也**不能定得更低**：丢掉整整一类（5 条）会掉到 19/24 = 79%，而 0.75 的
 #: 门禁拦不住它（判据是 `rate < baseline`）——"某一类能力整体失效"正是
-#: 最该被拦下的那种退步。85% 允许 2 条因模型抖动失败，第 3 条就报警。
+#: 最该被拦下的那种退步。85% 折算成条数是 20.4/24，也就是**允许 3 条**
+#: 因模型抖动失败，第 4 条就报警。
+#:
+#: ⚠️ 分母从 19 变成 24 之后这个数**没有重定**，因为它仍然满足上面两条：
+#: 拦得住整类失效（79% < 85%），又容得下几条抖动。加类时按这两条重新核一遍，
+#: 不必每次动它。
 #:
 #: ⚠️ **未判定计入分母**（见模块 docstring），所以系统大面积失败任务时
 #: 这个数会掉下来——那是刻意的，不是误报。
@@ -129,6 +143,12 @@ class CaseOutcome:
     refused: bool | None
     conflicts: tuple[str, ...]
     review: dict[str, Any] | None
+    #: 走这一趟有没有演进（`plan_revision`）。**报告里单列一栏**：
+    #: `loop` 那一类的判据全靠它，而它不在 `sources` / `conflicts` 里，
+    #: 不带上就只能靠 `verdict.note` 读文字。
+    plan_revision: int = 0
+    #: 下钻出来的步骤（`origin=EXTENDED`）。同样是给报告读的。
+    extended: tuple[str, ...] = ()
 
     @property
     def category(self) -> str:
@@ -185,6 +205,13 @@ def render(outcome: CaseOutcome) -> str:
         mark = "OBS "
     lines = [f"[{mark}] {outcome.case['id']}  {outcome.case['question']}"]
     lines.append(f"       验证：{outcome.case['proves']}")
+    if outcome.plan_revision:
+        # **只在真的演进过时打**：这一栏每次出现都会占一行，而绝大多数
+        # 用例（单源查询、澄清）不演进——恒打一栏「演进 0 次」是噪声。
+        lines.append(
+            f"       演进：第 {outcome.plan_revision} 版"
+            + (f"，下钻出 {sorted(set(outcome.extended))}" if outcome.extended else "")
+        )
     if not outcome.verdict.ok:
         lines.append(f"       结论：{outcome.verdict.note}")
     return "\n".join(lines)
@@ -263,6 +290,21 @@ def _probe(base: str, token: str, question: str) -> int:
     print(f"refused：{detail.get('refused')}")
     print(f"演进判定：{detail.get('progress_decision')}｜理由：{detail.get('progress_reason')}")
     print(f"plan_revision：{detail.get('plan_revision')}")
+    # **演进记录要打全**：`loop` 那一类的断言就写在这上面（版本号、加了哪几步、
+    # 触发源），而它们不在答案里、也不在证据里——看不到就只能猜。
+    for delta in detail.get("plan_deltas") or []:
+        print(
+            f"  delta v{delta.get('revision_no')} [{delta.get('trigger')}] "
+            f"加了 {delta.get('added_step_ids')}｜触发发现 {delta.get('trigger_finding_id')}"
+        )
+        print(f"      理由：{delta.get('reason')}")
+    print("步骤（含来源）：")
+    for step in steps:
+        print(
+            f"  - {step.get('id')} [{step.get('status')}] {step.get('tool')} "
+            f"origin={step.get('origin')} rev={step.get('revision_no')}｜{step.get('objective')}"
+        )
+    print(f"推理链：{detail.get('investigation_chain')}")
 
     print(f"冲突 {len(detail.get('conflicts') or [])} 条：")
     for item in detail.get("conflicts") or []:
@@ -364,6 +406,12 @@ def main(argv: list[str] | None = None) -> int:
             refused=detail.get("refused"),
             conflicts=tuple(detail.get("conflicts") or []),
             review=detail.get("review"),
+            plan_revision=int(detail.get("plan_revision") or 0),
+            extended=tuple(
+                step["tool"]
+                for step in (detail.get("steps") or [])
+                if step.get("origin") == "EXTENDED"
+            ),
         )
         outcomes.append(outcome)
         print(render(outcome), flush=True)

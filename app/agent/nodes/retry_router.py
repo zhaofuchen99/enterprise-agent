@@ -19,7 +19,7 @@ FR-REV-002 业务规则 1：**相互独立且都必须非负**。三者在这条
 | 预算 | 约束的回边 | 本节点的动作 |
 |---|---|---|
 | `review_retries_left` | `retry_router → sql/rag/analysis` | 回 Tool / analysis 时 -1 |
-| `expansions_left` | `reflect → 补一步` **与** `retry_target=expand` **共用** | 14.3 明写共用 |
+| `expansions_left` | 演进回边（`reflect` 与 `expand` 共用） | **本节点不扣**，`plan_extend` 扣 |
 | `replans_left` | 作废整份计划回 `supervisor` | 回 supervisor 时 -1 |
 
 `expansions_left` 那一行是 14.3 的原文要求："同一份 `expansions_left` 预算被
@@ -38,15 +38,21 @@ FR-REV-002 业务规则 1：**相互独立且都必须非负**。三者在这条
 两者在 State 上长得一模一样（都没有 PENDING 步骤），条件边推不出来。
 所以这一处必须显式写下来，见 `state.AgentState.retry_route`。
 
-## 阶段一只有一类触发，其余各缺一个产出者
+## 谁会被真正产出
 
-`choose_retry` 是 14.4 的逐字实现、五个目标都能路由，但**本版只有
-`retry_target=rag/sql` 会被真正产出**（`reviewer` 对"FACT 结论没有引用"
-且还有一路没查过时给出）。另外三个的缺前提：
+`choose_retry` 是 14.4 的逐字实现、五个目标都能路由，而能走到这里的
+`retry_target` 有三个来源：
 
-- `expand`：要 `plan_extend` 节点由它生成具体步骤（14.3 明写
-  "Reviewer 不直接指定 SQL"），而本版没有那个节点 → **降级**；
-- `replan`：要"计划本身不可执行"这个判断，那是语义，属第二阶段模型审查；
+| 来源 | 目标 |
+|---|---|
+| 第一阶段的确定性判据（"FACT 结论没有引用"且还有一路没查过） | `sql` / `rag` |
+| 第二阶段的模型审查（14.3 的"缺一整类信息"） | `expand`（偶尔也有 `sql`/`rag`） |
+| 14.4 的降级 | 不路由，`CLARIFY` / `FAIL` |
+
+另外两个的缺前提：
+
+- `replan`：要"计划本身不可执行"这个判断——那是语义，而模型审查的四个
+  布尔里没有哪一个问的是它，所以**目前没有产出者**；
 - `search`：Tool 本身还没接（`app/tools/search/` 是空的），没有落点。
 """
 
@@ -60,6 +66,7 @@ from app.agent.schemas.review import ReviewIssue, ReviewResult
 from app.agent.state import (
     AgentState,
     Route,
+    next_step_id,
     objective_for_route,
     tool_for_route,
 )
@@ -91,9 +98,10 @@ def choose_retry(
     if review.retry_target == "replan" and replans_left > 0:
         return Route.REPLAN
     if review.retry_target == "expand" and expansions_left > 0:
-        # 预算有、但**没有承接节点**（本版没有 `plan_extend`）。
-        # 不降级到别的目标：那等于借用了另一类预算。
-        return None
+        # 交给 `plan_extend` 生成具体步骤（14.3：Reviewer 不直接指定 SQL）。
+        # **本节点只路由，不加步骤也不扣预算**——预算是 `plan_extend` 在
+        # 步骤真的被合入时才扣的。
+        return Route.EXPAND
     if review.retry_target in _TOOL_TARGETS and review_retries_left > 0:
         return _TOOL_TARGETS[review.retry_target]
     if review.retry_target == "analysis" and review_retries_left > 0:
@@ -153,6 +161,15 @@ def build_retry_router_node() -> Callable[[AgentState], dict[str, Any]]:
             update["replans_left"] = max(0, state.get("replans_left", 0) - 1)
             return update
 
+        if route is Route.EXPAND:
+            # **提前返回**：`expand` 既不追加步骤（那是 `plan_extend` 的事），
+            # 也不扣 `review_retries_left`——它花的是 `expansions_left`
+            # 那一份，而那一份由 `plan_extend` 在步骤真被合入时才扣。
+            # 落到下面那行统一扣 `review_retries_left` 的话，一次计划演进
+            # 会**同时**吃掉一次补证预算，而四类预算各自可观测正是它们
+            # 分开存在的意义（FR-REV-002 业务规则 1）。
+            return update
+
         if route in (Route.SQL, Route.RAG):
             update["task_list"] = [*(state.get("task_list") or []), _retry_step(state, route)]
         # analysis 目标不追加步骤：`Route.ANALYSIS` 的落点就是重跑
@@ -209,12 +226,12 @@ def _retry_step(state: AgentState, route: Route) -> TaskStep:
 
 
 def _next_step_id(state: AgentState) -> str:
-    """序号接着计划往下排，**不重用已有 id**（同 `reflect._next_step_id`）。"""
-    used = {step.id for step in state.get("task_list") or []}
-    index = len(used) + 1
-    while f"step_{index:02d}" in used:  # pragma: no cover - 正常路径不会进循环
-        index += 1
-    return f"step_{index:02d}"
+    """序号接着计划往下排，**不重用已有 id**。
+
+    **实现搬去了 `state.next_step_id`**（`reflect` / `plan_extend` 问的是
+    同一个问题，三份各写一份就会漂移）。
+    """
+    return next_step_id(state)
 
 
 __all__ = ["build_retry_router_node", "choose_retry"]

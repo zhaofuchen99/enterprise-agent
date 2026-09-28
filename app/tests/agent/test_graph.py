@@ -330,6 +330,75 @@ async def test_expansion_does_not_loop_forever(settings: Settings) -> None:
     assert len(rag.calls) == 1
     assert state["progress_assessment"].decision == "SUFFICIENT"
     assert state["open_questions"], "两路都没结果时，未解决的问题要留下来"
+    assert len(state["plan_deltas"]) == 1, "演进只发生一次"
+
+
+async def _expanded_state(settings: Settings) -> dict[str, Any]:
+    """跑一条"SQL 空 → 补 RAG"的确定性演进，返回最终 State。"""
+    sql = FakeTool("sql_query", empty_as_success=True)
+    rag = FakeTool("rag_retrieve", source="DOCUMENT")
+    graph, _, _ = _run(settings, [_intent(["sql"])], sql_tool=sql, rag_tool=rag)
+    return await _invoke(settings, graph)
+
+
+async def test_the_expansion_leaves_a_traceable_record(settings: Settings) -> None:
+    """演进要留下**可追溯**的三样：`plan_deltas`、触发源、步骤的 `origin`。
+
+    「因为第一步查空了，所以补了一路」——这句话要能被程序读出来，
+    而不是靠人从答案里猜。三样缺一不可：只有 `plan_deltas` 的话，
+    "为什么加这一步"没有载体；只有 `origin` 的话，"加了哪一版"说不清。
+    """
+    state = await _expanded_state(settings)
+
+    deltas = state["plan_deltas"]
+    assert len(deltas) == 1
+    assert deltas[0].revision_no == 1
+    assert list(deltas[0].added_step_ids) == ["step_02"]
+    assert deltas[0].trigger == "EXTEND"
+
+    # **触发源指得到**：查空了的那一步有自己的 `Finding`（`tool_nodes` 产）。
+    # 不给空结果留发现的话，这里恒为 None，而"没有发现可指"与
+    # "有发现但没记"在产物上是同一副样子。
+    finding_ids = {item.id for item in state["findings"]}
+    assert deltas[0].trigger_finding_id in finding_ids
+
+
+async def test_step_records_mark_which_steps_came_from_an_expansion(
+    settings: Settings,
+) -> None:
+    """`agent_task_step` 的 `origin` / `revision_no` 要能分出初始步骤与下钻步骤。
+
+    ⚠️ 这里同时钉住另一件事：**初始那一步的 `revision_no` 是 0**，不是任务
+    的终值。原先所有步骤都拿 `state["plan_revision"]`（也就是 1），
+    等于每个步骤都被标成"最后一版加的"——而表看起来完全正常。
+    开发流程 7.5 的循环类评分正是靠这个区分。
+    """
+    from typing import cast
+
+    from app.agent.graph import _step_records
+    from app.agent.state import AgentState
+
+    state = await _expanded_state(settings)
+    by_key = {item.step_key: item for item in _step_records(cast(AgentState, state))}
+
+    assert by_key["step_01"].origin == "PLANNER"
+    assert by_key["step_01"].revision_no == 0
+    assert by_key["step_02"].origin == "EXTENDED"
+    assert by_key["step_02"].revision_no == 1
+
+
+async def test_the_plan_extend_node_shows_up_in_the_trace(settings: Settings) -> None:
+    """走演进时轨迹里**必须有 `plan_extend`**——它是回边的中继。
+
+    没有这条断言的话，"演进没发生"与"演进发生了但节点没被注册进轨迹"
+    在最终答案上分不出来（前者是判定问题，后者是埋点漏了一个节点）。
+    """
+    state = await _expanded_state(settings)
+
+    nodes = [event.node for event in state["trace_events"]]
+    assert "plan_extend" in nodes
+    assert nodes.index("plan_extend") > nodes.index("reflect")
+    assert nodes.index("plan_extend") < nodes.index("rag"), "它排在要跑的那一路之前"
 
 
 async def test_empty_sql_under_a_restricted_scope_is_not_reported_as_missing_data(

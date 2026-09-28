@@ -126,6 +126,13 @@ class TaskOutcome(BaseModel):
     #: 反复出现的烂 SQL、按 `content_hash` 找同一条证据）。
     #: 只留 JSON 的话，那些索引一个都用不上。
     steps: tuple[StepRecord, ...] = ()
+    #: 计划演进的记录（`agent_plan_revision`，16.6）。
+    #:
+    #: **它与 `steps` 是两个问题**：`steps` 说"计划里最后有哪几步"，
+    #: 这一份说"计划为什么变成这样"——哪一版加了哪几步、由哪个中间发现催生。
+    #: 只有前者的话，"这一步是初始计划里的还是下钻出来的"就查不到，
+    #: 而开发流程 7.5 的循环类评分正是靠这个区分。
+    revisions: tuple[PlanRevisionRecord, ...] = ()
     tool_calls: tuple[ToolCallRecord, ...] = ()
     evidence: tuple[Evidence, ...] = ()
     conflicts: tuple[Conflict, ...] = ()
@@ -134,6 +141,34 @@ class TaskOutcome(BaseModel):
     #: **它是「可重放」的载体**：18.3 规定客户端断线重连补历史要回到这张表，
     #: 因为 Redis Stream 会被 MAXLEN 裁掉。
     trace_events: tuple[NodeTrace, ...] = ()
+
+
+class PlanRevisionRecord(BaseModel):
+    """`agent_plan_revision` 的一行（16.6）——**一次计划演进**。
+
+    **不直接用 `agent/schemas/plan.py` 的 `PlanDelta`**：那条链上是
+    "进 State 之前必须过 Pydantic 校验"的边界模型，而这里是**行**。
+    同 `StepRecord` 的理由——`repositories/` 在依赖链的底端，
+    不能 import `agent/schemas`，所以由调用方（`agent/graph.py`）合成它。
+
+    `budget_snapshot` 是 16.6 那一列的来源，用途写在那张表的注释里：
+    **复盘「预算是否被借用」**。四类预算各自独立、不可借用是 FR-REV-002
+    业务规则 1 的要求，而"这次演进花的是哪一类"只有当时的余额能回答。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: 行的身份。与 `StepRecord` 同：**在这里生成而不是落库时**——
+    #: 两条记录是不是同一条，这个问题在造出它的时候就该有答案。
+    id: str = Field(default_factory=lambda: new_id(IdPrefix.TASK))
+    revision_no: int
+    #: `INITIAL` / `EXTEND` / `REPLAN`（16.6 的 `agent_plan_revision.trigger_type`）
+    trigger_type: str
+    trigger_finding_id: str | None = None
+    added_step_ids: tuple[str, ...] = ()
+    skipped_step_ids: tuple[str, ...] = ()
+    reason: str | None = None
+    budget_snapshot: dict[str, int] = Field(default_factory=dict)
 
 
 class StepRecord(BaseModel):
@@ -161,7 +196,15 @@ class StepRecord(BaseModel):
     status: str
     attempt_count: int = 0
     result_summary: dict[str, Any] | None = None
+    #: 这一步是**怎么进计划的**：`PLANNER`（初始计划）或 `EXTENDED`（下钻出来的）。
+    #: 16.6 定义的第三个取值 `REPLAN` 目前没有产出者——那条路会把计划整个作废
+    #: 回到 `supervisor` 重来，重来的那批仍是 `PLANNER` 的产出。
     origin: str = "PLANNER"
+    #: **引入这一步的那一版计划号**，不是任务的终值。
+    #:
+    #: 这两个值都由 `agent/graph.py` 从 `plan_deltas` 反推——不这么做的话
+    #: 每次演进都会把**所有**步骤（含初始那几条）标成新版本，
+    #: 于是"哪些步骤是下钻出来的"在表里查不到，而表看起来完全正常。
     revision_no: int = 0
 
 

@@ -189,7 +189,7 @@ def _derived_events(
     将来 `conflict` 或新节点产出同类字段时，事件自动跟着有，不必回来加分支。
 
     `plan.created` 与 `plan.updated` 靠 `plan_revision` 区分：
-    `supervisor` 写的是当前值（首次成计划），`reflect` 演进时写 +1。
+    `supervisor` 写的是当前值（首次成计划），`plan_extend` 演进时写 +1。
     """
     derived: list[tuple[TaskEventType, dict[str, Any]]] = []
 
@@ -207,17 +207,22 @@ def _derived_events(
             added = [
                 step.id for step in plan if step.id not in {old.id for old in state["task_list"]}
             ]
+            # 三样都取**这次更新的那条 delta**，不现推：`trigger_finding_id`
+            # 推不出来（它到底指哪条 finding 只有 `plan_extend` 知道），
+            # 而 `skipped_steps` 在它之前恒为空——那两处都是"看起来正常"的
+            # 空值，读的人会把"没有"与"没记"当成一回事。
+            delta = _latest_delta(update)
             derived.append(
                 (
                     TaskEventType.PLAN_UPDATED,
                     {
                         "revision_no": revision,
                         "added_steps": added,
-                        # 切片内 `reflect` 只追加、不放弃步骤，所以恒为空；
-                        # 放弃步骤要等模型的 EXPAND 判定（【后续扩展】）
-                        "skipped_steps": [],
-                        "trigger_finding_id": _trigger_finding_id(state),
-                        "reason": _assessment_reason(update),
+                        "skipped_steps": list(delta.skipped_step_ids) if delta else [],
+                        "trigger_finding_id": delta.trigger_finding_id if delta else None,
+                        # delta 的 `reason` 比 `progress_assessment.reason` 更贴切：
+                        # 后者是"为什么该继续查"，前者是"为什么加了这几步"。
+                        "reason": delta.reason if delta else _assessment_reason(update),
                     },
                 )
             )
@@ -273,17 +278,28 @@ def _derived_events(
                 },
             )
         )
+
+    # **只在有内容时发**：`plan_extend` 每次运行都会返回这个字段（哪怕是空
+    # 列表），无条件发的话，每个正常任务都会多出一条"这次演进没有提出步骤"
+    # 的事件——而它是噪声，真被拒的时候反而没人看（同 `DISABLED` 不进
+    # `warnings` 的理由，约定 58）。
+    rejected = update.get("plan_extend_rejected")
+    if rejected:
+        derived.append(
+            (TaskEventType.PLAN_EXTEND_REJECTED, {"reasons": list(rejected)}),
+        )
     return derived
 
 
-def _trigger_finding_id(state: AgentState) -> str | None:
-    """触发这次演进的结论 id（18.2 的 `trigger_finding_id`）。
+def _latest_delta(update: dict[str, Any]) -> Any | None:
+    """这次更新带回来的那条 `PlanDelta`（没有则 `None`）。
 
-    **切片内恒为 None**：演进由 `reflect` 的确定性规则触发（"某一路跑了但空"），
-    不来自某条 `Finding`——模型提出下钻理由的能力属【后续扩展】。
-    留这个字段而不是删掉：客户端的事件 schema 不该因为一个后置能力而变形。
+    **取最后一条而不是第一条**：一次节点调用最多产生一条 delta
+    （`plan_extend` 每次只加一版），但 reducer 是追加语义——写成"最后一条"
+    不会在将来某天有人一次追加多条时静默取到旧的那条。
     """
-    return None
+    deltas = update.get("plan_deltas") or []
+    return deltas[-1] if deltas else None
 
 
 def _assessment_reason(update: dict[str, Any]) -> str:

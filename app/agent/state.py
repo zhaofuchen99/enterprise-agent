@@ -18,9 +18,13 @@ LangGraph 里带 `Annotated[..., reducer]` 的字段走 reducer 合并，
 
 | 语义 | 字段 | 实现 |
 |---|---|---|
-| 按 id 去重追加 | `evidence` / `findings` | `merge_by_id` |
+| 按 id 去重追加 | `evidence` / `findings` / `plan_deltas` | `merge_by_id` |
 | 按键合并 | `step_results` | `merge_step_results` |
 | 整体替换 | `task_list` / `open_questions` / `progress_assessment` | 默认（后写覆盖） |
+
+`plan_deltas` 走 `merge_by_id` 而不是整体替换，因为 `PlanDelta.id` 就是
+`"{task_id}:{revision_no}"`（详设 7.2 要的去重键）——两次演进各是一条记录，
+整体覆盖会让第一次的演进记录**静默消失**，而"计划只演进过一次"看起来完全正常。
 
 **`errors` 用 `(错误码, 文案)` 去重而不是 `id`**：`AgentError` 没有 `id`
 （它是异常、不是实体）。详设 7.2 写的是"按 id 去重"，那条按当时的
@@ -30,18 +34,35 @@ LangGraph 里带 `Annotated[..., reducer]` 的字段走 reducer 合并，
 ## `task_list` 只允许整体替换
 
 详设 7.2 明写「只允许 Planner、PlanExtend 或 Replan 整体替换，其余节点只读」。
-在这一版里 `task_list` 由 `supervisor` 一次性产出、`reflect` 演进时替换，
-其余节点只读——**这条纪律没有类型层面的强制**，靠的是
-`test_state.py` 里那条"除 supervisor / reflect 外没有节点写 task_list"的断言。
+在这一版里 `task_list` 的写者只有两个：`supervisor` 一次性产出，`plan_extend`
+演进时追加（`replan` 那条路是 `retry_router` 把它清空，等 supervisor 重来）。
+
+**`reflect` 不再是写者**：它只出判定，追加步骤交给 `plan_extend`。
+这不是搬代码——两个写者各写一份"追加步骤 + 升 revision + 扣预算"的话，
+漂移的症状是**演进记录与实际计划对不上**（`plan_deltas` 说有一步、
+`task_list` 里没有），而两边都看不出来。单一写者是让 `plan_revision`、
+`plan_deltas`、`expansions_left` 三者始终一致的前提。
+
+**这条纪律没有类型层面的强制**：`task_list` 是普通字段，任何节点都能返回它。
+原先这里写的是"靠 `test_state.py` 的断言钉住"，而那个文件在仓库里
+**并不存在**——这条注释因此是没有保障的自我安慰，已如实改掉。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from enum import StrEnum
 from typing import Annotated, Any, TypedDict
 
 from app.agent.schemas.analysis import AnalysisResult
-from app.agent.schemas.plan import Finding, IntentResult, ProgressAssessment, StepResult, TaskStep
+from app.agent.schemas.plan import (
+    Finding,
+    IntentResult,
+    PlanDelta,
+    ProgressAssessment,
+    StepResult,
+    TaskStep,
+)
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
 from app.domain.task import TaskStatus, ToolCallRecord
@@ -62,6 +83,10 @@ class Route(StrEnum):
 
     SQL = "sql"
     RAG = "rag"
+    #: **计划演进**（详设 14.4 的 `retry_target=expand`）。落到 `plan_extend`：
+    #: 审查说的是"缺一整类信息"，而具体加哪几步由那个节点决定
+    #: （14.3 明写 Reviewer 不直接指定 SQL）。
+    EXPAND = "expand"
     #: ⚠️ 落到 **`conflict`** 而不是 `analysis`（`_TARGETS` 里那条映射）。
     #: 冲突检测要的是"证据都到齐了"这个时点，路由回这里时会重跑它再进
     #: `analysis`——重试补完证据之后，冲突也确实该重新算一遍。
@@ -138,9 +163,20 @@ class AgentState(TypedDict, total=False):
     findings: Annotated[list[Finding], merge_by_id]
     open_questions: list[str]
     progress_assessment: ProgressAssessment | None
-    #: 【Phase 6 未接】演进预算与修订记录，属 plan_extend（后置）
+    #: 计划版本号，初始为 0。**只有 `plan_extend` 会加一**（详设 6.6.3：
+    #: 它是"循环中唯一能修改 task_list 的节点"）。
     plan_revision: int
-    plan_deltas: list[Scalar]
+    #: 每次计划变更的原因与增删步骤（详设 7.4）。走 `merge_by_id` 是因为
+    #: `PlanDelta.id` 就是 `"{task_id}:{revision_no}"`——那正是 7.2 要的去重键。
+    plan_deltas: Annotated[list[PlanDelta], merge_by_id]
+    #: **本次演进中被拒的步骤与原因**（详设 6.6.3 的 `plan_extend_rejected`）。
+    #:
+    #: 为什么不是一个错误码：19.1 的错误码表是封闭的，"演进提出的一步没通过校验"
+    #: 也不该让任务失败——6.6.3 的原话是"丢弃未通过步骤、按 SUFFICIENT 收敛"。
+    #: 但**完全静默更糟**：那时"模型提了没通过的步骤"与"模型压根没提"在产物上
+    #: 长得一样。所以走"节点返回字段 → `tracing._derived_events` 派生事件"这条
+    #: 既有范式（约定 70），与 `open_questions` 同形。
+    plan_extend_rejected: list[str]
 
     #: 每个节点的进入/离开事件（16.7 的 `agent_trace_event`）。
     #: **图的节点是串行的，所以列表顺序就是执行顺序**——`sequence` 在落库时
@@ -180,6 +216,8 @@ class AgentState(TypedDict, total=False):
     #: **计划演进**剩余次数（详设 6.6.1 第一类）。执行阶段的 `reflect` 与
     #: 审查阶段的 `retry_target=expand` 共用这一份——两者之和不超过配置值，
     #: 这是 14.3 明写的（避免"执行阶段激进 + 审查阶段再来一轮"）。
+    #: **只有 `plan_extend` 扣它**，且只在步骤真的被合入时扣：
+    #: 一条被校验拒掉的演进没有产生新的取证动作，不该算一次演进。
     expansions_left: int
     #: **Reviewer 补证**剩余次数（第二类，`max_reviewer_evidence`）。
     #: 约束 `reviewer → retry_router → Tool/analysis` 那条回边。
@@ -209,6 +247,29 @@ def pending_steps(state: AgentState) -> list[TaskStep]:
 
 def has_pending_step(state: AgentState) -> bool:
     return bool(pending_steps(state))
+
+
+def next_step_id(state: AgentState, *, taken: Iterable[str] = ()) -> str:
+    """下一个可用的步骤 id（`step_01` / `step_02`…）。
+
+    **序号接着计划往下排，不重用已经出现过的 id**：`step_results` 是按
+    step_id 索引的，重用一个已存在的 id 会让新步骤的结果**覆盖**旧步骤的
+    （`merge_step_results` 的设计就是"新值覆盖"）。这类覆盖不报错，
+    只会让"这一步跑了两次、第一次是空的"事后无从分辨。
+
+    **提到这里是因为它有三个调用方**（`reflect` 出判定、`plan_extend` 合入、
+    `retry_router` 追加补证步骤）。三份各写一份的症状是某一天其中一份改了
+    规则（比如改用更短的 id），而撞号只在**那一条路径**上发生——
+    另外两条照常工作，排查时会以为是数据问题。
+
+    `taken` 是**同一次调用里已经分配出去的 id**：一次演进可能加不止一步，
+    而它们都还没进 `task_list`，只查 State 会给两步发同一个 id。
+    """
+    used = {step.id for step in state.get("task_list") or []} | set(taken)
+    index = len(used) + 1
+    while f"step_{index:02d}" in used:  # pragma: no cover - 正常路径不会进循环
+        index += 1
+    return f"step_{index:02d}"
 
 
 #: 两路取证工具：**工具名 ↔ 路由值 ↔ 补它时给步骤写的目标说明**。
@@ -317,5 +378,6 @@ __all__ = [
     "merge_by_id",
     "merge_errors",
     "merge_step_results",
+    "next_step_id",
     "pending_steps",
 ]

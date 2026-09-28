@@ -184,6 +184,10 @@ class TaskDetailData(BaseModel):
     progress_decision: str | None = None
     progress_reason: str | None = None
     plan_revision: int = 0
+    #: 计划演进的记录（哪一版加了哪几步、由哪个中间发现催生）。
+    #: `steps` 里每步也带 `origin`（PLANNER / EXTENDED）与 `revision_no`——
+    #: **两个一起看才回答得了"这一步是初始计划里的，还是下钻出来的"**。
+    plan_deltas: list[dict[str, Any]] = Field(default_factory=list)
 
     # --- 来自 result_json（16.5 的结构化结果）---
     evidence: list[dict[str, Any]] = Field(default_factory=list)
@@ -194,6 +198,11 @@ class TaskDetailData(BaseModel):
     review: dict[str, Any] | None = None
     #: 答案的限制：证据覆盖不到的部分、失败的数据源、未明确的前提
     limitations: list[str] = Field(default_factory=list)
+    #: 推理链（13.5）：每一轮的中间发现，以及它是否引出了新的下钻步骤。
+    #: **它是"任务循环"对外可见的样子**——只给答案的话，读者看不出
+    #: "因为第一步查空了、所以补了另一路"，而那正是这个系统与
+    #: "一次性生成答案"的区别。
+    investigation_chain: list[dict[str, Any]] = Field(default_factory=list)
     #: 本次回答是否**因为证据里没有问题所问的那件事**而没有作答（11.8 的拒答）。
     #: `None` 表示这个任务没有走到分析那一步。
     #:
@@ -211,8 +220,10 @@ class TaskDetailData(BaseModel):
             progress_decision=plan.get("decision"),
             progress_reason=plan.get("reason"),
             plan_revision=int(plan.get("revision") or 0),
+            plan_deltas=list(plan.get("deltas") or []),
             evidence=list(payload.get("evidence") or []),
             conflicts=list(payload.get("conflicts") or []),
+            investigation_chain=list(payload.get("investigation_chain") or []),
             review=payload.get("review"),
             limitations=list(payload.get("limitations") or []),
             refused=payload.get("refused"),

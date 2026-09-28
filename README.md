@@ -77,18 +77,21 @@ flowchart LR
     B --> C[Worker]
     C --> D{{最小 Graph}}
 
-    subgraph D [九节点任务循环]
+    subgraph D [十节点任务循环]
         direction TB
         S[supervisor<br/>意图 + 计划] --> T1[sql]
         S --> T2[rag]
-        T1 --> R[reflect<br/>确定性]
+        T1 --> R[reflect<br/>确定性判定]
         T2 --> R
-        R -->|还有待执行| T1
+        R -->|该补一路| PE[plan_extend<br/>唯一改计划的节点]
+        PE --> T1
+        PE --> T2
         R -->|收敛| F[conflict<br/>数值冲突检测]
         F --> AN[analysis<br/>模型组织证据]
-        AN --> RV[reviewer<br/>确定性检查]
+        AN --> RV[reviewer<br/>两阶段检查]
         RV --> RR[retry_router<br/>14.4 路由表]
         RR -->|审查要求补证| T2
+        RR -->|审查要求下钻| PE
         RR -->|不重试| FI[final<br/>代码渲染引用]
     end
 
@@ -120,6 +123,13 @@ Worker 不得依赖 FastAPI（无法独立扩缩容）；`domain/` 不依赖任�
 **预算耗尽就降级，不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态
 ——后者会让 `pending_steps` 的「已完成的步骤不重跑」失效，而那是个
 **不报错、只烧递归额度的死循环**。
+
+**`plan_extend` 是唯一能改计划的节点，而它有两个入口。** `reflect` 判"该补一路"
+时把算好的那一步交给它（**不调模型**——所以"SQL 空了就补 RAG"这条链路不依赖
+云模型连通性）；审查判"缺一整类信息"时它走模型生成步骤（14.3 明写 Reviewer
+不直接指定 SQL）。每次演进的**原因、加了哪几步、由哪条中间发现催生**都落进
+`plan_deltas` 与 `agent_plan_revision`，而"哪些步骤是下钻出来的"由
+`agent_task_step.origin` 回答。**这一层是「自适应下钻」这四个字唯一有实体的地方。**
 
 ---
 
@@ -214,7 +224,7 @@ make run        同时起两个进程          make fmt        格式化并自�
 
 make demo       端到端演示九条固化问题   make eval-sql   金标 SQL 评测
 make eval-rag   RAG Recall@8 评测        make verify-corpus  语料缺陷注入门禁
-make eval-agent Agent 端到端评测 20 条    make eval-agent-ask  先跑一遍再固化
+make eval-agent Agent 端到端评测 25 条    make eval-agent-ask  先跑一遍再固化
 make ingest     语料入库并发布            make retrieve   单次混合检索（调试用）
 make reindex    从归档原文重建向量索引     make sql        单次自然语言 → SQL 证据
 make tokenize   中文分词逐条核对
@@ -314,11 +324,14 @@ LOOP__MAX_TOTAL_STEPS=30
 |---|---|---|
 | 本机 WSL 内存 7.6GB | Milvus Standalone 需 8GB 起，跑不起来 | **已由 TBC-05 结案解决**：向量库改判 Qdrant（实测 300MB、多进程并发正常），见详细设计 23.1.1 |
 | 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
-| **Reranker 默认关闭**（已实现，需配置启用） | 关闭时检索用 RRF 融合后的 Top-8 直接出证据；打开才走 cross-encoder 重排 | 已实现 11.7 第 ⑥⑦ 步（`app/tools/rag/reranker.py`，`BAAI/bge-reranker-v2-m3` 云服务）。**本机跑不了本地重排**：Ollama 无 rerank 端点（实测 404），本地 cross-encoder 与 7.6GB 内存不相称；11.7 第 ⑧ 步「邻近块扩展」仍后置 |
+| **Reranker 默认关闭**（已实现，需配置启用） | 关闭时检索用 RRF 融合后的 Top-8 直接出证据；打开才走 cross-encoder 重排 | 已实现 11.7 第 ⑥⑦ 步（`app/tools/rag/reranker.py`，`BAAI/bge-reranker-v2-m3` 云服务）。**本机跑不了本地重排**：Ollama 无 rerank 端点（实测 404），本地 cross-encoder 与 7.6GB 内存不相称。11.7 的 ⑥⑦⑧ 三步都已实现，⑧「邻近块扩展」有 `RAG__TABLE_EXPAND_MAX_ROWS` 边界（默认 12 行）——语料里那张 80 行的明细表装不下，超边界的表维持"如实说明 + 建议查库" |
 | **SSE 重放暂走 Redis Stream** | 断线重连在流保留期（1 小时）内可完整补齐，超出窗口只能拿到 `snapshot` + `replay_lost=true` | 18.3 的「MySQL 权威重放」要先把 Worker 的每条事件**先落 `agent_trace_event` 取 sequence 再 XADD**，而现在的轨迹是收尾时批量落的（两批事件不是同一批）；合并已登记 |
 | **冲突检测只做 VALUE 一类** | 口径 / 时点 / 范围 / 来源四类没做，各有各的缺前提（见 `app/agent/nodes/conflict.py` 的清单） | Phase 9 |
 | **已知误报：表格的合计行与分项行不分** | 实测里一张表的分项行被当成区域合计去比，报出过 92% 的"差异" | 需要表格的合计标记或指标口径的 `grain`；模型能在 `claims` 里自己纠正，检测器这一层还不能 |
-| **Reviewer 只做确定性检查** | 14.1 的第二阶段（模型审查）与 `RETRY` / `CLARIFY` 两个状态没做 | Phase 8 完整版 |
+| **`plan_extend` 的校验没做全** | 6.6.3 的八条循环校验里做了四条（总步数、单轮步数、工具闭集、去重键）；**去重的语义相似度**、**下钻深度**（`objective` 是自由文本，判不出"同一实体维度链"）、**`success_criteria`**（`TaskStep` 没这个字段）三条没做 | 已登记在 CLAUDE.md 的【后续扩展】 |
+| **`retry_router` 的 `replan` 分支走不到** | 模型审查的四个布尔里没有哪一个问的是"计划本身不可执行"，所以 `choose_retry` 能路由、却没有产出者 | 要接就得给 `ModelReview` 加一条判断，而那会让"计划是否可执行"变成模型说了算——需重新论证 |
+| **`agent_finding` 表仍是空的** | `findings` 进 State 也进推理链（`investigation_chain`），但**没有落库的调用方**，所以库里查不到那些 `fnd_` id | 已登记 |
+| **`WAITING_CLARIFICATION` 没有状态位** | 澄清在答案文本里表达，任务终态仍是 `SUCCEEDED`——前端判不出"这条在等你回话" | 要动任务终态与 API/SSE 三处，已登记 |
 | 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |
 | 同义词会导致误拒 | `报备` vs 语料里的 `备案`，余弦 0.74 仍被拒答（金标 rag-06） | **重排生效时已解**（拒答改由逐候选的相关性分判）；重排关闭时仍会误拒——两条路径的差别写在 CLAUDE.md 约定 57 |
 | 跨进程 trace 用内存 exporter 断言 | 未接真实追踪后端，线上看不到链路 | 本机无 Jaeger/Grafana；OTLP 开关已就绪，Phase 11 接后端 |

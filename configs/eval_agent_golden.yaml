@@ -31,10 +31,30 @@
 # | `expect_limitations_contain` | `limitations` | 钉住**代码生成的**限制 |
 # | `expect_rejected` / `expect_clarification` | `refused` / 步骤为空 | 拒答与澄清 |
 # | `expect_review_*` | `review` | 审查确实跑过、结论形态正确 |
+# | `expect_plan_*` | `plan_revision` / `plan_deltas` / `steps[].origin` | 任务循环 |
 #
 # `expect_sources` **缺省 = 不检查，`[]` 才是"不该调任何工具"**；
 # `expect_review_issue_codes` 同理。合成一个的话，一条只断审查结论的用例
 # 会被判成"工具选择不符"——而它压根没打算断言工具。
+#
+# ## `expect_plan_*`：该演进的钉下限，不该演进的钉精确
+#
+# 演进有**两个触发源**：`reflect` 的确定性判定（某一路跑了但空 → 补另一路）
+# 与审查第二阶段的 `retry_target=expand`（"缺一整类信息"）。
+# 前者是代码判的、每次必发生；**后者是模型判的，同一题两次跑可以不一样**。
+#
+# 实测（2026-09-28，问一个库里没有的期间）：第一次确定性补了 RAG，
+# 审查又判了一次 expand，`plan_extend` 走模型再加 3 步——`plan_revision`
+# 最终是 2。**那个 2 不是稳定值**。所以：
+#
+# - `expect_plan_revision_min` + `expect_extended_tools_contain`（**下限与包含**）
+#   用于"反正会演进"的那几条——钉精确值等于把"模型这次怎么想的"固化成门禁；
+# - `expect_plan_revision: 0` + `expect_plan_delta_count: 0`（**精确**）
+#   用于"不该演进"的那几条——单源查询与澄清压根没有可补的一路，
+#   模型再想加也没有由头。
+#
+# 与 `expect_sources`（精确）和 `expect_conflicts`（不钉条数）的取舍同一条理由：
+# **能精确的地方精确，模型插得进手的地方只钉方向**（约定 90 的另一个面）。
 #
 # ## 金标是怎么来的
 #
@@ -120,7 +140,41 @@
 # 也正是"不误报"这个方向的断言。
 # ⚠️ 所以上面那条修完之后，**本报告的数字不会变**：五条冲突用例钉的都是
 # "报了哪一条"与"零条"，没有一条钉条数（这正是约定 90 立那条规矩的用处）。
-version: "2026.09.27-1"
+# ## 新增：任务循环与自适应下钻（2026-09-28，5 条）
+#
+# 这一类在 `plan_extend` 落地之前**写不出来**（`plan_deltas` 恒空，
+# 7.5 的循环断言没有载体）。现在有了，而且**演进的两条路都能在端到端里跑到**：
+#
+# - **确定性那条**（`reflect`：某一路跑了但空 → 补另一路）是代码判的，
+#   每次必发生——所以"该演进"这一类的下限断言是硬的；
+# - **模型那条**（审查第二阶段的 `retry_target=expand`）会飘，
+#   所以上限与包含式断言（见文件头那段说明）。
+#
+# 五条的分工：
+#
+# | id | 期间/粒度 | 钉的是什么 |
+# |---|---|---|
+# | loop-01 | 2026 全年 | 该演进时演进 + **触发源可反查**（22.10.3） |
+# | loop-02 | 2025 Q2 | **不该**演进时不演进（精确 0）+ 步数不涨 |
+# | loop-03 | —— | **澄清路径不演进**（走 `_review_or`，见 harness） |
+# | loop-04 | 2026-03 华南 | 换期间与区域仍是同一个机制 + **步数有界** |
+# | loop-05 | 2026-06 华东 | **两类演进共用同一份预算**（22.10.4 的端到端形态） |
+#
+# 换期间/换区域/换粒度是刻意的（同 `agent-review-02` 与 `demo-sql-q2` 的理由）：
+# 防的是"某一条问题碰巧总能满足断言"。
+#
+# ## 实测（2026-09-28，五类各 5 条）
+#
+# **分类通过率 5/5 × 5 类；稳定用例 24/24 = 100%、观察用例 1/1、
+# 无未判定、无失败项**（分母 24 而不是 25：`agent-clarify-03` 不进门禁）。
+# 跑之前重启了 `make run`（约定 100），`make demo` 同日 稳定 7/7 + 观察 2/2。
+#
+# ⚠️ **`agent-loop-05` 那一条证明了"钉下限"这个决定的必要**：它在
+# 2026-09-28 的两次真跑里**结果不同**——探针那次 `plan_revision=2`
+# （确定性一次 + 审查模型一次），评测那次只有 1 版。
+# 钉精确值的话它就是一条随机红的用例；钉 1 ≤ revision ≤ 2 则两次都通过，
+# 而"没演进"与"超预算"这两个真故障仍然拦得住。
+version: "2026.09.28-1"
 
 cases:
   # ==================================================== 工具选择与路由（5）
@@ -409,3 +463,97 @@ cases:
     proves: 11.7 的数据权限只在 SQL 侧（约定 79）：受限账号问授权范围外的
       区域时，答案必须说清「**看不到**」而不是「没有」，并声明文档来源
       没有这一层过滤。同一个问题换个账号，限制就多出三条
+
+  # ==================================================== 任务循环与自适应下钻（5）
+  #
+  # 这一类验的是**"Agent 能根据工具结果继续分析"**（冲刺方案 §8.4 第③条）
+  # 的产物面：计划真的变了、变的时候留下了记录、而记录能反查到原因。
+  #
+  # ⚠️ **不钉冲突条数、不钉审查 issue**——那两样属别的类。这里只问
+  #    "该不该下钻、下钻到哪一路、为什么"。
+  - id: agent-loop-01
+    category: loop
+    question: 2026年全年华东地区的净销售额是多少？
+    expect_sources: [sql_query, rag_retrieve]
+    # 业务库只到 2025-12-31（`make seed-business` 的语料范围），所以按 2026
+    # 条件查必然 0 行 → `reflect` 判 EXPAND → 补 RAG。
+    # 实测（2026-09-28）：plan_revision=1、扩展出一步 rag_retrieve、refused=true。
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [rag_retrieve]
+    # 22.10.3 的「每个 origin=EXTENDED 的步骤都能反查到存在的 finding_id」。
+    # **它同时查两个方向**：有新增步骤的 delta 必须有触发源，而那个源必须
+    # 真的在推理链里。只查前者的话，一个指向不存在 id 的值照样通过。
+    expect_trigger_finding_linked: true
+    proves: 该下钻时下钻了，**而且下钻这一步能反查到为什么**——
+      「因为第一步查空了，所以补了一路」这句话在产物上成立（推理链里那条
+      finding 挂着 triggered_step_id）。只是"多跑了一步"而没有因果记录，
+      与"一次性把两路都调了"在最终答案上分不出来
+
+  - id: agent-loop-02
+    category: loop
+    question: 2025年Q2华东地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 127,576,714.27 元（与 demo-sql-q2 同一个数——**换一个入口再钉一次**，
+    # 两个入口共用一份判据，所以这一条实际上是在验"判据只有一份"）
+    expect_numbers: ["127576714.27"]
+    # **精确的 0**：单源问题没有可补的第二路，`reflect` 的 EXPAND 判据
+    # （"某一路跑了但空，而另一路没进过计划"）根本不成立。
+    # 这里敢钉精确值，是因为它不依赖模型——见文件头那段说明。
+    expect_plan_revision: 0
+    expect_plan_delta_count: 0
+    expect_extended_tools_contain: []
+    expect_max_steps: 2
+    proves: |-
+      **不该下钻时一步都不多跑**。过度下钻与漏下钻是两类成本：
+      漏下钻答案会薄，过度下钻则每次都白花两个工具调用的时间——
+      而它看起来完全正常，只是慢。这一条钉的是后者
+
+  - id: agent-loop-03
+    category: loop
+    # 与 agent-clarify-01/02 同一个机制（意图判定），但**断言的不是同一件事**：
+    # 那两条钉"进澄清"，这一条钉"进澄清时计划一步都没动"。
+    question: 这个季度的情况如何？
+    expect_clarification: true
+    # ⚠️ 澄清用例会提前 return，`expect_plan_*` 原本**永远不会被检查**
+    # ——判据在 `agent_harness._review_or` 里单独走一步（那条注释记的
+    # 正是"写了却从不生效的断言比没有断言更糟"）。
+    expect_plan_revision: 0
+    expect_plan_delta_count: 0
+    expect_extended_tools_contain: []
+    proves: 澄清路径**不演进**——一步都不跑，也就没有"跑了但空"这回事。
+      实测（2026-09-28）：`intent=CLARIFICATION`、steps 为空、plan_revision=0
+
+  - id: agent-loop-04
+    category: loop
+    question: 2026年3月华南地区的净销售额是多少？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [rag_retrieve]
+    # **有界**：配置上限是 24 步，而这条问题最多能走到
+    # 初始 2 步 + 确定性演进 1 步 + 模型演进 ≤6 步 + 补证 1 步。
+    # 取 10 是想在"回边失控"刚露头时就被拦下，而不是等到递归上限
+    # ——那条路的收尾是 INTERNAL_ERROR + 五张表全空。
+    expect_max_steps: 10
+    proves: |-
+      **换一个期间、换一个区域，同一个机制仍然成立**（同 demo-expand
+      与 agent-loop-01 不同行）。防的是"某一条问题碰巧总能满足断言"，
+      同时钉住演进之后**总步数有界**——那正是 22.10.1 的终止性判据
+      在端到端的形态
+
+  - id: agent-loop-05
+    category: loop
+    question: 2026年6月华东地区的净销售额是多少？
+    expect_sources: [sql_query, rag_retrieve]
+    expect_plan_revision_min: 1
+    # **22.10.4 的预算隔离**：14.3 明写 `expansions_left` 被 `reflect` 的演进
+    # 与审查的 `retry_target=expand` **共用**，两者之和不超过配置值（2）。
+    # 绕过它只有一条路——某条路自己扣了别的预算，而那正是 FR-REV-002
+    # 业务规则 1 要防的"借用"。
+    # ⚠️ 上限钉的是**配置值**，所以 `LOOP__MAX_EXPANSIONS` 调大时要一起改。
+    expect_plan_revision_max: 2
+    expect_trigger_finding_linked: true
+    proves: 确定性演进与模型驱动的演进**花的是同一份预算**。实测（2026-09-28）
+      这条问题跑出 `plan_revision=2`：第一步确定性补了 RAG，审查又判了一次
+      "缺一整类信息"，`plan_extend` 走模型再加 3 步——两类的计数合起来
+      才是"演进用了几次"，这正是 14.3 那句"避免执行阶段激进 +
+      审查阶段再来一轮"要防的东西

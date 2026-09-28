@@ -1,12 +1,16 @@
-"""一次任务的执行产出落库（详细设计 16.6 与 16.7 的四张表）。
+"""一次任务的执行产出落库（详细设计 16.6 与 16.7 的六张表）。
 
 ## 为什么这几张表合成一个仓储
 
-`agent_task_step` / `agent_tool_call` / `agent_evidence` / `agent_conflict` /
-`agent_review` 各自是独立的表，但它们有同一个生命周期：**都只在一次任务
-结束时写一次，且必须一起写**。拆成五个仓储会让调用点从"一次执行落一次库"
-变成五行互不相干的写语句——而它们的不一致（证据落了、冲突没落）
-不会有任何报错，只会让复盘时看到的图景缺一块。
+`agent_task_step` / `agent_plan_revision` / `agent_tool_call` / `agent_evidence` /
+`agent_conflict` / `agent_review` 各自是独立的表，但它们有同一个生命周期：
+**都只在一次任务结束时写一次，且必须一起写**。拆成六个仓储会让调用点从
+"一次执行落一次库"变成六行互不相干的写语句——而它们的不一致（证据落了、
+冲突没落）不会有任何报错，只会让复盘时看到的图景缺一块。
+
+⚠️ `agent_finding` 是**唯一没接的**：`findings` 从 Phase 6 起就进 State
+（`tool_nodes._normalize` 产出），但一直没有落库的调用方。
+它不在这张契约里，是因为"发现"的读路径还没有人问——登记在【后续扩展】。
 
 ## 为什么之前一直没写，以及为什么现在要写
 
@@ -23,7 +27,8 @@
 
 一次任务可能因为重投（`max_requeue_attempts`）或重试跑第二遍。
 这几张表都没有天然唯一键（`agent_task_step` 有 `(task_id, step_key)`，
-但那是"计划内唯一"），所以再写一遍会造出两批并存的行，
+`agent_plan_revision` 有 `(task_id, revision_no)`，但那两个都是
+"同一次执行内唯一"），所以再写一遍会造出两批并存的行，
 而**从数据上分不出哪批属于最后那次执行**。
 
 因此 `save` 先按 `task_id` 删掉上一批、再写这一批——
@@ -48,7 +53,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.evidence import Conflict, Evidence
-from app.domain.task import ReviewRecord, StepRecord, ToolCallRecord
+from app.domain.task import PlanRevisionRecord, ReviewRecord, StepRecord, ToolCallRecord
 from app.domain.trace import NodeTrace
 from app.infrastructure.db import session_scope
 from app.infrastructure.models.evidence import (
@@ -57,7 +62,7 @@ from app.infrastructure.models.evidence import (
     AgentReview,
     AgentTraceEvent,
 )
-from app.infrastructure.models.task import AgentTaskStep, AgentToolCall
+from app.infrastructure.models.task import AgentPlanRevision, AgentTaskStep, AgentToolCall
 from app.repositories._mapping import to_db_time
 
 
@@ -70,6 +75,7 @@ class AgentArtifactRepository:
         *,
         trace_id: str = "",
         steps: Sequence[StepRecord] = (),
+        revisions: Sequence[PlanRevisionRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
@@ -106,6 +112,7 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
         *,
         trace_id: str = "",
         steps: Sequence[StepRecord] = (),
+        revisions: Sequence[PlanRevisionRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
@@ -120,6 +127,8 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
             await _clear(session, task_id)
             if steps:
                 session.add_all([_step_row(task_id, item, now) for item in steps])
+            if revisions:
+                session.add_all([_plan_revision_row(task_id, item, now) for item in revisions])
             if tool_calls:
                 session.add_all([_tool_call_row(task_id, item, now) for item in tool_calls])
             if evidence:
@@ -177,6 +186,7 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
 
     def __init__(self) -> None:
         self.steps: dict[str, list[StepRecord]] = {}
+        self.revisions: dict[str, list[PlanRevisionRecord]] = {}
         self.tool_calls: dict[str, list[ToolCallRecord]] = {}
         self.evidence: dict[str, list[Evidence]] = {}
         self.conflicts: dict[str, list[Conflict]] = {}
@@ -189,6 +199,7 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
         *,
         trace_id: str = "",
         steps: Sequence[StepRecord] = (),
+        revisions: Sequence[PlanRevisionRecord] = (),
         tool_calls: Sequence[ToolCallRecord] = (),
         evidence: Sequence[Evidence] = (),
         conflicts: Sequence[Conflict] = (),
@@ -200,6 +211,7 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
             for index, item in enumerate(trace_events, start=1)
         ]
         self.steps[task_id] = list(steps)
+        self.revisions[task_id] = list(revisions)
         self.tool_calls[task_id] = list(tool_calls)
         self.evidence[task_id] = list(evidence)
         self.conflicts[task_id] = list(conflicts)
@@ -224,8 +236,17 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
 
 
 async def _clear(session: AsyncSession, task_id: str) -> None:
+    """**整体替换的前提**：不在这里清掉的表，重投之后会留下两批并存的行。
+
+    少一张表的症状是"越攒越多"，而且**没有任何地方会报错**——
+    复盘时看到的是两份互相矛盾的记录，分不出哪批属于最后一次执行。
+    所以这张清单必须与 `save` 写入的每一张表一一对应；
+    `InMemoryAgentArtifactRepository.save` 那份赋值同理（它天然覆盖，
+    但两个实现在"重投"这件事上必须给出同一个结论）。
+    """
     for model in (
         AgentTaskStep,
+        AgentPlanRevision,
         AgentToolCall,
         AgentEvidence,
         AgentConflict,
@@ -233,6 +254,21 @@ async def _clear(session: AsyncSession, task_id: str) -> None:
         AgentTraceEvent,
     ):
         await session.execute(delete(model).where(model.task_id == task_id))
+
+
+def _plan_revision_row(task_id: str, item: PlanRevisionRecord, now: datetime) -> AgentPlanRevision:
+    return AgentPlanRevision(
+        id=item.id,
+        task_id=task_id,
+        revision_no=item.revision_no,
+        trigger_type=item.trigger_type,
+        trigger_finding_id=item.trigger_finding_id,
+        added_step_ids_json=list(item.added_step_ids),
+        skipped_step_ids_json=list(item.skipped_step_ids),
+        reason=item.reason,
+        budget_snapshot_json=dict(item.budget_snapshot),
+        created_at=now,
+    )
 
 
 def _step_row(task_id: str, item: StepRecord, now: datetime) -> AgentTaskStep:

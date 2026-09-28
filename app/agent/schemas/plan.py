@@ -11,10 +11,14 @@
 **没有 planner**。于是「从意图到计划」这一步落在 `supervisor` 里，
 且是**确定性**的：`required_sources` 里有哪几路，就生成几个步骤。
 
-这不是省事——`planner` 在详设里的职责（把意图拆成有依赖的步骤）只有到了
-`plan_extend`（演进）才真正需要模型，而演进按冲刺方案是后置的。
-先做确定性的版本，`task_list` 的形状与依赖字段都留着，
-接模型规划时改的是**生成方式**，不是 State 形状。
+这不是省事——`planner` 在详设里的职责（把意图拆成有依赖的步骤）要先做
+确定性的版本（详设 8.5 也明写初始计划应当克制）：首轮没有数据，枚举必然是猜测。
+`task_list` 的形状与依赖字段都留着，接模型规划时改的是**生成方式**，不是 State 形状。
+
+**演进的模型那一半落在这里**：`plan_extend` 节点（`nodes/plan_extend.py`）在
+`retry_router` 送它过来时调模型出 `PlanExtension`，而 `reflect` 送它过来时
+用的是现成的 `proposed_steps`（确定性，不调模型）。两条路合进同一个
+`TaskStep` 列表与同一条 `PlanDelta` 记录。
 """
 
 from __future__ import annotations
@@ -127,6 +131,70 @@ class Finding(BaseModel):
     evidence_ids: tuple[str, ...] = ()
 
 
+class PlanDelta(BaseModel):
+    """一次计划演进的记录（详设 7.4 的 `PlanDelta`）。
+
+    它回答的是**「计划为什么变了」**：这一版加了哪几步、放弃了哪几步、
+    由哪个中间发现催生。`agent_plan_revision` 表就是它的落库形态，
+    而开发流程 7.5 的循环类评分要靠它区分"哪些步骤是下钻出来的"。
+
+    ## `id` 用 `"{task_id}:{revision_no}"`
+
+    详设 7.2 要求 `plan_deltas` 的去重键是 `(task_id, revision_no)`——
+    拼成一个字符串就能直接走 `state.merge_by_id`，不必为它再写一个 reducer。
+    用随机 id 的话同一版本会被记两次，而两次一致的记录看起来完全正常。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    revision_no: int
+    trigger: Literal["INITIAL", "EXTEND", "REPLAN"]
+    #: 催生这次演进的中间发现。**没有就留空，不编一个**——同
+    #: `rerank_score` 那条（"没算过就没有值"），一个指向不存在 finding 的 id
+    #: 会让"每个下钻步骤都能反查发现"这句话变成假的，而它看起来完全正常。
+    trigger_finding_id: str | None = None
+    added_step_ids: tuple[str, ...] = ()
+    skipped_step_ids: tuple[str, ...] = ()
+    reason: str
+
+
+class ProposedStep(BaseModel):
+    """`plan_extend` 里模型提出的**一步**（详设 8.5）。
+
+    **没有 `id`**：序号由代码分配（`state.next_step_id`）。
+    让模型挑 id 的症状是撞号——而撞号会让新步骤的结果覆盖旧步骤的
+    （`merge_step_results` 就是"新值覆盖"），**不报错**。
+
+    `tool` 取 `StepTool` 这个闭集而不是 `str`，理由与上面的 `Intent` 逐字相同：
+    写成 `str` 会让未知取值一路走到下游才炸。于是 6.6.3 的第 4 条校验
+    （"工具属于启用集合"）**在类型层面已经被满足**——同 Reviewer 那条
+    "SQL 是否通过安全校验"（校验器在更早处拦下，重复检查只会两处漂移）。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    objective: str = Field(min_length=1)
+    tool: StepTool
+
+
+class PlanExtension(BaseModel):
+    """`plan_extend` 走模型时的结构化输出（详设 8.5）。
+
+    `reason` 是**必填**的：它进 `PlanDelta.reason`，是"这一步为什么被加进来"
+    的唯一文字载体。少了它，演进历史就只剩一串 step_id。
+
+    **不带 `trigger_finding_id`**：模型不掌握 finding 的 id，让它写等于
+    请它编一个。触发源由节点从 State 里查（哪个步骤查空了 / 哪条发现
+    催生了这次下钻），同"id 由代码分配"。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    reason: str = Field(min_length=1)
+    steps: tuple[ProposedStep, ...] = ()
+
+
 class ProgressAssessment(BaseModel):
     """`reflect` 的进度判定（详设 7.1 的 `progress_assessment`）。
 
@@ -190,7 +258,10 @@ __all__ = [
     "Finding",
     "Intent",
     "IntentResult",
+    "PlanDelta",
+    "PlanExtension",
     "ProgressAssessment",
+    "ProposedStep",
     "StepResult",
     "StepStatus",
     "StepTool",
