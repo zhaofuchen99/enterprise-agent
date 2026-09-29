@@ -55,8 +55,11 @@ from app.infrastructure.redis import RedisKey, create_client
 from app.infrastructure.storage import build_object_storage
 from app.infrastructure.vector_store import build_vector_store
 from app.repositories import build_sql_repositories
+from app.repositories.message_repo import SqlMessageRepository
+from app.repositories.task_repo import SqlTaskRepository
 from app.repositories.user_repo import SqlUserRepository
 from app.repositories.vocab_repo import SqlVocabRepository
+from app.services.conversation_service import ConversationService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.task_runner import TaskBody, TaskRunner
 from app.tools.rag.tool import build_rag_retrieve_tool
@@ -143,6 +146,10 @@ def _build_runner(
         redis=redis,
         artifacts=repos.artifacts,
         body=body,
+        # 助手答复的落点（FR-CHAT-003 的输入侧）。**与 API 侧同一份装配**：
+        # 用户消息由 API 进程写、助手消息由 Worker 写，两处不同源的话，
+        # 「有问没答」与「有答没问」会各出现在一半的会话里。
+        conversations=ConversationService(repos.messages),
     )
 
 
@@ -199,7 +206,13 @@ async def _build_task_graph(
         rag_tool=rag_tool,
         gateway=gateway,
     )
-    return graph, build_task_body(graph, SqlUserRepository(sessions))
+    return graph, build_task_body(
+        graph,
+        SqlUserRepository(sessions),
+        messages=SqlMessageRepository(sessions),
+        tasks=SqlTaskRepository(sessions),
+        settings=settings,
+    )
 
 
 async def on_startup(ctx: dict[str, Any]) -> None:

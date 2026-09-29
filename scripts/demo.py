@@ -40,7 +40,16 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.agent_harness import DEMO_USERNAME, amounts, ask, evaluate, login
+from scripts.agent_harness import (
+    DEMO_USERNAME,
+    amounts,
+    ask,
+    ask_turns,
+    case_turns,
+    evaluate,
+    login,
+    run_case,
+)
 
 DEMO_PATH = Path("configs/demo_questions.yaml")
 
@@ -83,9 +92,29 @@ def _ask(base: str, token: str, question: str) -> int:
     所以调试**评测集**时用 `make eval-agent-ask`——它打的是同一份事实的
     超集，并且用的是同一份解析。
     """
-    detail = ask(base, token, question)
+    # `|` 分隔 = 多轮追问（同一个会话）。**探针要能跑多轮**，否则
+    # "先跑一遍再固化"这条纪律在多轮用例上会退化成"先猜一遍"——
+    # 而多轮恰好是最不能猜的那一类（第二个问题缺了上文本来就不成立）。
+    questions = [item.strip() for item in question.split("|") if item.strip()]
+    details = (
+        [ask(base, token, questions[0])]
+        if len(questions) == 1
+        else ask_turns(base, token, questions)
+    )
+    for index, (item, detail) in enumerate(zip(questions, details, strict=True), start=1):
+        if len(questions) > 1:
+            print(f"\n── 第 {index} 轮：{item}")
+        _print_facts(detail)
+    return 0 if all(item["status"] == "SUCCEEDED" for item in details) else 1
+
+
+def _print_facts(detail: dict[str, Any]) -> None:
     steps = [step for step in detail.get("steps") or [] if step.get("status") != "PENDING"]
     print(f"任务 {detail['status']}｜id {detail.get('task_id')}")
+    # **代词解析的事实打在最前面**：多轮用例固化时第一个要抄的就是它
+    # （`resolved_question` 与 `resolved_entities`），而它们埋在任务详情深处。
+    print(f"resolved_question：{detail.get('resolved_question')!r}")
+    print(f"resolved_entities：{detail.get('resolved_entities')}")
     print(f"走了：{sorted({step['tool'] for step in steps})}")
     print(f"refused：{detail.get('refused')}｜冲突 {len(detail.get('conflicts') or [])} 条")
     print("限制与未覆盖：")
@@ -98,7 +127,6 @@ def _ask(base: str, token: str, question: str) -> int:
         print(f"  - {value}")
     print("─" * 78)
     print(detail.get("final_answer_md") or "")
-    return 0 if detail["status"] == "SUCCEEDED" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,18 +158,22 @@ def main(argv: list[str] | None = None) -> int:
 
     outcomes: list[Outcome] = []
     for case in cases:
-        print(f"\n{'=' * 78}\n▶ {case['id']}：{case['question']}")
+        # 多轮用例（`turns:`）展开成逐轮的子用例，**共用同一个会话**。
+        # 单轮用例走同一条路（`case_turns` 返回长度为 1 的列表），
+        # 于是"怎么跑"只有一份实现，两处各写一遍必然漂移。
+        turns = case_turns(case)
+        print(f"\n{'=' * 78}\n▶ {case['id']}：{turns[0]['question']}")
         try:
             # **每条用例可以指定账号**（默认 admin）。权限相关的行为只有换一个
             # 受限账号才演示得出来——"同一个问题，两个账号看到的限制不同"
             # 本身就是一句话能讲清、且别处看不到的东西。
             token = login(args.base, case.get("account") or DEMO_USERNAME)
-            detail = ask(args.base, token, case["question"])
+            details = run_case(args.base, token, case)
         except (httpx.HTTPError, TimeoutError) as exc:
             outcomes.append(
                 Outcome(
                     case["id"],
-                    case["question"],
+                    str(turns[0]["question"]),
                     "ERROR",
                     case.get("stability", "stable"),
                     (),
@@ -155,26 +187,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ✗ {exc}")
             continue
 
-        verdict = evaluate(case, detail)
-        outcome = Outcome(
-            case_id=case["id"],
-            question=case["question"],
-            status=str(detail.get("status")),
-            stability=case.get("stability", "stable"),
-            sources=tuple(
-                step["tool"] for step in (detail.get("steps") or []) if step["status"] != "PENDING"
-            ),
-            answer=detail.get("final_answer_md") or "",
-            conflicts=tuple(detail.get("conflicts") or []),
-            review=detail.get("review"),
-            ok=verdict.ok,
-            note=verdict.note,
-        )
-        outcomes.append(outcome)
-        mark = "✓" if outcome.ok else ("○" if outcome.stability != "stable" else "✗")
-        print(f"  {mark} {verdict.note}")
-        print(f"  证明：{case.get('proves', '')}")
-        _print_answer(outcome)
+        for index, (turn, detail) in enumerate(zip(turns, details, strict=True), start=1):
+            if index > 1:
+                # 每一轮单独起一段：多轮用例的看点是"同一句话，第二轮问得比
+                # 第一轮少，答案却仍然对"——不分开就看不出来是两轮。
+                print(f"\n  ── 第 {index} 轮：{turn['question']}")
+            verdict = evaluate(turn, detail)
+            outcome = Outcome(
+                case_id=case["id"] if len(turns) == 1 else f"{case['id']}#{index}",
+                question=str(turn["question"]),
+                status=str(detail.get("status")),
+                stability=case.get("stability", "stable"),
+                sources=tuple(
+                    step["tool"]
+                    for step in (detail.get("steps") or [])
+                    if step["status"] != "PENDING"
+                ),
+                answer=detail.get("final_answer_md") or "",
+                conflicts=tuple(detail.get("conflicts") or []),
+                review=detail.get("review"),
+                ok=verdict.ok,
+                note=verdict.note,
+            )
+            outcomes.append(outcome)
+            mark = "✓" if outcome.ok else ("○" if outcome.stability != "stable" else "✗")
+            print(f"  {mark} {verdict.note}")
+            print(f"  证明：{case.get('proves', '')}")
+            _print_answer(outcome)
 
     return _summary(outcomes)
 

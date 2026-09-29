@@ -118,7 +118,12 @@
     <textarea id="question" placeholder="用中文问一个业务问题，例如：2025年Q3华东地区的净销售额是多少？"></textarea>
     <div class="row" style="margin-top:8px">
       <button id="askBtn">提问并订阅</button>
+      <!-- 多轮追问（FR-CHAT-003）：**默认续用同一个会话**，
+           所以连着问「那 Q2 呢」能继承上一轮的指标与区域。
+           这也是服务端的默认行为——不传 conversation_id 才会新建一个。 -->
+      <button id="newChatBtn" title="清空会话，下一条提问另起一个">＋ 新会话</button>
       <span class="muted" id="taskLine"></span>
+      <span class="muted" id="conversationLine"></span>
     </div>
     <div class="chips" id="chips"></div>
     <h2 style="margin-top:16px">执行时间线（SSE 实时）</h2>
@@ -153,7 +158,9 @@ const DEMO_QUESTIONS = [
 ];
 
 const $ = (id) => document.getElementById(id);
-const state = { accessToken: "", taskId: "", source: null, startedAt: 0 };
+// `conversationId` 让连续提问落在**同一个会话**里（多轮追问的前提）。
+// 它由服务端在第一轮返回，之后原样带回；「＋ 新会话」把它清空。
+const state = { accessToken: "", taskId: "", conversationId: "", source: null, startedAt: 0 };
 
 // ---------------------------------------------------------------- 登录
 async function login() {
@@ -201,9 +208,15 @@ async function ask() {
 
   try {
     await ensureToken();
-    const created = await api("POST", "/api/agent/chat", { message: question });
+    const body = { message: question };
+    // 有会话就续用——「那 Q2 呢」要能继承上一轮的指标与区域，
+    // 靠的就是这一个字段（见 `ConversationContext`）。
+    if (state.conversationId) body.conversation_id = state.conversationId;
+    const created = await api("POST", "/api/agent/chat", body);
     state.taskId = created.data.task_id;
+    state.conversationId = created.data.conversation_id;
     $("taskLine").textContent = `任务 ${state.taskId}`;
+    $("conversationLine").textContent = `会话 ${state.conversationId}`;
     const token = await api("POST", `/api/agent/tasks/${state.taskId}/stream-token`, null);
     subscribe(token.data.stream_url);
   } catch (err) {
@@ -384,6 +397,12 @@ function inline(text) {
 // ---------------------------------------------------------------- 装配
 $("loginBtn").onclick = () => login().catch((err) => alert(err.message));
 $("askBtn").onclick = ask;
+// 清空会话 = 下一次提问另起一个（对照用：同一个问题在"有上文"与"没上文"
+// 下会走不同的路，这正是多轮追问值得演示的地方）
+$("newChatBtn").onclick = () => {
+  state.conversationId = "";
+  $("conversationLine").textContent = "（下一条提问将新建会话）";
+};
 $("question").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") ask();
 });

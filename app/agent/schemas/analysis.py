@@ -15,7 +15,19 @@ from pydantic import BaseModel, ConfigDict, Field
 #: 结论的性质（13.5）。**它约束措辞的确定性程度**：
 #: FACT 必须有直接证据；INFERENCE 至少两项相互支持的证据或一条明确的计算链；
 #: HYPOTHESIS 必须用不确定性语言并说明验证方法。
-ClaimKind = Literal["FACT", "INFERENCE", "HYPOTHESIS"]
+#:
+#: **`ABSENCE` 是本实现新增的第 4 个取值**（13.5 原文只有前三个，需回写）。
+#: 它描述的是**关于证据本身**的一句话（「现有证据里没有任何 2026 年 3 月的
+#: 数据」），而不是关于业务的事实。
+#:
+#: 为什么必须给它一个位置：这类话**按构造就不可能引用证据**——"没有证据"
+#: 恰好是由"引不出证据"证明的。而 14.1 第 3 条要求每条 claim 都有
+#: `evidence_ids`，于是它会被判成 `CLAIM_WITHOUT_EVIDENCE`（BLOCKING），
+#: 一条**行为完全正确**的拒答因此被拦下。实测踩到（2026-09-28）。
+#:
+#: 与 `HYPOTHESIS` 的区别：后者是"我猜的"，前者是"这里面没有"。
+#: 两者都不该按"缺少引用"判，但**理由不同**，所以是两个取值而不是一个。
+ClaimKind = Literal["FACT", "INFERENCE", "HYPOTHESIS", "ABSENCE"]
 
 
 class SupportedClaim(BaseModel):

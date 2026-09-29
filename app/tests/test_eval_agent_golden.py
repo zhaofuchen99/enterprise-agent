@@ -17,10 +17,24 @@ import pytest
 
 from scripts.eval_agent import CATEGORIES, GOLDEN_PATH, load_cases
 
-#: 冲刺方案 §6 定的口径：`Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5`，
-#: 加上 2026-09-28 补的 `任务循环 5`。
+#: 每一类的条数。**2026-09-28 从"每类 5 条"改成这张表**。
+#:
+#: 原因是 `任务循环` 按详设 22.10.5（"至少 15 条"）补齐了——它是**唯一**
+#: 一类条数不同的，而原来那条 `总数 = 类数 × 5` 的断言在它补到 15 之后
+#: 就成了一个说不上话的恒等式。
+#:
 #: 写死在测试里而不是从 YAML 数出来——**从被测对象推期望值等于没测**。
-_EXPECTED_PER_CATEGORY = 5
+#: 分布也要能被断言：总数对了而分布错了（比如 12+5+2+1）某一类的通过率
+#: 就没有意义了。
+_EXPECTED_COUNTS: dict[str, int] = {
+    "tool_selection": 5,
+    "conflict": 5,
+    "reviewer": 5,
+    "clarification": 5,
+    # 详设 22.10.5 明写"循环类问题至少 15 条"。**其余十类不跟着涨**
+    # （冲刺方案 §6 定的是每类 5 条），所以这里是一张表而不是一个数字。
+    "loop": 15,
+}
 
 #: 一条用例至少要有一个 `expect_*` 键，否则它跑完不判任何东西、
 #: 恒报通过。这不是理论风险：写清单时漏掉一行 `expect_sources`
@@ -33,12 +47,12 @@ def _cases() -> list[dict[str, Any]]:
 
 
 def test_the_set_has_the_planned_number_of_cases() -> None:
-    """总量：五类各 5 条 = 25 条。
+    """总量 = 各类条数之和（四类各 5 + 循环 15 = 35）。
 
     数字要能被断言，不能只看总数——总数对了而分布错了（比如 12+5+2+1），
     某一类的通过率就没有意义了。
     """
-    assert len(_cases()) == len(CATEGORIES) * _EXPECTED_PER_CATEGORY
+    assert len(_cases()) == sum(_EXPECTED_COUNTS.values())
 
 
 def test_every_category_has_the_planned_number_of_cases() -> None:
@@ -46,7 +60,7 @@ def test_every_category_has_the_planned_number_of_cases() -> None:
     for case in _cases():
         counts[str(case["category"])] += 1
 
-    assert counts == dict.fromkeys(CATEGORIES, _EXPECTED_PER_CATEGORY)
+    assert counts == _EXPECTED_COUNTS
 
 
 def test_every_case_asserts_something() -> None:

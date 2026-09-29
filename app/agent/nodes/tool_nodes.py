@@ -34,7 +34,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from app.agent.schemas.plan import Finding, IntentResult, StepResult, StepStatus, TaskStep
-from app.agent.state import AgentState, pending_steps
+from app.agent.state import AgentState, current_question, pending_steps
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
 from app.core.ids import IdPrefix, new_id
@@ -254,7 +254,7 @@ def build_sql_node(settings: Settings, tool: Any) -> Callable[[AgentState], Any]
         from app.tools.sql.schemas import SqlQueryArgs
 
         args = SqlQueryArgs(
-            question=state.get("user_query") or "",
+            question=current_question(state),
             objective=step.objective,
         )
         result = await tool.execute(args, _context(state, step))
@@ -273,7 +273,7 @@ def build_rag_node(settings: Settings, tool: Any) -> Callable[[AgentState], Any]
         from app.tools.rag.schemas import RagQueryArgs
 
         args = RagQueryArgs(
-            question=state.get("user_query") or "",
+            question=current_question(state),
             objective=step.objective,
             # **生效时点取问题所问区间的起点**：问「2025 Q3」时
             # v2.0（2025-07-01 生效）才是当时有效的那一版。

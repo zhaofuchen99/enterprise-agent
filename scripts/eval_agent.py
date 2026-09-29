@@ -93,8 +93,10 @@ from scripts.agent_harness import (
     Verdict,
     amounts,
     ask,
+    case_turns,
     evaluate,
     login,
+    run_case,
 )
 
 #: 评测集路径。与 `eval_sql_golden.yaml` / `eval_rag_golden.yaml` 同属配置类文件。
@@ -378,7 +380,11 @@ def main(argv: list[str] | None = None) -> int:
     for case in cases:
         try:
             token = login(args.base, case.get("account") or DEMO_USERNAME)
-            detail = ask(args.base, token, case["question"])
+            # **逐轮跑、逐轮判**（多轮用例共用同一个会话，见 `run_case`）。
+            # 一个 `CaseOutcome` 只装一轮：多轮用例的每一轮各是一条可判定的
+            # 行为，合成一条会丢掉"是哪一轮不成立"——而那正是排查的入口。
+            turns = case_turns(case)
+            details = run_case(args.base, token, case)
         except (httpx.HTTPError, TimeoutError) as exc:
             # 连不上或超时**不是这条用例的结论**，但也不能静默跳过——
             # 跳过的话"跑不动"会以"没这一类用例"的面目出现在报告里。
@@ -396,25 +402,28 @@ def main(argv: list[str] | None = None) -> int:
             print(render(outcomes[-1]), flush=True)
             continue
 
-        outcome = CaseOutcome(
-            case=case,
-            verdict=evaluate(case, detail),
-            status=str(detail.get("status")),
-            sources=tuple(
-                step["tool"] for step in (detail.get("steps") or []) if step["status"] != "PENDING"
-            ),
-            refused=detail.get("refused"),
-            conflicts=tuple(detail.get("conflicts") or []),
-            review=detail.get("review"),
-            plan_revision=int(detail.get("plan_revision") or 0),
-            extended=tuple(
-                step["tool"]
-                for step in (detail.get("steps") or [])
-                if step.get("origin") == "EXTENDED"
-            ),
-        )
-        outcomes.append(outcome)
-        print(render(outcome), flush=True)
+        for turn, detail in zip(turns, details, strict=True):
+            outcome = CaseOutcome(
+                case=turn,
+                verdict=evaluate(turn, detail),
+                status=str(detail.get("status")),
+                sources=tuple(
+                    step["tool"]
+                    for step in (detail.get("steps") or [])
+                    if step["status"] != "PENDING"
+                ),
+                refused=detail.get("refused"),
+                conflicts=tuple(detail.get("conflicts") or []),
+                review=detail.get("review"),
+                plan_revision=int(detail.get("plan_revision") or 0),
+                extended=tuple(
+                    step["tool"]
+                    for step in (detail.get("steps") or [])
+                    if step.get("origin") == "EXTENDED"
+                ),
+            )
+            outcomes.append(outcome)
+            print(render(outcome), flush=True)
 
     passed, total, summary = _summary(outcomes)
     print(summary, flush=True)

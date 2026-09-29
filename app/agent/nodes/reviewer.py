@@ -58,7 +58,7 @@ from app.agent.prompts.review import REVIEW_PROMPT
 from app.agent.schemas.analysis import AnalysisResult
 from app.agent.schemas.plan import StepStatus
 from app.agent.schemas.review import ModelReview, RetryTarget, ReviewIssue, ReviewResult
-from app.agent.state import AgentState, unconsulted_source
+from app.agent.state import AgentState, current_question, unconsulted_source
 from app.core.errors import AgentError
 from app.domain.evidence import ConflictSeverity
 from app.infrastructure.model_gateway import ModelGateway
@@ -150,7 +150,7 @@ async def _model_review(
         result = await gateway.invoke_structured(
             REVIEW_PROMPT,
             ModelReview,
-            question=state.get("user_query") or "",
+            question=current_question(state),
             answer=_render_answer(analysis),
             evidence=_render_evidence(state),
         )
@@ -367,7 +367,7 @@ def _check_claims_have_evidence(analysis: AnalysisResult) -> list[ReviewIssue]:
     **`FACT` 尤其**：13.5 明写「FACT 必须由直接证据支持」——
     一条标成 FACT 却没有引用的结论，读者会当成事实。
     `INFERENCE` 也要求引用（至少两项相互支持的证据），
-    只有 `HYPOTHESIS` 允许没有引用（它本来就是"证据不足时的推测"）。
+    **`HYPOTHESIS` 与 `ABSENCE` 允许没有引用**——但理由不同（见下）。
     """
     issues: list[ReviewIssue] = []
     for index, claim in enumerate(analysis.claims, start=1):
@@ -386,6 +386,21 @@ def _check_claims_have_evidence(analysis: AnalysisResult) -> list[ReviewIssue]:
                     claim_id=str(index),
                 )
             )
+            continue
+        if claim.kind == "ABSENCE" and analysis.refused:
+            # **关于证据本身的话**（「现有证据里没有 2026 年 3 月的数据」）：
+            # 它**按构造就不可能引用证据**——"没有证据"正是由"引不出证据"
+            # 证明的。按缺引用判它会拦下一条**行为完全正确**的拒答
+            # （2026-09-28 实测，`agent-clarify-04`：系统按验收③补了 RAG、
+            # 如实说了没有那个时间点，而审查给了 FAIL）。
+            # 与 `HYPOTHESIS` 走同一个位置，但**理由不同**：那个是"我猜的"，
+            # 这个是"这里面没有"（同约定 44 的类推）。
+            #
+            # ⚠️ **两个条件缺一不可**：只认 `ABSENCE` 的话，一句编造的
+            # 业务结论只要被标成 ABSENCE 就能绕开这条一票否决。
+            # 要求 `refused` 同时为真，是把豁免挂在**答案自己做出的、
+            # 用户可见的承诺**上（拒答会渲染进答案、进 payload、进演示判据）——
+            # 想绕开它就得先承认"我没回答那个问题"。
             continue
         issues.append(
             ReviewIssue(
@@ -503,9 +518,17 @@ def _coverage(state: AgentState) -> int:
     return int(done / len(required) * 100)
 
 
+#: 不要求引用的 kind。**分母里有它们就等于把"引用覆盖率"变成一个恒低的数**：
+#: `HYPOTHESIS` 本来就允许没有引用（13.5），`ABSENCE` 更是**按构造引不出**
+#: （见 `_check_claims_have_evidence` 的说明）。这一份与那里的豁免是同一件事的
+#: 两半——只改一处的话，一条正确的拒答要么被判 BLOCKING、要么覆盖率掉到 50 分以下，
+#: 两种症状都指向"这条答案有问题"，而它其实是完全正确的。
+_UNCITED_KINDS: frozenset[str] = frozenset({"HYPOTHESIS", "ABSENCE"})
+
+
 def _evidence_ratio(analysis: AnalysisResult) -> int:
-    """有引用的结论占比。**HYPOTHESIS 不计入分母**——它本来就不要求引用。"""
-    checkable = [claim for claim in analysis.claims if claim.kind != "HYPOTHESIS"]
+    """有引用的结论占比。**`HYPOTHESIS` / `ABSENCE` 不计入分母**。"""
+    checkable = [claim for claim in analysis.claims if claim.kind not in _UNCITED_KINDS]
     if not checkable:
         return 100
     cited = sum(1 for claim in checkable if claim.evidence_ids)

@@ -210,6 +210,15 @@ class TaskDetailData(BaseModel):
     #: 这几个词"，而模型换个说法就漏判（实测四次错一次）——那种不稳定性
     #: 在演示与面试现场是最贵的。拒绝理由的定义见 `AnalysisResult.refused`。
     refused: bool | None = None
+    #: 本轮**代词解析后的问题**（FR-CHAT-003）。`None` = 本轮问题本来就自足。
+    #:
+    #: **它必须被暴露出来**，否则"多轮追问生效了没有"这件事在接口上无从断言：
+    #: 只看末轮的答案数字证明不了记忆——同一个数在"没有记忆"时也可能出现
+    #: （用户问「那 Q2 呢」，系统当成新问题、答了全公司 Q2，数字照样是数字）。
+    resolved_question: str | None = None
+    #: 本轮解析出的口径（指标 / 区域 / 期间 …）。演示与评测按它断言
+    #: 「上一轮是华东、这一轮还是华东、只是期间换了」。
+    resolved_entities: dict[str, str] = Field(default_factory=dict)
 
     @classmethod
     def from_domain(cls, task: Task) -> Self:
@@ -227,6 +236,8 @@ class TaskDetailData(BaseModel):
             review=payload.get("review"),
             limitations=list(payload.get("limitations") or []),
             refused=payload.get("refused"),
+            resolved_question=payload.get("resolved_question"),
+            resolved_entities=dict(payload.get("resolved_entities") or {}),
             task_id=task.id,
             parent_task_id=task.parent_task_id,
             conversation_id=task.conversation_id,

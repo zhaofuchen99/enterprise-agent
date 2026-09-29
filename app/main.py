@@ -31,6 +31,7 @@ from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
 from app.repositories import Repositories, build_sql_repositories
 from app.services.auth_service import AuthService
+from app.services.conversation_service import ConversationService
 from app.services.event_bus import RedisStreamEventBus
 from app.services.rate_limit import RedisFixedWindowLimiter
 from app.services.stream_token import StreamTokenService
@@ -116,6 +117,7 @@ def wire_dependencies(
         # 会诱使 `_persist_artifacts` 长出"仓储不存在就跳过"的分支，
         # 而那条分支在 Worker 里永远为假——测试不出来的死代码。
         artifacts=artifacts,
+        conversations=ConversationService(repos.messages),
     )
 
     app.state.repositories = repos
@@ -134,7 +136,13 @@ def wire_dependencies(
     app.state.rate_limiter = RedisFixedWindowLimiter(redis=redis, settings=settings)
     app.state.auth_service = AuthService(repos.users, settings)
     app.state.task_service = TaskService(
-        tasks=repos.tasks, conversations=repos.conversations, settings=settings, runner=runner
+        tasks=repos.tasks,
+        conversations=repos.conversations,
+        settings=settings,
+        runner=runner,
+        # 用户消息在这里写（FR-CHAT-001 的「保存用户消息」），助手消息由
+        # Worker 侧写。**两处都从同一份 `repos.messages` 装配**。
+        conversation_service=ConversationService(repos.messages),
     )
 
 

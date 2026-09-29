@@ -43,6 +43,7 @@ from app.infrastructure.queue import JobQueue
 from app.infrastructure.redis import RedisKey, register_scripts
 from app.repositories.agent_repo import AgentArtifactRepository
 from app.repositories.task_repo import TaskPatch, TaskRepository
+from app.services.conversation_service import ConversationService
 from app.services.event_bus import EventBus, TaskEventType
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class TaskRunner:
         redis: aioredis.Redis,
         artifacts: AgentArtifactRepository,
         body: TaskBody | None = None,
+        conversations: ConversationService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tasks = tasks
@@ -106,6 +108,12 @@ class TaskRunner:
         self._artifacts = artifacts
         #: 任务体。**缺省是空实现**，Phase 5 之前的所有用例因此继续成立
         self._body = body
+        #: 会话消息的写入方（FR-CHAT-003 多轮上下文的输入）。
+        #: 与 `artifacts` 不同，这里**可以有默认值**：消息不是执行产出的一部分，
+        #: 缺了它任务照样跑完、答案照样对——只有"下一轮记不住上一轮"，
+        #: 而那正是 `memory.record_failed` 那条日志要抓的东西。
+        #: 写成必填的话，Phase 5 之前那些只验执行链路的用例都要跟着改。
+        self._conversations = conversations
         self._scripts = register_scripts(redis)
         self._tuning = settings.redis_tuning
         self._worker_tuning = settings.worker
@@ -365,6 +373,11 @@ class TaskRunner:
             expected=TaskStatus.RUNNING,
         )
         if updated is not None:
+            if self._conversations is not None:
+                # **落库成功之后**才写消息：`_transition` 返回 None 表示这次
+                # CAS 没抢到（任务已被回收成别的状态），那一刻写进去的消息
+                # 会挂在一条不属于本次执行的任务上。
+                await self._conversations.record_assistant_message(updated, outcome)
             await self._emit_final(
                 updated,
                 TaskEventType.TASK_COMPLETED,

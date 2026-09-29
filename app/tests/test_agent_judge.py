@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from scripts.agent_harness import amounts, evaluate, missing_amounts
+from scripts.agent_harness import amounts, case_turns, evaluate, missing_amounts
 
 
 def _detail(
@@ -30,6 +30,7 @@ def _detail(
     status: str = "SUCCEEDED",
     review: dict[str, Any] | None = None,
     progress_decision: str | None = None,
+    resolved_entities: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -40,6 +41,7 @@ def _detail(
         "steps": [{"tool": tool, "status": "SUCCEEDED"} for tool in tools],
         "review": review,
         "progress_decision": progress_decision,
+        "resolved_entities": resolved_entities if resolved_entities is not None else {},
     }
 
 
@@ -363,3 +365,71 @@ def test_expected_review_reason_code_is_checked() -> None:
     verdict = evaluate(case, _detail(review={"status": "PASS", "reason_code": "NO_ANALYSIS"}))
     assert not verdict.ok
     assert "审查归因不符" in verdict.note
+
+
+# ------------------------------------------------------- 多轮上下文（FR-CHAT-003）
+def test_case_turns_expands_and_merges() -> None:
+    """多轮用例展开成**结构相同的子用例**。
+
+    展开而不是另立一套多轮判据，是为了让 `evaluate` 原样复用——
+    多一份判据就多一处会与演示各说各话的地方（约定 87）。
+    """
+    case = {
+        "id": "demo-x",
+        "stability": "model-dependent",
+        "turns": [
+            {"question": "第一问"},
+            {"question": "那Q2呢", "expect_resolved_contain": {"period": "2025-Q2"}},
+        ],
+    }
+
+    turns = case_turns(case)
+
+    assert [turn["question"] for turn in turns] == ["第一问", "那Q2呢"]
+    # 顶层字段被带下去（否则每轮都要重抄一遍 stability / proves）
+    assert all(turn["stability"] == "model-dependent" for turn in turns)
+    # `turns` 本身不再出现——留着会让展开变成递归
+    assert all("turns" not in turn for turn in turns)
+
+
+def test_case_turns_of_a_single_turn_case_is_itself() -> None:
+    case = {"id": "demo-y", "question": "普通问题"}
+    assert case_turns(case) == [case]
+
+
+def test_the_resolved_entities_must_match() -> None:
+    """`expect_resolved_contain` 逐键比对。
+
+    **这条断言必须真的会红**：多轮追问最典型的失败样式是
+    "代词没被解析、于是判成缺前提去澄清"，而那时用例如果只钉工具选择，
+    报告会显示"进入澄清 ✓"——一个看起来通过了的失败。
+    """
+    case = {"id": "x", "expect_resolved_contain": {"region": "华东", "period": "2025-Q2"}}
+    good = _detail(resolved_entities={"region": "华东", "period": "2025-Q2", "metric": "净销售额"})
+
+    assert evaluate(case, good).ok
+
+    # 期间没换过来（上一轮是 Q3）——这正是"继承错了"的样子
+    stale = _detail(resolved_entities={"region": "华东", "period": "2025-Q3"})
+    verdict = evaluate(case, stale)
+    assert not verdict.ok
+    assert "上一轮口径没有被继承" in verdict.note
+
+
+def test_the_resolved_check_runs_even_when_the_case_clarifies() -> None:
+    """**它排在模式分支之前**，所以澄清 / 拒答的轮次照样被检查。
+
+    写在后面的话，这条断言只在"没拒答也没澄清"时生效——而代词没解析出来
+    最典型的结果**恰恰是去澄清**。那时用例会报"进入澄清 ✓"，
+    而真正的缺陷（记忆没生效）一声不响。
+    """
+    case = {
+        "id": "x",
+        "expect_clarification": True,
+        "expect_resolved_contain": {"period": "2025-Q2"},
+    }
+
+    verdict = evaluate(case, _detail(tools=(), resolved_entities={}))
+
+    assert not verdict.ok
+    assert "上一轮口径没有被继承" in verdict.note

@@ -117,6 +117,55 @@ def ask(base: str, token: str, question: str) -> dict[str, Any]:
     return wait_for_task(token, created["task_id"], base=base)
 
 
+def ask_turns(base: str, token: str, questions: list[str]) -> list[dict[str, Any]]:
+    """按顺序问一串问题，**共用同一个会话**，返回每轮的任务详情。
+
+    `conversation_id` 从**第一轮的响应**里取（由服务端生成），之后逐轮带上——
+    这正是浏览器/前端要做的事，脚本里不自己造一个 ID：造 ID 就绕开了
+    "服务端会不会返回它、下一轮认不认它"这两件事，而它们才是这条链路。
+
+    ⚠️ **一轮失败不中断**：第二轮的失败往往正是"记忆没生效"的第一个症状
+    （代词没被解析 → 缺前提 → 任务失败），把它掐掉会让演示只留下一句
+    "连不上"之类的假象。每轮都等到终态，判据逐轮跑。
+    """
+    details: list[dict[str, Any]] = []
+    conversation_id: str | None = None
+    for question in questions:
+        payload: dict[str, Any] = {"message": question}
+        if conversation_id is not None:
+            payload["conversation_id"] = conversation_id
+        created = post(f"{base}/api/agent/chat", payload, token=token)["data"]
+        conversation_id = str(created["conversation_id"])
+        details.append(wait_for_task(token, created["task_id"], base=base))
+    return details
+
+
+# ------------------------------------------------------- 多轮用例的展开与执行
+def case_turns(case: dict[str, Any]) -> list[dict[str, Any]]:
+    """把一条用例展开成**逐轮的子用例**。
+
+    单轮用例（绝大多数）只写 `question`；多轮用例写 `turns: [...]`，
+    每一项可以覆写任意 `expect_*`——这是必须的，因为**该断言什么逐轮不同**：
+    首轮没有上文可继承，中间轮要钉"口径继承对了"，末轮才钉答案里的数。
+
+    展开成一串**结构相同的子用例**而不是另立一套多轮判据，是为了让
+    `evaluate` 原样复用：多一份判据就多一处会与演示各说各话的地方（约定 87）。
+    """
+    turns = case.get("turns")
+    if not turns:
+        return [case]
+    shared = {key: value for key, value in case.items() if key != "turns"}
+    return [{**shared, **turn} for turn in turns]
+
+
+def run_case(base: str, token: str, case: dict[str, Any]) -> list[dict[str, Any]]:
+    """跑一条用例，返回**逐轮**的任务详情（单轮用例就是长度为 1 的列表）。"""
+    turns = case_turns(case)
+    if len(turns) == 1:
+        return [ask(base, token, str(turns[0]["question"]))]
+    return ask_turns(base, token, [str(turn["question"]) for turn in turns])
+
+
 # ------------------------------------------------------------------ 读答案里的数
 #: 数值断言里的数字。**带单位**——语料与答案里「万元」「亿元」是常态，
 #: 不认单位会让一条正确的「11,196.70 万元」判成错的。
@@ -219,6 +268,7 @@ def evaluate(case: dict[str, Any], detail: dict[str, Any]) -> Verdict:
     | `expect_review_*` | `review`（`ReviewResult`，两阶段审查的结论） |
     | `expect_plan_*` | `plan_revision` / `plan_deltas` / `steps[].origin` |
     | `expect_progress_decision` | `progress_decision`（`reflect` 的最终判定） |
+    | `expect_resolved_contain` | `resolved_entities`（FR-CHAT-003 的代词解析结果） |
     """
     if detail.get("status") != "SUCCEEDED":
         code = detail.get("error_code")
@@ -229,6 +279,22 @@ def evaluate(case: dict[str, Any], detail: dict[str, Any]) -> Verdict:
     sources = {step["tool"] for step in steps if step["status"] != "PENDING"}
     conflicts = detail.get("conflicts") or []
     answer = detail.get("final_answer_md") or ""
+
+    # **代词解析的断言排在最前面**，在任何提前 `return` 之前。
+    #
+    # 它验的是「上一轮的口径有没有被继承」，与这一轮走了哪几路、有没有拒答
+    # **完全正交**。写在下面那些模式分支之后的话，它只在"没拒答也没澄清"
+    # 的用例上生效——而"多轮没生效"最典型的表现恰恰是**判成缺前提去澄清**。
+    # 那时这条断言永远不会被检查，用例却报"进入澄清 ✓"。
+    if expected_entities := case.get("expect_resolved_contain"):
+        actual = detail.get("resolved_entities") or {}
+        wrong = {key: want for key, want in expected_entities.items() if actual.get(key) != want}
+        if wrong:
+            return Verdict(
+                False,
+                f"**上一轮口径没有被继承**：期望 {wrong}，实际解析出 {actual}"
+                f"（resolved_question={detail.get('resolved_question')!r}）",
+            )
 
     # 「模式」类断言：拒答与澄清是两条**互斥**的路径，走了它们就不再判
     # 工具选择 / 数值 / 冲突——那些字段在那条路径上没有意义（澄清一步都
@@ -366,6 +432,7 @@ def _check_plan(case: dict[str, Any], detail: dict[str, Any]) -> Verdict | None:
         "expect_extended_tools_contain",
         "expect_max_steps",
         "expect_trigger_finding_linked",
+        "expect_plan_records_consistent",
     )
     if all(case.get(key) is None for key in keys):
         return None
@@ -404,6 +471,29 @@ def _check_plan(case: dict[str, Any], detail: dict[str, Any]) -> Verdict | None:
 
     if (limit := case.get("expect_max_steps")) is not None and len(steps) > limit:
         return Verdict(False, f"**总步数越界**：{len(steps)} > {limit}")
+
+    if case.get("expect_plan_records_consistent"):
+        # 22.10.3 的另外两条：「`plan_deltas` 与实际演进次数一致」与
+        # 「`revision_no` 连续无跳号」。
+        #
+        # **它们是"计划变了"与"变了留没留记录"之间的那道校验**：两者不一致时，
+        # 复盘看到的是一份**缺了一版的计划变更史**，而答案与步骤都正常——
+        # 只有把 revision 与 delta 摆在一起才看得出来。
+        # 与 `expect_plan_delta_count`（钉一个具体条数）不同，这条是**不变量**：
+        # 不知道这条问题会演进几次时，它照样成立。
+        if len(deltas) != revision:
+            return Verdict(
+                False,
+                f"**变更史与版本号对不上**：plan_revision={revision}，"
+                f"而 plan_deltas 只有 {len(deltas)} 条——有一版变更没留下记录",
+            )
+        numbers = [int(delta.get("revision_no") or 0) for delta in deltas]
+        if numbers != list(range(1, len(deltas) + 1)):
+            return Verdict(
+                False,
+                f"**revision_no 跳号或乱序**：{numbers}，期望 1..{len(deltas)}"
+                f"——跳号意味着某一版被覆盖过，而覆盖之后剩下的那版看起来是对的",
+            )
 
     if case.get("expect_trigger_finding_linked"):
         unlinked = [

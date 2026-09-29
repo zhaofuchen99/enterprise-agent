@@ -65,6 +65,7 @@ from app.agent.schemas.plan import (
 )
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
+from app.domain.memory import ConversationContext
 from app.domain.task import TaskStatus, ToolCallRecord
 from app.domain.trace import NodeTrace
 
@@ -130,6 +131,27 @@ def merge_errors(left: list[AgentError] | None, right: list[AgentError] | None) 
     return list(merged.values())
 
 
+def current_question(state: AgentState) -> str:
+    """本轮**实际用于检索与生成**的问题（FR-CHAT-003 的「解析后的问题」）。
+
+    **不要直接读 `user_query`**。两者的分工：
+
+    | 字段 | 是谁写的 | 什么时候读 |
+    |---|---|---|
+    | `user_query` | 输入装配处，**用户原话** | 落 `agent_task.query_text`、给人看"他当时怎么问的" |
+    | `sanitized_query` | **supervisor**，代词解析后的自足问题 | 一切要拿去查库或生成的场合 |
+
+    这一版之前 `sanitized_query` 与 `user_query` 恒等（只有 supervisor 读它），
+    于是下游读哪一个都"对"——那正是它最危险的地方：「那 Q2 呢」会被原样
+    送进 SQL 生成器，而 SQL 看起来完全正常（少了个区域而已）。
+    收口成一个函数，是为了下次新增节点时**没有第二个选择**。
+
+    三者皆空时返回空串：那是状态装配出了错（`graph.run` 一定写入
+    `user_query`），读取侧不该为它造一个兜底语义。
+    """
+    return state.get("sanitized_query") or state.get("user_query") or ""
+
+
 class AgentState(TypedDict, total=False):
     """图的状态（详细设计 7.1）。
 
@@ -152,8 +174,18 @@ class AgentState(TypedDict, total=False):
     deadline_at: Scalar
 
     # ---------------------------------------------------------- 意图与计划
-    #: 会话结构化摘要。【Phase 6 未接】memory 未实现，恒为空 dict
-    context_summary: dict[str, Any]
+    #: 会话结构化摘要（详细设计 15.1 的 `ConversationContext`，FR-CHAT-003）。
+    #:
+    #: **由输入装配处填好**（`app/agent/runner.py` 的 `load_conversation_context`），
+    #: 图里没有 `memory` 节点：详设 7.1 说它由 `memory` 写入，而 6.1/6.2 的
+    #: 节点清单里根本没有 `memory`（文档自相矛盾）。取"输入装配"这条的另一个
+    #: 理由是它与 `permission_scope` 同性质——都是跑图的前置数据，不是决策。
+    #:
+    #: **类型是 Pydantic 模型而不是详设 7.1 写的 `dict`**：项目硬性约束
+    #: 「禁止把裸 dict 写入 State」，而这张字段表里其余结构化字段
+    #: （`intent` / `progress_assessment` / `step_results`）全是模型，
+    #: 它当时是全表唯一的例外——只因为"还没接"。
+    context_summary: ConversationContext | None
     intent: IntentResult | None
     task_list: list[TaskStep]
     current_step_index: int

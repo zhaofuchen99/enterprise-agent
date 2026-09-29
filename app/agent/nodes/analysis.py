@@ -31,7 +31,7 @@ from app.agent.nodes.conflict import render as render_conflicts
 from app.agent.prompts.analysis import ANALYSIS_PROMPT
 from app.agent.schemas.analysis import AnalysisResult, InvestigationStep, SupportedClaim
 from app.agent.schemas.plan import StepResult
-from app.agent.state import AgentState
+from app.agent.state import AgentState, current_question
 from app.core.errors import AgentError
 from app.domain.evidence import Evidence
 from app.infrastructure.model_gateway import ModelGateway
@@ -77,7 +77,7 @@ def build_analysis_node(
             result = await gateway.invoke_structured(
                 ANALYSIS_PROMPT,
                 AnalysisResult,
-                question=state.get("user_query") or "",
+                question=current_question(state),
                 evidence=_render(numbered),
                 # **冲突在分析之前就算好了**（详设 6.1 的
                 # `evidence_aggregate → conflict_detect → analysis`）：

@@ -23,6 +23,7 @@ from app.repositories.knowledge_repo import (
     KnowledgeDocumentRepository,
     SqlKnowledgeDocumentRepository,
 )
+from app.repositories.message_repo import MessageRepository, SqlMessageRepository
 from app.repositories.task_repo import SqlTaskRepository, TaskRepository
 from app.repositories.user_repo import SqlUserRepository, UserRepository
 from app.repositories.vocab_repo import SqlVocabRepository, VocabRepository
@@ -33,6 +34,10 @@ class Repositories:
     users: UserRepository
     conversations: ConversationRepository
     tasks: TaskRepository
+    #: 会话消息（16.4）。它和 `conversations` 必须同源：多轮上下文要
+    #: 「这条消息属于哪个会话」与「这个会话存不存在」两边对得上，
+    #: 一边来自 MySQL 一边来自内存时，症状是"有历史但会话不存在"。
+    messages: MessageRepository
     #: 稀疏检索词表（11.6.3）。它与其他三个的形状不同——**只增不改、没有删除**，
     #: 且读路径通常走快照而不是这张表（见 `tools/rag/vocabulary.py`）。
     #: 仍然放在这里，是因为"仓储依赖只有一个入口"这条纪律比形状整齐更重要：
@@ -61,6 +66,7 @@ def build_sql_repositories(sessions: async_sessionmaker[AsyncSession]) -> Reposi
         users=SqlUserRepository(sessions),
         conversations=SqlConversationRepository(sessions),
         tasks=SqlTaskRepository(sessions),
+        messages=SqlMessageRepository(sessions),
         vocab=SqlVocabRepository(sessions),
         documents=SqlKnowledgeDocumentRepository(sessions),
         artifacts=SqlAgentArtifactRepository(sessions),

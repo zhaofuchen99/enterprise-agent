@@ -23,8 +23,11 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from app.agent.schemas.analysis import AnalysisResult
+from app.agent.schemas.plan import IntentResult
 from app.agent.state import AgentState
 from app.domain.evidence import Evidence
+from app.domain.memory import TurnResolution, resolution_to_payload
+from app.domain.period import canonical_period
 
 
 def build_final_node() -> Callable[[AgentState], Any]:
@@ -308,6 +311,59 @@ def _failure_answer(state: AgentState) -> str:
     return "\n".join(lines)
 
 
+#: 口径的维度键 → `IntentResult.filters` 里的键。三个都同名，
+#: 但**映射要显式写出来**：将来 filters 里多一个 `province`，
+#: 靠"键名碰巧一样"的话它会静默地不进上下文（而"上下文里少了哪个维度"
+#: 在渲染出来的文本上完全看不出来）。
+_FILTER_KEYS: tuple[str, ...] = ("region", "channel", "product_line")
+
+
+def _entities_of(intent: IntentResult | None) -> dict[str, str]:
+    """`IntentResult` → 进下一轮上下文的紧凑口径。
+
+    **只取"能拿来解析代词"的那几样**（指标 / 区域 / 渠道 / 产品线 / 期间 / 对比），
+    不整份倒进去：`IntentResult` 有十个字段，其中 `confidence`、`missing_fields`、
+    `clarification_question` 对下一轮解析代词毫无用处，而它们会占用
+    恒留段的预算（那是唯一不会被裁掉的一段）。
+    """
+    if intent is None:
+        return {}
+    entities: dict[str, str] = {}
+    if intent.metrics:
+        entities["metric"] = "、".join(intent.metrics)
+    for key in _FILTER_KEYS:
+        value = intent.filters.get(key)
+        if isinstance(value, list):
+            rendered = "、".join(str(item) for item in value if str(item).strip())
+        else:
+            rendered = str(value or "").strip()
+        if rendered:
+            entities[key] = rendered
+    if intent.time_range is not None:
+        # 期间记号走 `domain/period.py` 那一份换算（2025-Q3 / 2025-08 / 2025）。
+        # **不自己拼字符串**：拼出来的东西与冲突检测认的记号一旦不同源，
+        # 下一轮的口径与证据的期间就不可比了。
+        period = canonical_period(intent.time_range.start.date(), intent.time_range.end.date())
+        if period:
+            entities["period"] = period
+    if intent.comparison != "NONE":
+        entities["comparison"] = intent.comparison
+    return entities
+
+
+def _resolution_of(intent: IntentResult | None) -> TurnResolution:
+    """本轮解析结果 → 落 `result_json`、供下一轮读取的形状。"""
+    if intent is None:
+        return TurnResolution()
+    return TurnResolution(
+        entities=_entities_of(intent),
+        # **`missing_fields` 进 `unresolved_fields`**：那是"这一轮缺什么"，
+        # 而下一轮如果就是来补它的（用户看到澄清后补充一句），
+        # 让模型看见"上一轮缺的是年度"比让它重新推一遍可靠。
+        unresolved_fields=tuple(intent.missing_fields),
+    )
+
+
 def _payload(
     analysis: AnalysisResult | None, evidence: list[Evidence], state: AgentState
 ) -> dict[str, Any]:
@@ -316,6 +372,12 @@ def _payload(
     **带完整证据**：Markdown 里的引用是人读的，前端要跳转需要 id 与 locator。
     在这里给全，比让前端去正则解析 Markdown 可靠。
     """
+    intent = state.get("intent")
+    resolution = _resolution_of(intent)
+    # **存模型的原话（`resolved_question`），不存 `sanitized_query`**：
+    # 后者在没有改写时等于用户原话，存下来会让"这一轮做过代词解析"看起来
+    # 每次都成立。`None` 是"本轮问题本来就自足"，那是有信息量的。
+    resolved_question = intent.resolved_question if intent is not None else None
     return {
         "direct_answer": analysis.direct_answer if analysis else None,
         # **`refused` 必须在这里**：它已经渲染进 Markdown（人读），
@@ -361,6 +423,18 @@ def _payload(
             if state.get("review_result") is not None
             else None
         ),
+        # 本轮把问题解析成了什么口径（FR-CHAT-003）。
+        #
+        # **它的去处是下一轮的上下文**：`load_conversation_context` 按
+        # `message.task_id` 把这里读回来，拼成"上一轮问 X → 口径 Y"。
+        # 落 payload 而不是新加一列，是因为 `result_json` 本来就是
+        # "这条任务的结构化结果"的落点，而这份口径正是其中之一。
+        #
+        # **`resolved_question` 也一并落**：排查"多轮没生效"时第一个要看的是
+        # "上一轮到底把问题解析成了什么"——只留结构化口径的话，
+        # 关键词漏了半截（「那 Q2 呢」被解析成"Q2"而没有区域）看不出来。
+        "resolved_question": resolved_question,
+        **resolution_to_payload(resolution),
     }
 
 

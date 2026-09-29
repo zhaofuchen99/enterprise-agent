@@ -115,6 +115,15 @@ class TaskRepository(Protocol):
         """心跳早于 `heartbeat_before` 且仍处于 RUNNING 的任务（孤儿回收）。"""
         ...
 
+    async def list_recent_by_conversation(self, conversation_id: str, *, limit: int) -> list[Task]:
+        """按**时间正序**返回某个会话最近 `limit` 个任务。
+
+        多轮上下文用它取「上一轮把问题解析成了什么口径」（16.5 的 `result_json`）。
+        口径的来源是**任务**而不是消息：解析结果是 supervisor 的产物、
+        由任务落库，把它再抄一份到消息上就会有两份互相漂移的真相。
+        """
+        ...
+
 
 # ------------------------------------------------------------------ 内存实现
 class InMemoryTaskRepository:
@@ -195,6 +204,16 @@ class InMemoryTaskRepository:
             and (task.heartbeat_at or task.started_at or task.queued_at) < heartbeat_before
         ]
         return sorted(stale, key=lambda t: t.heartbeat_at or t.queued_at)[:limit]
+
+    async def list_recent_by_conversation(self, conversation_id: str, *, limit: int) -> list[Task]:
+        if limit <= 0:
+            return []
+        matching = [
+            task for task in self._by_id.values() if task.conversation_id == conversation_id
+        ]
+        # 与 SQL 侧同一套排序键，含 `id` 作次级键（同一毫秒建的两个任务）。
+        matching.sort(key=lambda item: (item.queued_at, item.id))
+        return matching[-limit:]
 
 
 # ------------------------------------------------------------------- SQL 实现
@@ -320,6 +339,22 @@ class SqlTaskRepository:
             .limit(limit)
         )
         return await self._fetch(stmt)
+
+    async def list_recent_by_conversation(self, conversation_id: str, *, limit: int) -> list[Task]:
+        if limit <= 0:
+            return []
+        # 与 `message_repo.list_recent` 同形：倒序取最近 N 条再翻回正序。
+        # ⚠️ 它**没有走 `conversation_id` 索引**——`agent_task` 上只有
+        # `idx_task_user_status` 与 `idx_task_queued`（16.5）。当前的调用方
+        # 只在一个会话的规模下查（几十行），全表扫的代价可以接受；
+        # 会话一多就要加索引，那是一次迁移而不是改一行 SQL。
+        stmt = (
+            select(AgentTask)
+            .where(AgentTask.conversation_id == conversation_id)
+            .order_by(AgentTask.queued_at.desc(), AgentTask.id.desc())
+            .limit(limit)
+        )
+        return list(reversed(await self._fetch(stmt)))
 
     async def _fetch(self, stmt: Any) -> list[Task]:
         async with session_scope(self._sessions) as session:

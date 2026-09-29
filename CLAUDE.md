@@ -27,9 +27,10 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 6 最小 Graph 接入 | ✅ 完成 | **6 节点**：`supervisor / sql / rag / reflect / analysis / final`（`app/agent/`）。Supervisor 走模型出 `IntentResult`、**按 `required_sources` 真的在选工具**（FR-PLAN-002 业务规则 1 有专门用例钉着）；`reflect` 是**确定性**的任务循环判断点（某一路跑了但空 → 补另一路，最多一次）；`analysis` 把证据编号化交模型组织、`final` 用代码渲染引用与限制。已接入 `TaskRunner`（任务体由 `worker.py` 注入）。**实测**：端到端跑通「SQL 拿数字 + RAG 拿口径定义 + 报告数字与库不符被识别」 |
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**14.1 的第二阶段（结构化模型审查）也接上了**（2026-09-27 晚）：四条判断落成结构化输出，issue 的 code **由代码从布尔推出来**（模型不写自由文本 code），**一律 WARNING——模型不能独自把答案拦下**（见约定 105）。`CLARIFY` 从此有了产出者。**2026-09-28 补上 `plan_extend`（计划演进）**：详设 6.1 的 `reflect -> plan_extend -> dispatch` 那条回边补齐，`retry_router` 的 `expand` 分支从此有落点——14.4 路由表里那一行**不再是"能路由但没人接"**。`plan_deltas` / `plan_revision` / `trigger_finding_id` 三样第一次有了生产者，`agent_plan_revision` 表（建表起一直空着）接上了写入方，`agent_task_step.origin` 能分出 `EXTENDED`。**循环类评测（`任务循环与自适应下钻` 5 条）随之可写**，见 Phase 13。**仍未做**：`WAITING_CLARIFICATION` 状态位、`retry_target=replan` 的产出者（模型审查的四个布尔里没有哪个问的是"计划本身不可执行"）——已登记 |
+| **多轮追问**（FR-CHAT-003 会话内短期记忆） | ✅ 完成（2026-09-28） | 冲刺方案 §7 **明确拒绝砍掉**的那条需求，此前**零实现**：`agent_message` 表从 Phase 2 建好起没有任何写入方，`AgentState.context_summary` 是个从没被填过的占位字段。本次交付：**`Message` 领域对象 + `MessageRepository`**（Protocol/内存/SQL 三份，`agent_message` 第一次被真的读写）、**`ConversationContext`**（详设 15.1 的五字段，`app/domain/memory.py` 的纯函数 `group_turns` / `build_conversation_context`）、**`ConversationService`**（用户消息在 `create_task` 写、助手消息在 `_finish_succeeded` 写，落库失败吞异常但记 `memory.record_failed`）、**上下文进图**（`load_conversation_context` 读最近 10 轮 + 各任务口径 → `supervisor` 的 `{context}`，prompt 升 `1.1.0`）、**`IntentResult.resolved_question`**（代词解析后的问题，FR-CHAT-003 的"输出：解析后的问题"）+ **`current_question()` 收口**（下游四处从读 `user_query` 改为读本轮问题——**不换的话「那 Q2 呢」会被原样送进 SQL 生成器**，见约定 112）。**实测三连问**（2026-09-28，`make demo ONLY=demo-memory-followup` 3/3）：「2025年Q3华东地区的净销售额是多少？」→「那Q2呢？」→「和去年比呢？」——第 2 轮解析成「2025年Q2华东地区的净销售额是多少」（区域继承、期间换掉，答案 127,576,714.27 与 `demo-sql-q2` 的真值一致），第 3 轮 `comparison=YOY`。**它跑第一轮就发现一个真缺陷**：同一条问题另一次跑生成了**绑定参数错**的 SQL（"2024年Q2"实际求 2024-04~2025-04，差 4 倍还给出同比 −74.43% 的结论），SQL 语法与白名单全过、只有区间错——见约定 117。**未做**：写 `agent_conversation.context_summary_json`（避免第二份真相）、`metric_definitions` 填充（需指标目录跨层注入）、失败/取消也写 `SYSTEM_NOTICE`、`token_count` 真实计量、多轮类进 golden 评测集、会话列表/删除 API 与 180 天清理——已登记。**同日全量回归**：`make check` **979 单测** + `make test-integration` **121** 全绿；`make demo` 稳定 **7/7** + 观察 **5/5**（多轮那条占 3 轮）；`make eval-agent` 稳定 **23/24 = 96%**、观察 1/1——**唯一那条红是审查器的门禁误报，不是本次改动引起的**（见约定 118）。⚠️ 回归前按约定 100 **重启了 `make run`** |
 | 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
-| 13 评测（**40 题口径**，切片内**五类**） | ✅ 完成 | **Agent 端到端评测集 25 条**（`configs/eval_agent_golden.yaml` + `make eval-agent`）：Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5 / **任务循环 5**（2026-09-28 加）。判据与 `make demo` **共用一份**（`scripts/agent_harness.py`），避免"演示判对、评测判错"。加上已有的 SQL 10 + RAG 20 = **55 条**（冲刺方案 §6 的 40 题口径，RAG 按 115 口径交了 20 所以超发）。**走 HTTP**（HTTP → 限流 → 队列 → Worker → 图 → 查详情），组件层测不到的就是这一层。**未判定单独计数且计入分母**（排除的话，系统大面积失败时通过率反而上升）；观察用例（`stability: model-dependent`，1 条）不进门禁。**2026-09-28 实测（五类各 5 条）：分类 5/5 × 5 类、稳定用例 24/24 = 100%、观察 1/1、无未判定、无失败项**；同日 `make demo` 稳定 7/7 + 观察 2/2、`make check` 945 单测 + 109 集成全绿。⚠️ 基线仍是 85%（未重定）——它仍拦得住整类失效（19/24 = 79% < 85%）又容得下抖动，理由写在 `eval_agent._DEFAULT_BASELINE` 的注释里。⚠️ 它跑第一轮就发现了三个真缺陷（冲突检测的**时间粒度**与**维度比较单向**、以及**语料生成器的明细表漏传报告自身的范围**，实测报出 157%–1133% / 499% / 占比 187.4%）——**2026-09-27 三条全部修掉**（见约定 93/97/98/99）。**同日复跑**（语料 `2026.09.27-1`，全量重建）：稳定用例 **19/19**、观察 1/1、无失败项；`verify-corpus` 10/10、`eval-rag` 20/20（定位一致 19/20）、`calibrate-rerank` 0.1350 vs 0.0127（阈值 0.07 仍成立）、`make demo` 9/9。⚠️ 复跑前**重启了 `make run`**——见约定 100 |
+| 13 评测（**40 题口径**，切片内**五类**） | ✅ 完成（2026-09-28 循环类补到 15） | **Agent 端到端评测集 35 条**（`configs/eval_agent_golden.yaml` + `make eval-agent`）：Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5 / **任务循环 15**（详设 22.10.5 要求"至少 15 条"，本次补齐）。**同日全量实测（35 条）：稳定 33/33 = 100%、观察 1/2、无未判定、无 FAIL**——观察那两条是 `agent-clarify-03`（这一轮判了 `refused=false`）与 `agent-loop-06`（反方向演进，一次通过）；分类 工具选择 5/5、冲突 5/5、审查 5/5、澄清 4/5、**循环 15/15**——10 条新用例一次通过，含**反方向演进**（RAG 空 → 补 SQL）、**抑制**（该补的一路已在计划里 → 一步不动）、**变更史自洽**（新增 `expect_plan_records_consistent`：`plan_deltas` 条数 == `plan_revision` 且 `revision_no` 连续）、**澄清路径 `expect_max_steps: 0`**。**「异常恢复与重试」这一类没写**，理由是它没有稳定触发面（见约定 121）。**6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」已落地**——在**组件层**（`app/tests/agent/test_reviewer_gate.py`，8 条必拦缺陷 100% 阻断 + 3 条不该拦的放行 + 一条把**盲区写死的断言**），见约定 120。判据与 `make demo` **共用一份**（`scripts/agent_harness.py`），避免"演示判对、评测判错"；加上既有 SQL 10 + RAG 20 = **65 条**。**走 HTTP**（HTTP → 限流 → 队列 → Worker → 图 → 查详情），组件层测不到的就是这一层。**未判定单独计数且计入分母**（排除的话，系统大面积失败时通过率反而上升）；观察用例不进门禁。⚠️ 基线仍是 85%（未随分母重定，理由写在 `eval_agent._DEFAULT_BASELINE` 的注释里）。⚠️ 它跑第一轮就发现过三个真缺陷（冲突检测的**时间粒度**与**维度比较单向**、**语料生成器的明细表漏传报告自身的范围**，实测报出 157%–1133% / 499% / 占比 187.4%），**2026-09-27 全部修掉**（见约定 93/97/98/99）；2026-09-28 又发现并修掉了审查器的一处门禁误报（约定 118）。⚠️ 每次跑之前**重启 `make run`**——见约定 100 |
 
 > ⚠️ **当前按「秋招冲刺方案」执行**：`docs/秋招冲刺方案.md` 覆盖了开发流程第 6 章的 Phase 顺序。
 > 近期做 **SQL + RAG 双源垂直切片**，**分两批交付**：
@@ -956,6 +957,168 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     当前取值对 7.5 要问的那个问题恰好是对的（补证**不该**算作下钻），
     代价是 `revision_no` 对这几行没有意义——已登记。
 
+### 多轮追问（FR-CHAT-003）期间新立的临时约定
+
+111. **上下文是「图的输入」，不是图里的一步**——**不新增 `memory` 节点**。
+    详设 7.1 说 `context_summary` 由 `memory` 节点写入，而 6.1/6.2 的节点清单里
+    **根本没有 `memory`**（文档自相矛盾，需回写）。选"输入装配"这条的实际依据
+    更硬：加节点要改 `build_graph(...)` 签名，而它被 `app/tests/agent/test_graph.py`
+    等 6 处直接调用，**加参数会波及所有 agent 单测**。
+    实现落在 `app/agent/runner.py` 的 `load_conversation_context`——与
+    `permission_scope` 完全同形（都是跑图的前置数据，都不是决策）。
+    ⚠️ 同时**偏离了详设 7.1 的类型写法**：`AgentState.context_summary` 从 `dict`
+    改成 `ConversationContext | None`。依据是项目硬性约束「禁止把裸 dict 写入
+    State」——那张字段表里其余结构化字段（`intent` / `progress_assessment` /
+    `step_results`）全是 Pydantic，它当时是**唯一的例外**，而例外的理由只是"还没接"。
+
+112. **`user_query` 与 `sanitized_query` 从此分工，下游一律走
+    `state.current_question()`**。这一版之前两者恒等（全仓只有 supervisor 读
+    后者），所以读哪一个都"对"——**那正是最危险的地方**：
+    `tool_nodes` / `analysis` / `reviewer` / `plan_extend` 四处都读 `user_query`
+    （用户原话），于是「那 Q2 呢」会被原样送进 SQL 生成器的 `业务问题：{question}`，
+    指标与区域一个都带不过去（它们只活在 `IntentResult` 的字段里，而模板看不到那个
+    schema）。生成的 SQL **看起来完全正常**，只是少了个区域。
+    - `user_query` = 用户原话，**只用来给人看**（落 `agent_task.query_text`），
+      "他当时怎么问的"是排查误答的第一个线索，覆盖掉就查不出来了；
+    - `sanitized_query` = **本轮实际用于检索与生成的问题**，由 supervisor 按
+      `IntentResult.resolved_question` 覆写（只在可执行意图上采纳：澄清那一轮
+      拿到的可能是半截回话而不是问题）。
+    ⚠️ 收口成一个函数（`state.current_question`）而不是让四处各自 `or` 一下，
+    是为了下次新增节点时**没有第二个选择**。
+
+113. **消息的写入位置是承重的，两条各错一处都不报错**：
+    - **用户消息写在 `tasks.add` 的 `try/except` 之后**（`task_service.create_task`）。
+      写在前面的话，两个并发同幂等键的请求中**输掉的那个**在拿到
+      `DuplicateTaskError` 之前已经写过一条 → 同一句话出现两次。
+    - **助手消息用 `replace_for_task` 而不是 `add`**：任务可能被执行两次
+      （图跑完、收尾提交前进程死掉，孤儿回收会重跑），追加会造出两条一模一样的
+      助手消息，症状是下一轮的上下文里上一轮出现两次——看起来完全正常。
+    **落库失败吞异常**（沿用约定 50：不该把一次成功的分析变成任务失败），
+    但**必须留一个能 grep 到的事件名** `memory.record_failed`。
+    它的症状是**另一条任务**上的：消息没写进去 → 下一轮代词没有上下文 →
+    「那 Q2 呢」被答成 Q2 的**全公司**数字（丢掉了上一轮的"华东"）——
+    任务全绿、答案看着正常、数字是错的，而第二轮**无从知道自己少了什么**。
+    只 `logger.exception` 一句的话，排查的人手上没有任何可捞的东西。
+
+114. **口径的来源是「任务」不是「消息」，且 `confirmed_entities` 只取最近一轮**
+    （`app/domain/memory.py`）。对话文本在 `agent_message`，而"上一轮把问题解析成了
+    什么口径"是 supervisor 的产物、由 `agent_task.result_json` 落库（`final._payload`
+    新增 `resolved_question` / `resolved_entities` / `unresolved_fields`）——
+    在消息上再抄一份就是两份会漂移的真相。两者靠 `agent_message.task_id` 关联。
+    - **不跨轮合并**：把第 1 轮的「华东」与第 3 轮的「华南」并起来会造出一份
+      **从来没被问过的口径**，而模型会拿它去解析第 4 轮的代词。
+    - **措辞禁用「已确认」**：详设 15.1 的原话是「模型推测不得写成"用户已确认"」，
+      而字段名 `confirmed_entities` 读起来正好像是前者。模型看到的是**渲染出来的
+      文本**，所以渲染表头写「上一轮系统解析出的口径（未经用户确认）」，
+      并有一条单测钉住渲染结果里**不出现"已确认"**。
+    - ⚠️ **不写 `agent_conversation.context_summary_json`**（详设指定的那一列）：
+      加载器每次都从消息 + 任务现算，写它会造出第二份真相。已登记后置。
+
+115. **多轮演示用例只进 `make demo`，不进 `eval_agent_golden.yaml`**。
+    后者有两条断言钉着"总数 = 类数 × 5"「每类恰好 5 条」
+    （`test_eval_agent_golden.py`），加一条会直接让 `make check` 红，
+    还会逼着重定基线（85% 是按 24 条分母定的）。
+    ⚠️ **`expect_resolved_contain` 排在模式分支之前**（`agent_harness.evaluate` 的最前面）：
+    它验的是"上一轮的口径有没有被继承"，与走了哪几路、有没有拒答**完全正交**，
+    而写在后面的话，它只在"没拒答也没澄清"时生效——**代词没解析出来最典型的
+    结果恰恰是去澄清**，那时用例会报"进入澄清 ✓"而缺陷一声不响
+    （同约定 87 那条"写在提前 return 之后的断言永远不会被检查"）。
+    有用例钉住了这件事（`test_the_resolved_check_runs_even_when_the_case_clarifies`）。
+
+116. **`agent_message.status` 的取值是详设留白，本实现补为 `SENT`**
+    （16.4 只列了列名，而它是 `NOT NULL`）。定在这里而不是留空：不给值第一次
+    插入就 `IntegrityError`，而写入失败沿约定 50 是被吞掉的——症状是
+    "消息表一直空着、没有任何报错"，正是那五张表长期为空的历史重演。**需回写详设 16.4**。
+
+117. **口径被解析对 ≠ 答案对——绑定参数错这一层只有答案里的数字能察觉**
+    （2026-09-28 实测，`demo-memory-followup` 第 3 轮）。同一句「和去年比呢？」跑两次：
+    一次生成 `GROUP BY YEAR`（对），另一次生成双列 CASE 聚合，**第二个 CASE 的右边界
+    用了 `:q2_start`，而它被绑成 2025-04-01**——于是"2024年Q2"实际求的是
+    2024-04 ~ 2025-04，拿到 498,882,324.77（真值 **123,325,842.54**），
+    并据此给出「同比减少 74.43%」的结论。
+    **SQL 语法、AST 白名单、绑定参数完整性全过，证据里也确实有那个数——
+    错的只有区间。** 词法/语法层的校验器天然看不见这个，`expect_numbers` 才是
+    它唯一的落点（补上后该轮立刻能红）。⚠️ 它是**间歇**的（同一次复跑就正常），
+    所以这条用例的 `stability` 保持 `model-dependent`，**别把它升成 stable 当成门禁**。
+
+118. **「结论缺引用」这条一票否决会误伤拒答句——修法是给它一个 kind，不是改判据**
+    （2026-09-28 `make eval-agent` 实测发现，同日修掉）。产物：
+
+    ```
+    claims[5] = "现有证据中没有任何2026年3月的数据，因此无法回答该时间点的华东净销售额。"
+                evidence_ids = 0    review = FAIL / CLAIM_WITHOUT_EVIDENCE
+    ```
+
+    系统**行为是对的**（SQL 查空 → `reflect` 补 RAG → 分析层如实说没有那个时间点），
+    红的是审查器：它要求每条 `claims` 都有 `evidence_ids`，只豁免了 `HYPOTHESIS`
+    （约定 44）。而「**证据里没有这件事**」按构造引不出证据——"没有证据"
+    正是由"引不出证据"证明的。
+    ⚠️ **它不是多轮改动的回归**：那条任务的 `resolved_question` 是 `null`
+    （单轮路径没变），差别只是这次分析模型写了 5 条 claim（上一次 2 条）——
+    **同一条用例换个跑法会翻**（同约定 91），所以单看它红一次说明不了任何事。
+
+    **修法：`ClaimKind` 加第四个取值 `ABSENCE`**（13.5 原文只有三个，已回写），
+    并把豁免挂在**两个信号同时成立**上：`kind == ABSENCE` **且** `refused == True`。
+    - 只认 `ABSENCE` 的话，一句编造的结论只要标成它就能绕开一票否决；
+    - 而 `refused` 是答案自己做出的、**用户可见**的承诺（渲染进答案、进 payload、
+      进演示判据），想绕开它得先承认"我没回答那个问题"。
+    - **同一件事有两半**：`_evidence_ratio` 的分母也要把它排除，否则覆盖率
+      掉到 50 分以下——症状同样是"这条答案有问题"，而它其实完全正确。
+      两处各自的注释都指回对方，因为**只改一处不会有任何报错**。
+    ⚠️ **没有走"按文本匹配去豁免"那条路**（猜词判据，见约定 82），
+    也没有让 prompt 去"求"模型别这么写——`ABSENCE` 是个机器可读的位置。
+
+### 评测口径补齐期间新立的临时约定
+
+119. **循环类评测算到 15 条，且新增的断言是「不变量」而不是「又一个数字」**
+    （`configs/eval_agent_golden.yaml` 的 `agent-loop-06..15`）。10 条按 7.5 的
+    四类性质分布，每条钉一个**具名的性质**——不是把同一句话换五个期间重写：
+    - **有效性**：`loop-06` 是**反方向**（RAG 先跑、语料里没有 → 补 SQL）。
+      前五条全是 SQL→RAG，而补证关系表（`state.COMPLEMENTS`）是**两条边**，
+      只测一条等于只测了一半，另一条"再也不发生"没有任何症状；
+      `loop-07/08` 钉**抑制**（该补的那一路已在计划里 → 一步都不动）；
+    - **一致性**：新增 `expect_plan_records_consistent`——`plan_deltas` 条数
+      等于 `plan_revision`、且 `revision_no` 连续 1..N。它比
+      `expect_plan_delta_count`（钉一个具体条数）**更可用**：不知道这条问题
+      会演进几次时它照样成立，抓的是"计划变了却没留记录"；
+    - **终止性**：`expect_max_steps` 在几种粒度上各钉一次；`loop-14` 用
+      `expect_max_steps: 0` 钉澄清路径**一步都不跑**（只看 `plan_revision`
+      时，0 与"跑了两路但没演进"长得一样）；
+    - **预算**：`expect_plan_revision_max` 换采样点。
+    ⚠️ `test_eval_agent_golden.py` 的「总数 = 类数 × 5」改成了
+    **一张每类条数的表**——它是唯一一类条数不同的，原来那条断言在
+    补到 15 之后就成了一个说不上话的恒等式。
+
+120. **6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」落在组件层**
+    （`app/tests/agent/test_reviewer_gate.py`）。两处口径要写清楚，否则它会
+    被读成比实际更强的东西：
+    - **分母是「14.3 判为一票否决的那五类」**，不是 14.1 的十条。
+      `INFERENCE` 无引用与 `OPEN_QUESTION_NOT_LISTED` 按设计只记 WARNING，
+      把它们算成"漏拦"只会逼着门禁去收紧规则——而那会误伤正常答案。
+      所以另有一条 `test_benign_shapes_are_not_blocked` 钉反方向。
+    - ⚠️ **它不覆盖「答案里的数是错的」**，而且这条边界被写成了**断言**：
+      `test_the_blind_spot_is_documented` 构造了一个**有引用、有证据、
+      但数算错**的答案（2026-09-20 那次的形态），断言它**必须 PASS**。
+      数字正确性不在 14.1 的十条里，它由答案层 `expect_numbers` 管——
+      不把这段写死的话，"阻断率 100%"会被读成"答案都对"。
+
+121. **「异常恢复与重试」这一类**不写**端到端用例**，理由是它在这版架构下
+    没有稳定的触发面（2026-09-28 逐条核过）：
+    - 确定性的 RETRY 要**两个条件同时成立**——"标成 FACT 的结论没有引用"
+      **且**"还有一路没查过"（`reviewer._retry_target`）。后半是代码判的，
+      **前半取决于分析模型的输出**，同一条问题两次跑可以不一样；
+    - 预算耗尽（`retry_budget_exhausted` → CLARIFY/FAIL）更是要连续触发；
+    - 能稳定触发的那几类（四类预算互不借用、`choose_retry` 的降级分支）
+      **已经在 `app/tests/agent/test_retry_router.py` 里有确定性用例**，
+      端到端再写一遍只会得到恒绿或随机红的用例——而**恒绿的用例会让
+      分类通过率失去意义**（这条判断在 `plan_extend` 落地前就已经记过，
+      现在仍然成立）。
+    **触发面确实存在**：`agent-loop-05` 实测跑出 `plan_revision=2`，
+    第二版正是审查模型的 `retry_target=expand`——所以**重试机器是被跑到的**，
+    只是"它什么时候跑"不由我们决定。要把它变成门禁，前置是**能注入一次
+    可控的 RETRY**（比如给 `AnalysisResult` 开一个只用于测试的注入点，
+    或把 `LOOP__MAX_REVIEWER_EVIDENCE` 做成按任务可覆盖）——已登记。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -994,7 +1157,8 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **`retry_target=replan` 的产出者**：`choose_retry` 能路由，而模型审查的四个布尔里**没有哪一个问的是"计划本身不可执行"**，所以走不到。要接就得给 `ModelReview` 加一条判断（那会让"计划是否可执行"变成模型说了算，需重新论证） | 需要时 |
 | **`plan_extend` 的 `plan_extend_rejected` 事件与任务的关联**：事件已发（`plan_extend.rejected`），但它没有进 `agent_task` 的任何一个 JSON 列，所以**只在事件流与 State 里可见**；要按任务回看就得加一列或一张表 | 需要时 |
 | **`agent_finding` 表落库**：`findings` 从 Phase 6 起就进 State（`tool_nodes._normalize` 产出，含空结果那一步），但**一直没有落库的调用方**。它不接上，`investigation_chain` 里那些 `fnd_` id 在库里查不到 | 需要时 |
-| **开发流程 6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」**：现在可测了（模型审查落地后有「缺陷答案」的定义），但还没写那组用例 | 下一项 |
+| **`异常恢复与重试` 这一类的触发面**：端到端写不出稳定用例（约定 121）。前置是**能注入一次可控的 RETRY**——给 `AnalysisResult` 开一个只用于测试的注入点，或让 `LOOP__MAX_REVIEWER_EVIDENCE` 可按任务覆盖。有它之后才谈得上钉「预算耗尽降级为 CLARIFY/FAIL 且记 `retry_budget_exhausted`」 | 需要时 |
+| ~~开发流程 6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」~~ **已交付（2026-09-28）**：落在**组件层**（`app/tests/agent/test_reviewer_gate.py`），8 条必拦缺陷 100% 阻断、3 条不该拦的放行、1 条把**盲区**（数字正确性不在 14.1 的十条里）写成断言。分母口径见约定 120 | ✅ 本次 |
 | ~~`reindex` 接口~~ **已完成（2026-09-27）**：`make reindex`（`app/cli.py::_reindex`），以**归档原文**为准逐篇重建，重建前比对行的 `checksum` 与归档的 SHA-256，不一致**拒绝重建那一篇**。与 `make ingest FORCE=1` 的分工见约定 96 | ✅ 本次 |
 | 扫描件 OCR：语料里 2 份（SP-016 / CM-010）已归档原文并标 `FAILED`，补齐 OCR 后可直接从归档重跑 | 后置 |
 | Qdrant 的 `set_payload` 跨分片无事务保证 → 发布窗口内读者可能看到同一版本的部分 chunk。要严格就需把状态位提到文档级（见详设 11.1 的落地记录第 4 条） | 语料规模上去再评估 |
@@ -1002,6 +1166,15 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 未注册路径复用 `TASK_NOT_FOUND` 的语义含混（错误码表封闭所致） | 待定 |
 | token / 成本进 **OTel Metrics**（详设 19.4.3）。Phase 3 先落 span 属性，`observability.py` 目前只有 tracer、没有 meter | Phase 11「节点埋点」 |
 | `MODEL_TUNING__THINKING_ENABLED=true` 时，带 `tools` 的历史轮次必须回传 `reasoning_content`，否则 DeepSeek 返回 400。切片内不开思考模式，故未实现该回传路径 | 需要时 |
+| **写 `agent_conversation.context_summary_json`**：详设 15.1 指定的落点，本次**不写**——加载器每次都从消息 + 任务现算，写它会造出**第二份真相**（两份不一致时只会静默漂移）。要写就得先回答"谁是权威"（见约定 114）。⚠️ `_mapping.py` 至今**根本没映射这一列** | 需要时 |
+| **`ConversationContext.metric_definitions` 恒空**：要填它需要指标目录，而目录活在 `app/tools/sql`——为这一个字段把 tools 层拖进 API 进程的装配链不合算。空列表的语义是"本轮没有注入口径定义"，不是"没有口径" | 需要时 |
+| **失败 / 取消的轮次不写任何消息**（本次只写 USER + 成功的 ASSISTANT）。要写就写一条 `SYSTEM_NOTICE`——`role` 的三个取值里正是为它留的位置 | 需要时 |
+| **`agent_message.token_count` 恒空**：网关的用量统计还没接进这条链路，填一个估算值会让"这条消息花了多少"看起来是被计量过的 | Phase 11「节点埋点」 |
+| **多轮类进 `eval_agent_golden.yaml`**：本次只落在 `make demo`（见约定 115）。要进评测集得同时改 `CATEGORIES` / `_EXPECTED_PER_CATEGORY` 与重定基线 | 下一项 |
+| **`WAITING_CLARIFICATION` 续跑**（详设 15.2 的 `parent_task_id`）：用户补充后新建 task 并复用原计划摘要，是**另一片**（要动任务终态与 API/SSE 侧）。会话内短期记忆不含它 | 需要时 |
+| 会话列表 / 删除 API 与 180 天保留期清理（`make cleanup` 仍是占位实现）。`agent_message.deleted_at` 的过滤**已经写好并有集成用例钉着**，只是还没有生产者 | Phase 12 / 需要时 |
+| ~~拒答句进 `claims` 导致 `CLAIM_WITHOUT_EVIDENCE` 误报~~ **已修（2026-09-28）**：`ClaimKind` 加 `ABSENCE`，豁免要求 `ABSENCE` **且** `refused`（见约定 118）；`_evidence_ratio` 的分母同步排除。analysis prompt 升 `1.4.0` | ✅ 本次 |
+| **SQL 生成的「绑定参数语义」没有校验层**（约定 117）：AST 白名单管的是"允许哪些表/列/函数"，管不了"这个 CASE 的右边界绑的是不是那一年的 4 月 1 日"。要挡住它得做**区间口径校验**（把 `time_range` 与 SQL 里的时间谓词对账），属独立切片 | Phase 9 |
 
 **冲刺期后置**（由 `docs/秋招冲刺方案.md` §10 冻结，切片内不要顺手做）：
 
@@ -1016,7 +1189,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | `agent_plan_revision` / `agent_finding` 表（切片内先存 `agent_task` 上的 JSON） | |
 | ~~SSE 订阅端点与订阅令牌~~ | **已完成（2026-09-19，提前）**：端点 + 令牌 + 双通道 + 心跳 + `done` + 降级路径，节点级事件也进了同一条流。**注**：重放暂走 Redis Stream（约定 68），18.3 的 MySQL 权威重放仍待合并 |
 | ~~`/trace` 接口与节点埋点~~ | **已完成（2026-09-18，提前）**：节点级埋点 + 17.4 的接口。**工具级事件与 `include_tools` 仍未做**，见上方【后续扩展】 |
-| ~~评测集扩到 40 题~~ **已完成（2026-09-22，2026-09-28 扩到 25 条）**：Agent 端到端 **25 条**（五类各 5）+ 既有 SQL 10 / RAG 20 = **55 条**。**SQL 安全类 100% 阻断率的判定标准没缩**（28 条校验器用例照旧）。**未做的一类**：`异常恢复与重试`——「异常恢复」要的是**模型层面**的缺陷答案，而端到端能稳定触发的重试只有确定性那几类；写进来只能是一条恒绿的观察用例，而**一条恒绿的用例会让分类通过率失去意义**。⚠️ `任务循环与自适应下钻` **本次交了 5 条**（7.4 要求 15），其余 10 条随 115 口径一起做 | ✅ 本次 |
+| ~~评测集扩到 40 题~~ **已完成（2026-09-22，2026-09-28 扩到 35 条）**：Agent 端到端 **35 条**（Tool选择/Conflict/Reviewer/异常澄清各 5 + **任务循环 15**）+ 既有 SQL 10 / RAG 20 = **65 条**，另有安全类 28 条独立断言（100% 阻断的判定标准没缩）。**仍未做的一类**：`异常恢复与重试`——它没有稳定的端到端触发面，理由与已登记的触发提案见约定 121 | ✅ 本次 |
 | ~~**语料生成器：按报告自身范围限定的表，只限定了「正在枚举的那个维度」**~~ **已交付（2026-09-27，见约定 97）**：`render_report` 的三张明细表现在都是「报告自身的范围 + 正在枚举的那个维度」——`region_rows` 只放开 region、`channel_rows` 只放开 channel、`line_rows` 两个都带上。产物自证：`SR-EC-2025Q3`（华东）的「分产品线经营情况」从 **21,057.87 万元 / 占比 187.4%**（分子全公司、分母华东）变成 **3,813.24 万元 / 占比 34.0%**，占比列加起来是 100%。清单 `version` 已升到 `2026.09.27-1`（内容变 = 语料变）。⚠️ 只影响**带范围的报告**（`SR-EC-*` / `SR-CH-*`），全公司报告不受影响 | ✅ 本次 |
 | ~~**冲突检测的时间粒度**~~ **已交付（2026-09-27，见约定 97/98）**：`report.period` 现在从清单一路进 payload（`ChunkMetadata.stat_period` → `Evidence.stat_period`），判据是 `conflict._same_period` 的**期间相等**（不取相交），换算规则只在 `app/domain/period.py`。归不上规范跨度就按**期间未知**放行（九个月、同比包出来的 15 个月、无时间条件——都是多报方向）。重建路径是新写的 `make reindex`（认归档原文 + checksum 对账），`--force` 也修成真正的「无条件重建」（见约定 95）。本次复跑数字见进度表。 | ✅ 本次 |
 | ~~**冲突检测的维度比较是单向的**~~ **已交付（2026-09-27，见约定 93）**：判据改成 `_comparable` 里**两个方向各遍历一次**（原先只遍历文档侧的键），499.55% 那条假冲突消失；空 `scope` 仍然放行，`demo-cross` 的真冲突与两条放行用例都还在。⚠️ 下面这条与它**不同源**——时间粒度那条是缺信息，这条是判据写反了 | ✅ 本次 |

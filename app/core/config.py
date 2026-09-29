@@ -34,6 +34,30 @@ class LoopSettings(BaseModel):
     max_reviewer_evidence: int = Field(default=1, ge=0, le=5)
 
 
+class MemorySettings(BaseModel):
+    """会话内短期记忆（详细设计 15.1 / FR-CHAT-003）。
+
+    环境变量覆盖方式：`MEMORY__MAX_TURNS=5`。
+
+    **没有 `enabled` 开关**（与 `RERANKER_ENABLED` / `SEARCH_ENABLED` 不同）：
+    那两个是"外部服务可选"，关掉是**正常的运行形态**；记忆不是外部依赖，
+    关掉它等于把 FR-CHAT-003 静默作废，而系统看起来完全正常
+    （每轮都当成新问题，答案都答得出来，只是答错了对象）。
+    要停用就在装配处传 `None`，那是一条代码路径而不是一个配置位。
+    """
+
+    #: 保留最近多少**轮**对话（一轮 = 一次提问 + 它的答复）。
+    #: 默认 10 是 FR-CHAT-003 业务规则写死的数字，**调小它等于改需求**。
+    max_turns: int = Field(default=10, ge=1, le=100, description="进上下文的最近对话轮数")
+    #: 渲染出来的上下文文本的**护栏**，不是 token 计量。
+    #:
+    #: 真实规模（10 轮 × 约 110 字）在 1.1k 字上下，这个值是给异常长答案兜底的。
+    #: 用字符数近似 token（中文在主流分词下约 1–1.7 字/token）而不引 tiktoken：
+    #: 多一个依赖、多一次校准，而护栏在真实数据上永远不触发。
+    #: **真正的 token 计量已登记后置。**
+    context_max_chars: int = Field(default=4000, ge=200, le=20000, description="上下文文本字符上限")
+
+
 class RedisTuning(BaseModel):
     """Redis 使用参数（详细设计 4.4 的键生命周期 / 19.5 的 redis 段）。
 
@@ -480,6 +504,9 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------ 循环预算
     loop: LoopSettings = Field(default_factory=LoopSettings)
+
+    # ------------------------------------------------------ 多轮上下文（FR-CHAT-003）
+    memory: MemorySettings = Field(default_factory=MemorySettings)
 
     # ------------------------------------------------------------------ 校验
     @model_validator(mode="after")

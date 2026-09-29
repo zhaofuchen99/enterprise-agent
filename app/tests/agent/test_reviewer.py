@@ -319,3 +319,82 @@ def test_the_score_is_reported_but_does_not_override_a_blocking_verdict() -> Non
     assert result.status == "FAIL"
     assert 0 < result.score < 100
     assert result.evidence_score == 50  # 两条可检查的结论，一条有引用
+
+
+# ------------------------------------------------- 关于证据本身的话（ABSENCE）
+def test_an_absence_statement_in_a_refusal_is_not_blocking() -> None:
+    """拒答时那句「证据里没有这件事」**不按缺引用判**。
+
+    **这条是一次门禁误报的直接产物**（2026-09-28，`agent-clarify-04`）：
+    SQL 按条件查空 → `reflect` 补了一路 RAG → 分析层如实说"没有任何 2026 年
+    3 月的数据"。系统行为**完全正确**，而审查给了
+    `FAIL / CLAIM_WITHOUT_EVIDENCE`——因为模型把拒答那句话也写进了 `claims`，
+    而它按构造引不出证据（"没有证据"正是由"引不出证据"证明的）。
+
+    与 `HYPOTHESIS` 的区别是**理由**：那个是"我猜的"，这个是"这里面没有"。
+    两者都不该按缺引用判，所以是两个 kind 而不是一个。
+    """
+    item = _evidence()
+    analysis = AnalysisResult(
+        refused=True,
+        direct_answer="现有证据中没有任何 2026 年 3 月的数据，因此无法回答。",
+        claims=(
+            _claim(text="现有证据中没有任何 2026 年 3 月的数据", kind="ABSENCE"),
+            _claim(text="华东 2025 年 3 月净销售额为 3,946.08 万元", evidence_ids=(item.id,)),
+        ),
+        limitations=("证据未覆盖 2026 年",),
+    )
+
+    result = review(analysis, _state(evidence=[item]))
+
+    assert result.status == "PASS"
+    assert [item.code for item in result.issues] == []
+
+
+def test_an_absence_statement_without_a_refusal_is_still_recorded() -> None:
+    """**两个条件缺一不可**：只认 `ABSENCE` 的话，一句没有证据的话
+    只要被标成 ABSENCE 就再也留不下任何痕迹。
+
+    要求 `refused` 同时为真，是把豁免挂在**答案自己做出的、用户可见的承诺**上
+    ——拒答会渲染进答案、进 payload、进演示判据，想绕开它得先承认
+    "我没回答那个问题"。
+
+    ⚠️ 断言的是 issue **还在**，不是它 BLOCKING：14.3 只把
+    `kind == FACT` 的缺引用判成一票否决，其余是 WARNING
+    （`INFERENCE` 同样如此，不是本次引入的口子）。
+    """
+    analysis = AnalysisResult(
+        refused=False,
+        direct_answer="华东净销售额为 100。",
+        claims=(_claim(text="证据里没有别的东西", kind="ABSENCE"),),
+        limitations=(),
+    )
+
+    result = review(analysis, _state(evidence=[_evidence()]))
+
+    assert [item.code for item in result.warnings] == ["CLAIM_WITHOUT_EVIDENCE"]
+
+
+def test_an_absence_statement_stays_out_of_the_evidence_ratio() -> None:
+    """它不计入「引用覆盖率」的分母——**与上面那条豁免是同一件事的两半**。
+
+    只改一处的话，一条完全正确的拒答要么被判 BLOCKING，
+    要么覆盖率掉到 50 分以下把总分拉下 80 —— 两种症状都指向
+    "这条答案有问题"，而它其实是正确的。
+    """
+    item = _evidence()
+    analysis = AnalysisResult(
+        refused=True,
+        direct_answer="没有这件事。",
+        claims=(
+            _claim(text="有引用", evidence_ids=(item.id,)),
+            _claim(text="现有证据里没有 2026 年 3 月的数据", kind="ABSENCE"),
+        ),
+        limitations=(),
+    )
+
+    result = review(analysis, _state(evidence=[item]))
+
+    # 引用覆盖率只按那一条**应当有引用**的结论算 → 100 分，而不是 50
+    assert result.score >= 80
+    assert result.status == "PASS"

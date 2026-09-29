@@ -252,6 +252,19 @@ class IntentResult(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     missing_fields: tuple[str, ...] = ()
     clarification_question: str | None = None
+    #: **代词解析后的问题**（FR-CHAT-003 的「输出：解析后的问题」）。
+    #:
+    #: 「那 Q2 呢？」本身不是一个能拿去查库的问题——SQL 生成器只拿得到
+    #: 问题文本，指标与区域全在**这个 schema 的别的字段里**，而它看不到
+    #: （`业务问题：{question}` 是模板里唯一的业务输入）。所以让模型把
+    #: 上下文消化掉之后**重写出一句自足的问题**，是让解析结果真正生效的
+    #: 唯一低成本做法；备选是让 SQL 工具直接吃 `metrics`/`filters`，
+    #: 那要改 `SqlQueryArgs` 与 SQL prompt，属独立切片。
+    #:
+    #: `None` 表示**本轮没有历史可继承**（或模型认为不必改写），那时
+    #: 原话就是自足的——**不能拿空串顶替**，空串送进 SQL 生成器
+    #: 会得到一条没有任何过滤条件的 SQL，而它会正常跑出结果。
+    resolved_question: str | None = None
 
 
 __all__ = [

@@ -24,6 +24,7 @@ from app.domain.task import Task, TaskStatus
 from app.domain.user import User, UserRole
 from app.repositories.conversation_repo import ConversationRepository
 from app.repositories.task_repo import DuplicateTaskError, TaskPatch, TaskRepository
+from app.services.conversation_service import ConversationService
 from app.services.task_runner import TaskRunner
 
 logger = logging.getLogger(__name__)
@@ -52,11 +53,17 @@ class TaskService:
         conversations: ConversationRepository,
         settings: Settings,
         runner: TaskRunner,
+        conversation_service: ConversationService | None = None,
     ) -> None:
         self._tasks = tasks
         self._conversations = conversations
         self._settings = settings
         self._runner = runner
+        #: 可空是**为了测试的局部展开**（只想验幂等或配额的用例不必先装配消息仓储），
+        #: 不是"生产里可能没有它"——`app/main.py` 一定传。
+        #: 判空的代价写在这里：漏装配的症状是**消息表一直空着**，
+        #: 那与"这一轮没有历史"在产物上长得一样（见 `ConversationService`）。
+        self._conversation_service = conversation_service
 
     async def create_task(
         self,
@@ -111,6 +118,13 @@ class TaskService:
             if existing is None:
                 raise
             return self._replay(existing, message=message, conversation_id=conversation_id)
+
+        # **必须在这里**（`tasks.add` 成功之后、`_dispatch` 之前）：
+        # 上面任何一个 `return` 都是幂等命中或失败，它们不该写出第二条用户消息。
+        # 位置放到 `try` 里的话，两个并发同幂等键的请求中**输掉的那个**
+        # 在拿到 `DuplicateTaskError` 之前就已经写过了。
+        if self._conversation_service is not None:
+            await self._conversation_service.record_user_message(task)
 
         await self._conversations.touch(conversation.id, now)
         await self._dispatch(task)

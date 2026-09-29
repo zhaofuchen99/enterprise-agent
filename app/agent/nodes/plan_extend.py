@@ -66,7 +66,7 @@ from app.agent.nodes.analysis import _number, _render
 from app.agent.prompts.plan_extend import PLAN_EXTEND_PROMPT
 from app.agent.schemas.plan import PlanDelta, PlanExtension, ProposedStep, TaskStep
 from app.agent.schemas.review import ReviewResult
-from app.agent.state import AgentState, next_step_id
+from app.agent.state import AgentState, current_question, next_step_id
 from app.core.config import Settings
 from app.core.errors import AgentError
 from app.infrastructure.model_gateway import ModelGateway
@@ -165,7 +165,7 @@ async def _proposed(
     result = await gateway.invoke_structured(
         PLAN_EXTEND_PROMPT,
         PlanExtension,
-        question=state.get("user_query") or "",
+        question=current_question(state),
         plan=_render_plan(state),
         evidence=_render_evidence(state),
         reason=_review_reason(state.get("review_result")),

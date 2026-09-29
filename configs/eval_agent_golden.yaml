@@ -174,7 +174,7 @@
 # （确定性一次 + 审查模型一次），评测那次只有 1 版。
 # 钉精确值的话它就是一条随机红的用例；钉 1 ≤ revision ≤ 2 则两次都通过，
 # 而"没演进"与"超预算"这两个真故障仍然拦得住。
-version: "2026.09.28-1"
+version: "2026.09.28-2"
 
 cases:
   # ==================================================== 工具选择与路由（5）
@@ -557,3 +557,132 @@ cases:
       "缺一整类信息"，`plan_extend` 走模型再加 3 步——两类的计数合起来
       才是"演进用了几次"，这正是 14.3 那句"避免执行阶段激进 +
       审查阶段再来一轮"要防的东西
+
+  - id: agent-loop-06
+    category: loop
+    # **反方向**：前面五条全是「SQL 空 → 补 RAG」。这一条是 RAG 先跑、
+    # 语料里没有这份制度（工具层 `NO_RELEVANT_KNOWLEDGE`）→ 补 SQL。
+    # 补证关系表（`state.COMPLEMENTS`）是两条边，只测一条边等于只测了一半，
+    # 而"另一条边再也不发生"没有任何症状——它只是安静地少了一种行为。
+    question: 根据《海外渠道管理办法》，海外渠道的开户流程是怎么规定的？
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [sql_query]
+    # 路由依赖意图判定（问法带"办法"是为了让模型判成 RAG），所以是观察用例
+    stability: model-dependent
+    proves: 补证关系的**两个方向都成立**。`reflect` 的判据是"某一路跑了但空、
+      而另一路没进过计划"——它对两路是对称的，这一条钉的是被前五条
+      掩盖掉的那一半
+
+  - id: agent-loop-07
+    category: loop
+    # 两路**一开始就都在计划里** → 没有可补的一路 → 一步都不演进。
+    # 与 agent-loop-01 恰好是同一个问题在两种判法下的样子：那条只调 SQL，
+    # 于是"SQL 空"触发了演进；这条两路都要，于是没有补的由头。
+    question: 2025年Q3华东的净销售额是多少，这个指标的口径制度上是怎么规定的？
+    expect_sources: [rag_retrieve, sql_query]
+    expect_plan_revision_max: 2
+    expect_max_steps: 10
+    proves: 22.10.2 的**抑制**一半：该补的那一路**已经在计划里**时不再补。
+      `missing_complement` 的判据是"已跑过的 && 不在计划里的"，两路都在时
+      它返回 None——这条钉的是那个 None 真的会发生（而不是每轮都补一遍）
+
+  - id: agent-loop-08
+    category: loop
+    # 跨源问题 + SQL 查空（2026 不在业务库范围内）。**两路都进过计划**，
+    # 所以确定性那一半不会补——演进只可能来自审查的 `retry_target=expand`。
+    question: 2026年华东的净销售额是多少，报告里对这块业务是怎么解释的？
+    expect_sources: [rag_retrieve, sql_query]
+    expect_plan_revision_max: 2
+    expect_max_steps: 12
+    expect_plan_records_consistent: true
+    proves: 终止性：**"某一路查空"本身不足以触发演进**——判据要的是
+      "还有一路没查过"。这一条与 agent-loop-01 只差"另一路在不在计划里"，
+      两者放在一起才说明 `reflect` 判的是计划而不是结果
+
+  - id: agent-loop-09
+    category: loop
+    question: 2026年电商渠道的净销售额是多少？
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [rag_retrieve]
+    # 22.10.3：`plan_deltas` 条数 == plan_revision，且 revision_no 连续无跳号。
+    # **它是不变量**（不知道会演进几次时照样成立），与 `expect_plan_delta_count`
+    # 那种"钉一个具体条数"互为补充
+    expect_plan_records_consistent: true
+    expect_max_steps: 10
+    proves: 换一个**维度**（渠道而不是区域/期间）时同一个机制仍然成立。
+      同时钉住变更史的**自洽**：`plan_revision` 说有 N 版，就必须有 N 条
+      记录、编号 1..N——两者不一致时复盘看到的是一份缺了一版的计划变更史，
+      而答案与步骤都正常，只有把两个数摆在一起才看得出来
+
+  - id: agent-loop-10
+    category: loop
+    question: 2026年智能家居产品线的净销售额是多少？
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [rag_retrieve]
+    expect_trigger_finding_linked: true
+    expect_max_steps: 10
+    proves: 再换一个维度（产品线）。**同一个机制在三条不同的数据路径上各验一次**，
+      防的是"某一条问题碰巧总能满足断言"——那正是固化清单存在的理由
+
+  - id: agent-loop-11
+    category: loop
+    # **早于语料范围的期间**（业务库从 2024-01-01 起），与 2026 那几条是同一种
+    # "查不到"，但走的是区间的另一头——下界。
+    question: 2023年华南地区的净销售额是多少？
+    expect_plan_revision_min: 1
+    expect_extended_tools_contain: [rag_retrieve]
+    expect_plan_records_consistent: true
+    proves: 区间的**下界**同样触发"查不到 → 补一路"。只测上界的话，
+      一个"只判 upper bound"的实现照样全绿——而它在下界上是瞎的
+
+  - id: agent-loop-12
+    category: loop
+    # **单源 + 查到数据 → 一步都不多跑**（与 agent-loop-02 同型，换区域与期间）。
+    question: 2025年Q1华南地区的净销售额是多少？
+    expect_sources: [sql_query]
+    # 真值 107,545,886.13 元（2025-01-01 ~ 2025-04-01，业务库现查）
+    expect_numbers: ["107545886.13"]
+    expect_plan_revision: 0
+    expect_plan_delta_count: 0
+    expect_extended_tools_contain: []
+    expect_max_steps: 2
+    proves: 过度下钻的**第二个采样点**。这一条同时钉住"答案里的数"——
+      不演进与答对是两件事，而"没多跑一步、数也对了"才是这个系统该有的样子
+
+  - id: agent-loop-13
+    category: loop
+    question: 2025年Q4华中地区的净销售额是多少，报告里对这块业务是怎么解释的？
+    expect_sources: [rag_retrieve, sql_query]
+    expect_plan_revision_max: 2
+    expect_plan_records_consistent: true
+    expect_max_steps: 12
+    expect_trigger_finding_linked: true
+    proves: 跨源问题在**数据齐备**时的样子：两路都查、都不空，演进只可能
+      来自审查。这条与 agent-loop-08 只差"数据在不在"，两者一起说明
+      演进是**由缺口驱动**的，不是"每轮都试着加一步"
+
+  - id: agent-loop-14
+    category: loop
+    # 澄清路径**不演进**（与 agent-loop-03 同型，换一个问法）。
+    question: 看一下那边的情况。
+    expect_clarification: true
+    expect_plan_revision: 0
+    expect_plan_delta_count: 0
+    expect_extended_tools_contain: []
+    expect_max_steps: 0
+    proves: |-
+      澄清路径上**一步都不该跑**。`expect_max_steps: 0` 是这里最硬的一条
+      ——澄清不产出步骤，于是"预算被悄悄花掉"或"澄清前先跑了两路"都会
+      立刻暴露，而它们在只看 `plan_revision` 时都是 0
+
+  - id: agent-loop-15
+    category: loop
+    # 预算共用（与 agent-loop-05 同型，换期间与区域）。
+    question: 2026年Q2西南地区的净销售额是多少？
+    expect_plan_revision_min: 1
+    expect_plan_revision_max: 2
+    expect_plan_records_consistent: true
+    expect_max_steps: 10
+    proves: 22.10.4 的预算隔离在**另一个采样点**上成立：确定性演进与审查的
+      `retry_target=expand` 共用同一份 `expansions_left`，两者之和不超过
+      配置值。⚠️ 上限钉的是 `LOOP__MAX_EXPANSIONS`，调大时要一起改

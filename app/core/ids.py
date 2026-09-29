@@ -39,6 +39,10 @@ class IdPrefix(StrEnum):
 
     USER = "usr"
     CONVERSATION = "cnv"
+    #: 会话里的一条消息（`agent_message`，16.4）。与 `tsk_` 分开是因为
+    #: **它们不是一对一**：`SYSTEM_NOTICE` 不一定由某个任务产生，
+    #: 而日志里 `tsk_xxx` 与 `msg_xxx` 混在一起时，前缀是唯一能一眼分开的东西。
+    MESSAGE = "msg"
     TASK = "tsk"
     TRACE = "trc"
     #: 工具调用与证据（Phase 4 起）。两者都是「答案为什么成立」的追溯入口，
@@ -134,6 +138,10 @@ def new_conversation_id() -> str:
 
 def new_task_id() -> str:
     return new_id(IdPrefix.TASK)
+
+
+def new_message_id() -> str:
+    return new_id(IdPrefix.MESSAGE)
 
 
 def new_trace_id() -> str:

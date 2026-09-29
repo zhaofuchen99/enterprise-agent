@@ -28,10 +28,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from app.agent.prompts.supervisor import SUPERVISOR_PROMPT
+from app.agent.prompts.supervisor import SUPERVISOR_PROMPT, render_context
 from app.agent.schemas.analysis import AnalysisResult
 from app.agent.schemas.plan import IntentResult, StepTool, TaskStep
-from app.agent.state import AgentState, Route
+from app.agent.state import AgentState, Route, current_question
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
 from app.domain.task import TaskStatus
@@ -47,6 +47,31 @@ _SOURCE_OBJECTIVE: dict[str, str] = {
     "rag": "从企业制度与报告知识库查出问题涉及的规定、口径或解释",
 }
 
+#: 会真的去跑工具的意图。**CLARIFICATION / UNSUPPORTED 不在其中**——
+#: 它们那一轮没有步骤，改写出来的是半截回话而不是问题。
+_EXECUTABLE_INTENTS: frozenset[str] = frozenset(
+    {"QUERY", "DIAGNOSIS", "POLICY_QA", "CROSS_SOURCE", "EXTERNAL_RESEARCH"}
+)
+
+
+def _resolved_query(state: AgentState, intent: IntentResult) -> str:
+    """本轮**实际用于检索与生成**的问题（FR-CHAT-003 的「解析后的问题」）。
+
+    从这一版起 `sanitized_query` 不再与 `user_query` 恒等：supervisor 跑在图的
+    最前面，它写下的值下游全都要用（`tool_nodes` / `analysis` / `reviewer` /
+    `plan_extend`）。**在这一版之前，下游读的都是 `user_query`**——
+    于是「那 Q2 呢」会被原样送进 SQL 生成器的 `业务问题：{question}`，
+    指标与区域一个都带不过去（它们只活在 `IntentResult` 的字段里，
+    而模板看不到那些字段）。
+
+    **`user_query` 保持不变**——它要落 `agent_task.query_text` 给人看，
+    "用户当时是怎么问的"是排查误答的第一个线索，覆盖掉就查不出来了。
+    """
+    resolved = (intent.resolved_question or "").strip()
+    if resolved and intent.intent in _EXECUTABLE_INTENTS:
+        return resolved
+    return current_question(state)
+
 
 def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable[[AgentState], Any]:
     """构造 supervisor 节点。
@@ -56,11 +81,18 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
     """
 
     async def supervisor(state: AgentState) -> dict[str, Any]:
-        question = state.get("sanitized_query") or state["user_query"]
+        question = current_question(state)
+        # 两份输入一次算好：下面**两处** `invoke_structured`（首调与重建）
+        # 必须拿同一份 kwargs。各写一遍的话，漏改的那一处只会在"模型第一次
+        # 输出非法"时走到——而那正是最难复现的一条路径。
+        variables: dict[str, Any] = {
+            "question": question,
+            "context": render_context(
+                state.get("context_summary"), max_chars=settings.memory.context_max_chars
+            ),
+        }
         try:
-            result = await gateway.invoke_structured(
-                SUPERVISOR_PROMPT, IntentResult, question=question
-            )
+            result = await gateway.invoke_structured(SUPERVISOR_PROMPT, IntentResult, **variables)
         except AgentError as exc:
             # **重建一次**（详设 8.3：「校验失败可让 Supervisor 重建一次，
             # 第二次失败返回 `PLAN_INVALID`」）。网关内部已经按 VALIDATION 类
@@ -72,12 +104,13 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
                 return _fail(exc)
             try:
                 result = await gateway.invoke_structured(
-                    SUPERVISOR_PROMPT, IntentResult, question=question
+                    SUPERVISOR_PROMPT, IntentResult, **variables
                 )
             except AgentError as retry_exc:
                 return _fail(retry_exc)
 
         intent = result.value
+        resolved = _resolved_query(state, intent)
         try:
             task_list = _plan(intent)
         except AgentError as exc:
@@ -97,6 +130,7 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
             return {
                 "intent": intent,
                 "task_list": [],
+                "sanitized_query": resolved,
                 "errors": [],
                 "analysis_result": _explain(intent),
                 "next_route": Route.ANALYSIS,
@@ -104,6 +138,7 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
         return {
             "intent": intent,
             "task_list": task_list,
+            "sanitized_query": resolved,
             "current_step_index": 0,
             "plan_revision": state.get("plan_revision", 0),
             # **三份预算是三份，不是一个**（FR-REV-002 业务规则 1：相互独立、

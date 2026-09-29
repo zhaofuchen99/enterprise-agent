@@ -25,11 +25,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, overload
 
-from app.domain.conversation import Conversation
+from app.domain.conversation import Conversation, Message
 from app.domain.knowledge import KnowledgeDocumentRecord
 from app.domain.task import Task
 from app.domain.user import User
-from app.infrastructure.models.identity import AgentConversation, AppUser
+from app.infrastructure.models.identity import AgentConversation, AgentMessage, AppUser
 from app.infrastructure.models.knowledge import KnowledgeDocument
 
 
@@ -194,6 +194,35 @@ def conversation_from_row(row: AgentConversation) -> Conversation:
     for name in _CONVERSATION_TIME_FIELDS:
         data[name] = from_db_time(data[name])
     return Conversation.model_validate(data)
+
+
+# ------------------------------------------------------------- 消息
+def message_to_row_values(message: Message) -> dict[str, Any]:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "task_id": message.task_id,
+        "role": message.role.value,
+        "content": message.content,
+        "status": message.status.value,
+        "token_count": message.token_count,
+        "created_at": to_db_time(message.created_at),
+    }
+
+
+def message_from_row(row: AgentMessage) -> Message:
+    return Message.model_validate(
+        {
+            "id": row.id,
+            "conversation_id": row.conversation_id,
+            "task_id": row.task_id,
+            "role": row.role,
+            "content": row.content,
+            "status": row.status,
+            "token_count": row.token_count,
+            "created_at": from_db_time(row.created_at),
+        }
+    )
 
 
 # --------------------------------------------------------- 知识文档版本

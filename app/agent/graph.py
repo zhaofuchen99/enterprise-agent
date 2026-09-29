@@ -63,6 +63,7 @@ from app.agent.schemas.plan import StepStatus
 from app.agent.state import AgentState, Route, pending_steps
 from app.agent.tracing import EventPublisher, traced
 from app.core.config import Settings
+from app.domain.memory import ConversationContext
 from app.domain.task import (
     PlanRevisionRecord,
     ReviewRecord,
@@ -381,19 +382,35 @@ class TaskGraph:
         self._rag_tool = rag_tool
         self._gateway = gateway
 
-    async def run(self, task: Task, *, permission_scope: Any) -> TaskOutcome:
+    async def run(
+        self,
+        task: Task,
+        *,
+        permission_scope: Any,
+        context: ConversationContext | None = None,
+    ) -> TaskOutcome:
         """跑一个任务，返回最终答案（Markdown）。
 
-        `permission_scope` **由调用方传入**而不是在这里从 `task.user_id` 查：
-        调用方（`_run_body`）已经持有仓储，而这一层不应该再依赖用户仓储——
-        它拿到一个 `PermissionScope` 就够跑图了。
+        `permission_scope` 与 `context` **都由调用方传入**而不是在这里查：
+        调用方（`build_task_body`）已经持有仓储，而这一层不应该再依赖它们——
+        它拿到一个范围、一份会话摘要就够跑图了。
+
+        `context` 是 FR-CHAT-003 的会话摘要（`None` = 首轮或没有历史）。
+        **不做成 `memory` 节点**：详设 7.1 说它由 `memory` 写入，而 6.1/6.2 的
+        节点清单里没有 `memory`；更重要的是它是**输入装配**而不是决策——
+        与 `permission_scope` 同性质，混进图里会让"图跑了几步"多出一跳，
+        而那一跳什么都不决定。
         """
         started = datetime.now(UTC)
         initial: AgentState = {
+            # 用户原话：**只用来给人看**（落 `agent_task.query_text`）。
             "user_query": task.query_text,
+            # 本轮问题：初值就是原话，supervisor 解析代词后会改写它。
+            # 下游一律读 `state.current_question()`，不直接读上面那个。
             "sanitized_query": task.query_text,
             "user_id": task.user_id,
             "conversation_id": task.conversation_id or "",
+            "context_summary": context,
             "task_id": task.id,
             "trace_id": task.trace_id,
             "permission_scope": permission_scope,
