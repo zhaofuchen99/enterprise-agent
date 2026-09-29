@@ -12,12 +12,12 @@ from typing import Any, cast
 
 import pytest
 
-from app.agent.schemas.plan import IntentResult, ProgressAssessment, TaskStep
+from app.agent.schemas.plan import IntentResult, ProgressAssessment, StepResult, TaskStep
 from app.agent.schemas.review import ReviewResult
-from app.agent.state import AgentState
+from app.agent.state import AgentState, Route
 from app.agent.tracing import traced
 from app.domain.events import TaskEventType
-from app.domain.task import TaskStatus
+from app.domain.task import TaskStatus, ToolCallRecord
 
 
 async def test_traced_emits_a_pair_of_events() -> None:
@@ -128,7 +128,10 @@ class _Recorder:
     """
 
     def __init__(self) -> None:
-        self.events: list[tuple[str, str | None, dict[str, object]]] = []
+        #: `(事件类型, node, data, step_id)`。**`step_id` 追加在末尾**：
+        #: 既有断言按索引取前几位（`events[-1][2]` 之类），插在中间会让它们
+        #: 以"取到别的字段"的方式红掉——与被测行为无关。
+        self.events: list[tuple[str, str | None, dict[str, object], str | None]] = []
 
     async def publish(
         self,
@@ -140,11 +143,11 @@ class _Recorder:
         node: str | None = None,
         step_id: str | None = None,
     ) -> None:
-        self.events.append((event_type.value, node, data or {}))
+        self.events.append((event_type.value, node, data or {}, step_id))
 
     @property
     def types(self) -> list[str]:
-        return [event_type for event_type, _node, _data in self.events]
+        return [event_type for event_type, _node, _data, _step in self.events]
 
 
 def _state(**extra: object) -> AgentState:
@@ -281,6 +284,139 @@ async def test_clarification_required_is_derived_from_the_supervisor_intent() ->
         "question": "您问的是哪个季度？",
         "missing_fields": ["time_range"],
     }
+
+
+async def test_tool_completed_is_derived_from_the_step_results() -> None:
+    """一次工具执行 → 一条 `tool.completed`（18.2），**判据是 `step_results` 的增量**。
+
+    工具名不在 `StepResult` 上，从 `task_list` 按 step_id 反查——那是 State 里
+    工具名的权威。这里同时钉住"它会落进轨迹"：`traced` 把工具轨迹拼在节点的
+    进/出事件之间，顺序即真实执行顺序，而落库的 `sequence` 按列表顺序分配（约定 52）。
+    """
+    recorder = _Recorder()
+    step = TaskStep(id="step_01", objective="查销售额", tool="sql_query")
+
+    async def node(state: AgentState) -> dict[str, object]:
+        return {
+            "step_results": {
+                "step_01": StepResult(
+                    step_id="step_01",
+                    status="SUCCEEDED",
+                    summary="返回 6 行区域汇总数据",
+                    duration_ms=386,
+                )
+            }
+        }
+
+    update = await traced("sql", node, recorder)(_state(task_list=[step], plan_revision=0))
+
+    assert recorder.types == ["node.started", "node.completed", "tool.completed"]
+    # data 的四个字段就是 18.2 的最小字段集（需求 7.4 的示例也是这四个）
+    assert recorder.events[-1][2] == {
+        "tool": "sql_query",
+        "status": "SUCCEEDED",
+        "summary": "返回 6 行区域汇总数据",
+        "duration_ms": 386,
+    }
+    # `step_id` 是 18.2 事件模型里与 `data` **同级**的字段，不是 data 的一项
+    assert recorder.events[-1][3] == "step_01"
+
+    traces = update["trace_events"]
+    assert [item.event_type for item in traces] == [
+        "node.started",
+        "tool.completed",
+        "node.completed",
+    ]
+    assert traces[0].tool is None
+    assert traces[1].tool == "sql_query"
+    assert traces[1].payload == {"summary": "返回 6 行区域汇总数据"}
+
+
+async def test_a_repaired_sql_still_emits_one_tool_completed() -> None:
+    """**一次工具执行 = 一条事件**，哪怕它内部修了两次。
+
+    SQL 自修复会让 `tool_calls` 出现三行（生成 → 修复 → 修复，每行一个
+    `attempt_no`），而 `tool.completed` 说的是"这次工具结束了"。判据取
+    `step_results`（键是 step_id、按键合并）而不是 `tool_calls`——否则订阅者
+    会以为工具跑了三次，而它只跑了一次、内部重试了两轮。
+    """
+    recorder = _Recorder()
+    step = TaskStep(id="step_01", objective="查销售额", tool="sql_query")
+    attempts = [
+        ToolCallRecord(step_id="step_01", tool_name="sql_query", attempt_no=n, status="SUCCEEDED")
+        for n in (1, 2, 3)
+    ]
+
+    async def node(state: AgentState) -> dict[str, object]:
+        return {
+            "tool_calls": attempts,
+            "step_results": {
+                "step_01": StepResult(
+                    step_id="step_01", status="SUCCEEDED", summary="命中 1 行", duration_ms=900
+                )
+            },
+        }
+
+    await traced("sql", node, recorder)(_state(task_list=[step], plan_revision=0))
+
+    assert recorder.types.count("tool.completed") == 1
+    # 耗时取**整次调用**的（900），不是某一次尝试的
+    assert recorder.events[-1][2]["duration_ms"] == 900
+
+
+async def test_a_node_that_runs_no_step_emits_no_tool_event() -> None:
+    """没产出 `step_results` 的节点不误报 `tool.completed`。
+
+    `reflect` / `analysis` / `reviewer` 都不跑工具。判据必须是"这次跑完了哪一步"，
+    不能写成"这是个节点、所以可能有工具"——后者会让每个节点都白带一条事件。
+    """
+    recorder = _Recorder()
+
+    async def node(state: AgentState) -> dict[str, object]:
+        return {"final_answer": "答"}
+
+    await traced("analysis", node, recorder)(_state())
+
+    assert recorder.types == ["node.started", "node.completed"]
+
+
+async def test_task_retrying_is_derived_from_the_retry_router_update() -> None:
+    """`task.retrying`（18.2）：合法重试时报一次，data 是 target / reason_code / attempt。
+
+    判据是 `retry_route` 与 `retry_attempt` **同时**被这次更新写入——
+    那是"真的路由出去了"才有的形态（见 `_derived_events` 那条注释）。
+    """
+    recorder = _Recorder()
+    review = ReviewResult(status="RETRY", score=60, reason_code="CLAIM_WITHOUT_EVIDENCE")
+
+    async def node(state: AgentState) -> dict[str, object]:
+        return {"retry_route": Route.RAG, "retry_attempt": 1}
+
+    await traced("retry_router", node, recorder)(_state(review_result=review))
+
+    assert recorder.types == ["node.started", "node.completed", "task.retrying"]
+    assert recorder.events[-1][2] == {
+        "target": "rag",
+        "reason_code": "CLAIM_WITHOUT_EVIDENCE",
+        "attempt": 1,
+    }
+
+
+async def test_a_retry_that_degrades_emits_no_task_retrying() -> None:
+    """预算耗尽后的**降级**不是一次重试，不发 `task.retrying`。
+
+    那时 `retry_router` 写的是 `retry_route=None`（并把审查结论改成 CLARIFY/FAIL）。
+    只看"经过了这个节点"是分不开两者的——降级同样经过它。分不开的后果是
+    订阅者看到一次并不存在的重试，而真实的处置是"放弃补证"。
+    """
+    recorder = _Recorder()
+
+    async def node(state: AgentState) -> dict[str, object]:
+        return {"retry_route": None}
+
+    await traced("retry_router", node, recorder)(_state())
+
+    assert recorder.types == ["node.started", "node.completed"]
 
 
 async def test_without_a_bus_nothing_is_published() -> None:

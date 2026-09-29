@@ -81,6 +81,10 @@ class FakeJobQueue:
     async def is_pending(self, task_id: str) -> bool:
         return task_id in self.present
 
+    async def depth(self) -> int:
+        # 真实实现数的是 ZSET 基数，这里数的是同一个概念（"在队列里"的那个集合）
+        return len(self.present)
+
     async def aclose(self) -> None:
         self.closed = True
 

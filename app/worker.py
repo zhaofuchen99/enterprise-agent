@@ -49,6 +49,7 @@ from app.infrastructure.observability import (
     restore_trace_context,
     setup_error_tracking,
     setup_observability,
+    shutdown_observability,
 )
 from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
 from app.infrastructure.redis import RedisKey, create_client
@@ -264,6 +265,11 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
     两条路径都必须存在，少一条就会留下永远停在 RUNNING 的任务。
     """
     logger.info("worker 正在退出，等待在跑任务结束", extra={"status": ctx.get("worker_id")})
+    # OTel 收尾**放最前面**：它要 flush 还没导出的 span 与指标，而下面几步
+    # 会把它们的落点先关掉。它也清空模块级单例——`run_forever` 的重启外壳
+    # 会再走一遍 `on_startup`，不清的话那一次命中的是"已初始化 → 提前返回"，
+    # 而 provider 已经关掉了（见 `observability.shutdown_observability`）
+    shutdown_observability()
     queue: ArqJobQueue | None = ctx.get("queue")
     if queue is not None:
         await queue.aclose()

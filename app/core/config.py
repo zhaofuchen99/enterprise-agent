@@ -352,6 +352,40 @@ class WorkerTuning(BaseModel):
     #: 收到停机信号后等多久再中断在跑任务。取 0 会让 `Ctrl-C` 立刻打断任务，
     #: 任务停在 RUNNING 只能等孤儿回收；取 task_timeout 则本地开发要等太久。
     shutdown_grace_seconds: int = Field(default=10, ge=0, le=600)
+    #: 队列深度超过它即视为积压（详细设计 19.5 的 `queue_backlog_threshold`）。
+    #: 19.4.3 明写队列深度是"分层架构下唯一能提前发现故障的信号"之一，
+    #: 而一个只有数字没有阈值的信号要靠人一直盯着——阈值是**告警**存在的前提。
+    #: 它只用于记日志与计数，**不参与 `/health/ready`**：把"消费能力下降"
+    #: 报成"实例不可用"会让编排层摘掉实例，而那恰恰是最不该做的事
+    #: （同限流降级时 `/health/ready` 返回 200 + degraded 的理由）。
+    queue_backlog_threshold: int = Field(default=200, ge=1, le=100_000)
+
+
+class ObservabilitySettings(BaseModel):
+    """可观测数据的导出与折算参数（详细设计 19.4.2 / 19.4.3）。
+
+    环境变量覆盖方式：`OBSERVABILITY__METRICS_ENABLED=true`。
+
+    **为什么不与扁平的 `OTEL_ENABLED` / `OTLP_ENDPOINT` 合成一段**：那几个决定
+    "要不要接后端"（进程级，接不接系统都照跑），这里决定"接上之后导什么、
+    按什么单价折算"（数据级）。**单价的归属**尤其要讲清：它只服务工程追踪层，
+    不是模型网关的业务参数——混进 `MODEL__*` 段会让人以为它会影响调用行为。
+    """
+
+    #: 指标开关。**与 `OTEL_ENABLED` 分开**：trace 有采样率可调小，
+    #: 而指标是聚合的、没有采样这一说；开发时也可能只想开其中一个。
+    metrics_enabled: bool = True
+    #: 导出周期。OTel 默认 60s，显式写出来是为了让它可调
+    #: （本地验证时不必等满一分钟）。
+    metric_export_interval_ms: int = Field(default=60_000, ge=1_000, le=600_000)
+    #: 队列深度的采样周期。`ObservableGauge` 是**采集时回调取值**的，
+    #: 得有人定期把值喂给它（见 `infrastructure/observability.set_queue_depth`）。
+    queue_depth_interval_seconds: int = Field(default=15, ge=5, le=300)
+    #: 模型单价（每百万 token）。**0 表示未配置**——那时只记 token 计数、
+    #: 不记成本。把"不知道单价"记成"成本为 0"是拿一个假值冒充事实，
+    #: 而它在报表上完全看不出来（同"引用拿不到就留空、不填 0"的取舍）。
+    model_prompt_price_per_million: float = Field(default=0.0, ge=0.0, le=10_000.0)
+    model_completion_price_per_million: float = Field(default=0.0, ge=0.0, le=10_000.0)
 
 
 class Settings(BaseSettings):
@@ -491,8 +525,13 @@ class Settings(BaseSettings):
     #: 进程角色（api / worker）**不是配置项**，见 infrastructure/logging.py
     otel_enabled: bool = False
     otlp_endpoint: str | None = None
+    #: **只作用于 trace**：指标是聚合量，没有"采样一部分"这种形态。
+    #: 指标的开关在 `observability.metrics_enabled`（19.4.3）。
     otel_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     sentry_dsn: str | None = None
+    #: 指标的导出与折算参数。**与上面几个分开**：那几个是"接不接后端"，
+    #: 这一段是"接上之后导什么、按什么单价折算"（见那个类的 docstring）
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     # ------------------------------------------------------------------ 外部搜索
     search_enabled: bool = False

@@ -293,6 +293,54 @@ async def test_trace_events_keep_the_execution_order(
     assert rows[0].created_at == datetime(2026, 9, 18, tzinfo=UTC)
 
 
+async def test_tool_events_round_trip_and_can_be_filtered_out(
+    make_repo: Callable[[], AgentArtifactRepository],
+) -> None:
+    """`tool` / `summary` 能落库读回，且 `include_tools=false` 滤得掉它们。
+
+    **两个实现必须给出同一个结论**——这是契约测试存在的理由：SQL 侧比的是
+    `tool IS NULL`，内存侧比的是 `not item.tool`。判据一旦不一致，症状是
+    "这个过滤只在连库时生效"，而单测全绿。
+    """
+    repo = make_repo()
+    await repo.save(
+        _TASK,
+        trace_id="trc_0000000000000000000001",
+        trace_events=[
+            _trace("sql", "node.started"),
+            NodeTrace(
+                node="sql",
+                tool="sql_query",
+                event_type="tool.completed",
+                status="SUCCEEDED",
+                duration_ms=386,
+                payload={"summary": "返回 6 行区域汇总数据"},
+                created_at=datetime(2026, 9, 18, tzinfo=UTC),
+            ),
+            _trace("sql", "node.completed", duration=400),
+        ],
+    )
+
+    everything = await repo.list_trace_events(_TASK)
+
+    assert [item.event_type for item in everything] == [
+        "node.started",
+        "tool.completed",
+        "node.completed",
+    ]
+    assert everything[1].tool == "sql_query"
+    assert everything[1].payload == {"summary": "返回 6 行区域汇总数据"}
+
+    nodes_only = await repo.list_trace_events(_TASK, include_tools=False)
+
+    assert [item.event_type for item in nodes_only] == ["node.started", "node.completed"]
+    assert all(item.tool is None for item in nodes_only)
+    # **序号保持不变**：过滤发生在查询层，不是"取回来再筛并重新编号"。
+    # 重编号会让客户端的增量游标（`after_sequence`）错位，而症状是
+    # "重连之后少了一段事件"——那是静默的
+    assert [item.sequence for item in nodes_only] == [1, 3]
+
+
 async def test_after_sequence_is_strictly_greater(
     make_repo: Callable[[], AgentArtifactRepository],
 ) -> None:

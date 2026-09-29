@@ -111,6 +111,12 @@ class TraceEventData(BaseModel):
     字段名与 17.4 的示例逐字一致（`type` / `node` / `status` / `timestamp`）。
     **`type` 而不是 `event_type`**：这是给客户端解析的契约，
     改名的代价是前端静默拿不到事件类型。
+
+    `tool` / `summary` 是**工具级事件**才有的两个字段——17.4 的示例举的是
+    节点级事件，所以原文里没有它们。工具级事件因此可以从两处认出来
+    （`type == "tool.completed"` 与 `tool` 非空），**两条都留着不是冗余**：
+    前者是读的人看的，后者是过滤条件依赖的（见 `list_trace_events` 的
+    `include_tools`，它比的就是 `tool` 是否为空）。
     """
 
     sequence: int
@@ -119,6 +125,10 @@ class TraceEventData(BaseModel):
     status: str
     duration_ms: int | None = None
     timestamp: datetime
+    #: 产生这条事件的工具（`sql` / `rag`）。**节点级事件为空**
+    tool: str | None = None
+    #: 工具结果的脱敏摘要（`_clip` 过，≤240 字）。节点级事件为空
+    summary: str | None = None
 
 
 class TaskTraceData(BaseModel):

@@ -152,7 +152,17 @@ def build_retry_router_node() -> Callable[[AgentState], dict[str, Any]]:
                 update["review_result"] = _degrade(review)
             return update
 
-        update = {"retry_route": route}
+        # **在这里统一 +1，不在下面几个分支里各写一遍**：REPLAN 与 EXPAND 都
+        # 会提前 return（14.4 要求它们不扣 `review_retries_left`），写在下面
+        # 会漏掉那两条路——而漏掉的表现是"某类重试的 attempt 永远不增"。
+        update = {
+            "retry_route": route,
+            # 18.2 的 `task.retrying.attempt`：**本任务第几次合法重试**。
+            # 它与四类预算正交——预算答"还能不能重试"，它答"这是第几次"。
+            # **不从预算反推**：`expansions_left` 同时被 `reflect` 的
+            # 计划演进正常路径消耗（那不是重试），减出来的会把那些算进来
+            "retry_attempt": state.get("retry_attempt", 0) + 1,
+        }
         if route is Route.REPLAN:
             # **作废整份计划**：留空列表让 supervisor 重新规划。
             # 已经跑过的 `step_results` 不清——它们是"已经知道的事实"，

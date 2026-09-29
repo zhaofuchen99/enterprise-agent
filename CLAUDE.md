@@ -28,6 +28,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**14.1 的第二阶段（结构化模型审查）也接上了**（2026-09-27 晚）：四条判断落成结构化输出，issue 的 code **由代码从布尔推出来**（模型不写自由文本 code），**一律 WARNING——模型不能独自把答案拦下**（见约定 105）。`CLARIFY` 从此有了产出者。**2026-09-28 补上 `plan_extend`（计划演进）**：详设 6.1 的 `reflect -> plan_extend -> dispatch` 那条回边补齐，`retry_router` 的 `expand` 分支从此有落点——14.4 路由表里那一行**不再是"能路由但没人接"**。`plan_deltas` / `plan_revision` / `trigger_finding_id` 三样第一次有了生产者，`agent_plan_revision` 表（建表起一直空着）接上了写入方，`agent_task_step.origin` 能分出 `EXTENDED`。**循环类评测（`任务循环与自适应下钻` 5 条）随之可写**，见 Phase 13。**仍未做**：`WAITING_CLARIFICATION` 状态位、`retry_target=replan` 的产出者（模型审查的四个布尔里没有哪个问的是"计划本身不可执行"）——已登记 |
 | **多轮追问**（FR-CHAT-003 会话内短期记忆） | ✅ 完成（2026-09-28） | 冲刺方案 §7 **明确拒绝砍掉**的那条需求，此前**零实现**：`agent_message` 表从 Phase 2 建好起没有任何写入方，`AgentState.context_summary` 是个从没被填过的占位字段。本次交付：**`Message` 领域对象 + `MessageRepository`**（Protocol/内存/SQL 三份，`agent_message` 第一次被真的读写）、**`ConversationContext`**（详设 15.1 的五字段，`app/domain/memory.py` 的纯函数 `group_turns` / `build_conversation_context`）、**`ConversationService`**（用户消息在 `create_task` 写、助手消息在 `_finish_succeeded` 写，落库失败吞异常但记 `memory.record_failed`）、**上下文进图**（`load_conversation_context` 读最近 10 轮 + 各任务口径 → `supervisor` 的 `{context}`，prompt 升 `1.1.0`）、**`IntentResult.resolved_question`**（代词解析后的问题，FR-CHAT-003 的"输出：解析后的问题"）+ **`current_question()` 收口**（下游四处从读 `user_query` 改为读本轮问题——**不换的话「那 Q2 呢」会被原样送进 SQL 生成器**，见约定 112）。**实测三连问**（2026-09-28，`make demo ONLY=demo-memory-followup` 3/3）：「2025年Q3华东地区的净销售额是多少？」→「那Q2呢？」→「和去年比呢？」——第 2 轮解析成「2025年Q2华东地区的净销售额是多少」（区域继承、期间换掉，答案 127,576,714.27 与 `demo-sql-q2` 的真值一致），第 3 轮 `comparison=YOY`。**它跑第一轮就发现一个真缺陷**：同一条问题另一次跑生成了**绑定参数错**的 SQL（"2024年Q2"实际求 2024-04~2025-04，差 4 倍还给出同比 −74.43% 的结论），SQL 语法与白名单全过、只有区间错——见约定 117。**未做**：写 `agent_conversation.context_summary_json`（避免第二份真相）、`metric_definitions` 填充（需指标目录跨层注入）、失败/取消也写 `SYSTEM_NOTICE`、`token_count` 真实计量、多轮类进 golden 评测集、会话列表/删除 API 与 180 天清理——已登记。**同日全量回归**：`make check` **979 单测** + `make test-integration` **121** 全绿；`make demo` 稳定 **7/7** + 观察 **5/5**（多轮那条占 3 轮）；`make eval-agent` 稳定 **23/24 = 96%**、观察 1/1——**唯一那条红是审查器的门禁误报，不是本次改动引起的**（见约定 118）。⚠️ 回归前按约定 100 **重启了 `make run`** |
+| **可观测性补齐**（19.4.3 指标 + 工具级轨迹 + `task.retrying`） | ✅ 完成（2026-09-29） | 19.4.3 的指标**全接**：`observability.py` 有了 meter（`counter` / `histogram` / `up_down_counter` / **幂等** `MeterProvider` / `shutdown_observability`），`docker-compose.dev.yml` 加了 `ea-otel-collector`（debug exporter 打 stdout，不引 Prometheus/Grafana——19.4.3 只要求"被采集"）。**`agent_trace_event.tool` 不再恒为 NULL**、`/trace` 有了 17.4 的 `include_tools`（默认**开**）、`tool.completed` 与 `task.retrying` 两个事件第一次有了生产者。**实测一条真任务**：collector 收到九个新指标（`agent.node.duration` / `agent.task.{finished,duration,queue_wait}` / `agent.tool.calls` / `agent.sql.attempts` / `agent.review.verdicts` / `llm.tokens` / `agent.queue.depth`），`llm.cost` **正确缺席**（单价未配是"未计量"不是"零成本"，约定 126）；`/trace` 17 条含 1 条工具级、`?include_tools=false` 16 条含 0 条。⚠️ **它跑第一轮就抓到一个自 Phase 1.5 起就存在的真缺陷**：`OTLP_ENDPOINT` 被当完整 URL 用，而 `OTLPSpanExporter(endpoint=...)` **不会**替你补 `/v1/traces` —— 导出恒 404，而 `OTEL_ENABLED=false` 时完全看不出来（**见约定 122**）。`make check` **1013** + 集成 **122** 全绿。**未做**：`agent_message.token_count`（19.4.2 的红线，见约定 126）、`answer.delta`、SSE 侧 `tool.completed` 的端到端断言（派生逻辑有单测，流那一段没单独跑） |
 | 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
 | 13 评测（**40 题口径**，切片内**五类**） | ✅ 完成（2026-09-28 循环类补到 15） | **Agent 端到端评测集 35 条**（`configs/eval_agent_golden.yaml` + `make eval-agent`）：Tool选择 5 / Conflict 5 / Reviewer 5 / 异常澄清 5 / **任务循环 15**（详设 22.10.5 要求"至少 15 条"，本次补齐）。**同日全量实测（35 条）：稳定 33/33 = 100%、观察 1/2、无未判定、无 FAIL**——观察那两条是 `agent-clarify-03`（这一轮判了 `refused=false`）与 `agent-loop-06`（反方向演进，一次通过）；分类 工具选择 5/5、冲突 5/5、审查 5/5、澄清 4/5、**循环 15/15**——10 条新用例一次通过，含**反方向演进**（RAG 空 → 补 SQL）、**抑制**（该补的一路已在计划里 → 一步不动）、**变更史自洽**（新增 `expect_plan_records_consistent`：`plan_deltas` 条数 == `plan_revision` 且 `revision_no` 连续）、**澄清路径 `expect_max_steps: 0`**。**「异常恢复与重试」这一类没写**，理由是它没有稳定触发面（见约定 121）。**6.10 的门禁「缺陷答案阻断召回率 ≥ 90%」已落地**——在**组件层**（`app/tests/agent/test_reviewer_gate.py`，8 条必拦缺陷 100% 阻断 + 3 条不该拦的放行 + 一条把**盲区写死的断言**），见约定 120。判据与 `make demo` **共用一份**（`scripts/agent_harness.py`），避免"演示判对、评测判错"；加上既有 SQL 10 + RAG 20 = **65 条**。**走 HTTP**（HTTP → 限流 → 队列 → Worker → 图 → 查详情），组件层测不到的就是这一层。**未判定单独计数且计入分母**（排除的话，系统大面积失败时通过率反而上升）；观察用例不进门禁。⚠️ 基线仍是 85%（未随分母重定，理由写在 `eval_agent._DEFAULT_BASELINE` 的注释里）。⚠️ 它跑第一轮就发现过三个真缺陷（冲突检测的**时间粒度**与**维度比较单向**、**语料生成器的明细表漏传报告自身的范围**，实测报出 157%–1133% / 499% / 占比 187.4%），**2026-09-27 全部修掉**（见约定 93/97/98/99）；2026-09-28 又发现并修掉了审查器的一处门禁误报（约定 118）。⚠️ 每次跑之前**重启 `make run`**——见约定 100 |
@@ -1119,6 +1120,86 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     可控的 RETRY**（比如给 `AnalysisResult` 开一个只用于测试的注入点，
     或把 `LOOP__MAX_REVIEWER_EVIDENCE` 做成按任务可覆盖）——已登记。
 
+### 可观测性补齐（19.4.3）期间新立的临时约定
+
+122. **`OTLP_ENDPOINT` 是 base URL，两个 exporter 各自补自己的路径**——这不是风格问题，
+    是一个**从 Phase 1.5 潜伏到 2026-09-29 的真缺陷**，端到端验证时抓到。
+    `OTLPSpanExporter(endpoint=...)` 收的是**完整 URL**，它**不会**替你补 `/v1/traces`；
+    会替调用方补路径的是**环境变量** `OTEL_EXPORTER_OTLP_ENDPOINT` 那条路，而本实现走的是参数。
+    于是 `OTLP_ENDPOINT=http://127.0.0.1:4318` 会 POST 到根路径 → **恒 404**
+    （实测：`/` → 404、`/v1/traces` → 200）。
+
+    **为什么这么久没被发现**：`OTEL_ENABLED=false` 是默认值，而导出失败**只影响观测**——
+    任务照跑、答案照出、演示照过，错误只躺在应用日志的一角
+    （`Failed to export span batch code: 404`）。这是"接了后端却什么都看不到"的典型形态。
+    修法是 `observability._otlp_endpoint(base, path)`。
+    ⚠️ **新增任何 OTLP exporter 都要经过它**：漏掉的那个静默 404，而它看起来与
+    "后端没起来"一模一样。
+
+123. **工具级事件从 `update["step_results"]` 派生**，不从 `tool_calls`、也不在工具节点里显式发
+    （`tracing._tool_completed`）。三条理由是同一个取舍的三个面：
+    - **不从 `tool_calls`**：它按 attempt 拆开（SQL 自修复时一次执行产三行），而
+      `tool.completed` 的语义是"**一次工具结束**"——一条。从它派生会让订阅者以为工具跑了三次。
+    - **不在节点里显式发**：那得先把 `traced` 的返回值改成合并（否则节点放进去的
+      `trace_events` 被**静默覆盖**），而**开了这个口子就退化了「包装器是唯一埋点出口」**
+      那条结构性保证（约定 54 的立足点）。包装器里现在**保留**了那个合并分支
+      （`update.get("trace_events")`）作为防御，但主路径不依赖它。
+    - **`step_results` 天然满足**：键是 step_id、由 `merge_step_results` 按键合并，
+      "这次更新里有几个键"恰好等于"这次跑完了几步"；判据仍是 State 契约
+      （"这次更新里有没有那个字段"），与 `_derived_events` 其余五条同构。
+
+    **一个函数产出两种表示**（轨迹行 + SSE 事件 data）：两者说的是同一件事，
+    分成两个函数写必然漂移，而漂移的症状是"轨迹里有、流里没有"。工具名从 `task_list`
+    按 step_id 反查，**反查不到也照发**（`tool=None`）——宁可留一条字段缺失的事件，
+    也不静默丢掉一条（轨迹是权威，"哪一步慢"整段读不出来比读到一条不完整严重）。
+
+124. **`task.retrying.attempt` 是独立的递增计数器，不从预算反推**
+    （`AgentState.retry_attempt`，`retry_router` 在真的路由出去时 +1）。
+    - **不能从"预算初值 − 剩余"反推**：`retry_router` 手上没有 `settings`
+      （`build_retry_router_node()` 无参）；更要命的是 **`expansions_left` 同时被
+      `reflect` 的计划演进正常路径消耗**（那不是重试），减出来会把正常演进算成重试
+      ——这条无法靠换个组合方式绕开。
+    - **不能用 `ReviewRecord.round_no`**：它是落库期字段、不在 State 里，且现在恒为 1。
+    - **+1 写在三个分支之前**：`REPLAN` 与 `EXPAND` 都会提前 return，写在后面会漏掉
+      那两条路——症状是"某类重试的 attempt 永远不增"。
+    - **降级不计数**：预算耗尽时 `retry_route=None`，没有发生重试这件事。
+      `_derived_events` 的判据因此是"`retry_route` 与 `retry_attempt` **同时**被写入"。
+
+125. **MeterProvider 的幂等守卫与 `shutdown_observability` 必须成对**。两个方向都验过：
+    - **不幂等**：`worker.run_forever` 在依赖抖动时先 `on_shutdown` 再 `on_startup`，
+      每轮重启叠加一个 `BatchSpanProcessor` 与一个 `PeriodicExportingMetricReader`
+      ——导出量随重启次数线性增长，而没有任何报错。
+    - **shutdown 后不清空单例**：下一次 setup 命中"已初始化 → 提前返回"，而 provider
+      **已经关掉了** → span 与指标**永久静默**。这比重复叠加更难发现（叠加至少还导出得出东西），
+      所以 `shutdown_observability` 末尾那三行清空是承重的。
+
+    顺带：**仪表缓存（`_instruments`）在 provider 换了之后必须清**（两处各清一次：
+    装上真 provider 之后、`reset_for_testing`）。缓存键里没有 provider 的身份，
+    在 setup 之前创建的仪表会被永久绑在 no-op meter 上——症状是"指标代码明明在跑，
+    后端一条都收不到"，而调用点完全正常。
+
+126. **token 与成本只进工程追踪层，`agent_message.token_count` 因此仍然不填**
+    （19.4.2 的红线原话是"禁止通过任何产品接口返回"）。`agent_message` 是产品数据
+    （经会话历史出口、保留 180 天），token 属工程追踪层——填它就是让工程层数据
+    穿两跳透到产品层（网关 → 任务产出 → 消息表）。这与登记里"填一个估算值会让它
+    看起来是被计量过的"结论相同，但依据更硬：**不是"值不准"，是这条数据通路本身不该存在**。
+    落点是 `model_gateway._record_usage`——**它是 `TokenUsage` 的唯一出口**。
+
+    ⚠️ **单价未配置（0）时不记 `llm.cost`**，只记 `llm.tokens`：记一条 `cost=0` 是把
+    "不知道单价"写成"免费"，而它在任何报表上都看不出来（同约定 59 的取舍）。
+    币种口径也如实记下：单位标签是 `{usd}`，**实际币种由配置的单价决定**。
+
+127. **队列深度的抽样放在 API 进程，不放 Worker 的 cron**（`main._sample_queue_depth`）。
+    理由只有一条：**Worker 全挂时队列深度才会涨，而那一刻 Worker 的定时任务恰好也不跑了**
+    ——最需要这个信号的时刻它缺席。代价如实记下：多副本 API 会各导一份（当前是单 API + 单 Worker）。
+    另外 `ObservableGauge` 的回调**是同步的**（OTel 在导出线程里调它），
+    不能在回调里 await 一次 `ZCARD`——取值的活儿因此落在这个循环上
+    （`set_queue_depth` 写模块级值，回调只读它）。
+
+    `WORKER__QUEUE_BACKLOG_THRESHOLD` **只用于记日志与计数，不参与 `/health/ready`**：
+    把"消费能力下降"报成"实例不可用"会让编排层摘掉实例，而那恰恰是最不该做的事
+    （同限流降级时返回 200 + degraded 的取舍）。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -1169,7 +1250,9 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **写 `agent_conversation.context_summary_json`**：详设 15.1 指定的落点，本次**不写**——加载器每次都从消息 + 任务现算，写它会造出**第二份真相**（两份不一致时只会静默漂移）。要写就得先回答"谁是权威"（见约定 114）。⚠️ `_mapping.py` 至今**根本没映射这一列** | 需要时 |
 | **`ConversationContext.metric_definitions` 恒空**：要填它需要指标目录，而目录活在 `app/tools/sql`——为这一个字段把 tools 层拖进 API 进程的装配链不合算。空列表的语义是"本轮没有注入口径定义"，不是"没有口径" | 需要时 |
 | **失败 / 取消的轮次不写任何消息**（本次只写 USER + 成功的 ASSISTANT）。要写就写一条 `SYSTEM_NOTICE`——`role` 的三个取值里正是为它留的位置 | 需要时 |
-| **`agent_message.token_count` 恒空**：网关的用量统计还没接进这条链路，填一个估算值会让"这条消息花了多少"看起来是被计量过的 | Phase 11「节点埋点」 |
+| ~~**`agent_message.token_count` 恒空**~~ **已决议：不填**（2026-09-29）。依据是 19.4.2 的红线——token 与成本属工程追踪层、**禁止经产品接口返回**，而这一列随会话历史对外可读。**不是"值不准"，是这条数据通路本身不该存在**（见约定 126）。用量已经进了 `llm.tokens` 指标 | ✅ 本次 |
+| **`tool.started` 事件**：详设 10.x（9.3 的七步流程第 2 步）写了"记录 `tool.started` 轨迹和 SSE"，而 **18.2 的事件清单与需求 7.3 的清单里都只有 `tool.completed`**——文档内部不一致，按"清单优先"处理。依据不只是"清单更长"：本实现的 Tool 在节点内**原子执行**，两个事件会由同一行代码前后隔几微秒发出、成为**没有区间的噪声事件**；而"进了工具所在节点还没出来"这件事已经由 `node.started` 表达了。派生点相同，要补是加一行的事 | 需要时 |
+| **SSE 侧 `tool.completed` 的端到端断言**：本次只验了 `/trace`（工具级事件确实落了库、带 tool 与 summary），走 Redis 流那条路没单独跑。派生逻辑是同一条（`_derived_events`），所以缺的是验证不是实现 | 需要时 |
 | **多轮类进 `eval_agent_golden.yaml`**：本次只落在 `make demo`（见约定 115）。要进评测集得同时改 `CATEGORIES` / `_EXPECTED_PER_CATEGORY` 与重定基线 | 下一项 |
 | **`WAITING_CLARIFICATION` 续跑**（详设 15.2 的 `parent_task_id`）：用户补充后新建 task 并复用原计划摘要，是**另一片**（要动任务终态与 API/SSE 侧）。会话内短期记忆不含它 | 需要时 |
 | 会话列表 / 删除 API 与 180 天保留期清理（`make cleanup` 仍是占位实现）。`agent_message.deleted_at` 的过滤**已经写好并有集成用例钉着**，只是还没有生产者 | Phase 12 / 需要时 |
@@ -1255,7 +1338,7 @@ api  →  services  →  agent / domain / tools  →  repositories / infrastruct
 
 ```bash
 make bootstrap   # 首次：生成 .env + 装依赖
-make up          # 起 redis / agent-mysql / business-mysql / minio
+make up          # 起 redis / agent-mysql / business-mysql / qdrant / minio / otel-collector
 make run         # 同时起 api + worker  ← 本地开发必须用这个，不要只跑 make api
 make check       # 提交前必跑：ruff + mypy + 分层约束 + pytest
 make migrate     # 迁移 agent 运行库到最新（前置 make up）

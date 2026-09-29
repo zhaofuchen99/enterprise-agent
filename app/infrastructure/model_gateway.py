@@ -61,7 +61,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
-from app.infrastructure.observability import span
+from app.infrastructure.observability import counter, span
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,39 @@ class StructuredResult[T: BaseModel](BaseModel):
     prompt_version: str
     duration_ms: int
     attempts: int
+
+
+def _record_usage(usage: TokenUsage, model: str, settings: Settings) -> None:
+    """把一次调用的 token 与成本记进指标（19.4.3）。
+
+    **这里是 `TokenUsage` 的唯一出口。** 19.4.2 把 token 与成本划进
+    「工程追踪层」，并明写它**禁止通过任何产品接口返回**——所以它只进指标与
+    span，不进 State、不进 `TaskOutcome`、不进任何响应体。`StructuredResult`
+    连用量一起返回，是为了让埋点取得到它，而不是让它一路漂到 API 上去。
+
+    **成本只在配了单价时记**：单价为 0（未配置）时只记 token 计数。
+    把"不知道单价"记成"成本为 0"是拿假值冒充事实，而它在报表上完全看不出来
+    ——同"引用拿不到就留空、不填 0"的取舍。
+
+    ⚠️ 两个币种口径如实记下：`{usd}` 只是单位标签，**换算率由配置的单价决定**
+    ——填人民币单价进来，这个数就是人民币。指标系统不该替使用者假定币种，
+    而猜错的代价是"成本"这个数在跨团队对比时静默错一个汇率。
+    """
+    counter("llm.tokens", unit="{token}", description="模型 token 用量").add(
+        usage.prompt_tokens, {"kind": "prompt", "model": model}
+    )
+    counter("llm.tokens", unit="{token}", description="模型 token 用量").add(
+        usage.completion_tokens, {"kind": "completion", "model": model}
+    )
+    prompt_price = settings.observability.model_prompt_price_per_million
+    completion_price = settings.observability.model_completion_price_per_million
+    if prompt_price <= 0 and completion_price <= 0:
+        return
+    counter("llm.cost", unit="{usd}", description="模型调用成本（按配置单价折算）").add(
+        (usage.prompt_tokens * prompt_price + usage.completion_tokens * completion_price)
+        / 1_000_000,
+        {"model": model},
+    )
 
 
 class PromptSource(Protocol):
@@ -381,6 +414,7 @@ class HttpModelGateway:
                     current.set_attribute("llm.prompt_tokens", usage.prompt_tokens)
                     current.set_attribute("llm.completion_tokens", usage.completion_tokens)
                     current.set_attribute("llm.duration_ms", duration_ms)
+                    _record_usage(usage, self._model, self._settings)
                     return StructuredResult[T](
                         value=value,
                         usage=usage,

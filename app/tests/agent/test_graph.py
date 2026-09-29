@@ -706,7 +706,10 @@ async def test_every_node_leaves_a_started_and_a_leave_event(settings: Settings)
 
     events = state["trace_events"]
     started = [event for event in events if event.event_type == "node.started"]
-    leaves = [event for event in events if event.event_type != "node.started"]
+    # **按类型取，不按"非 started 的即是离开"取**：这张表现在还装载工具级事件
+    # （`tool.completed`），把后者混进 `leaves` 会让断言挂在一条"某次工具结束"
+    # 的事件上——它压根不是节点事件
+    leaves = [event for event in events if event.event_type in {"node.completed", "node.failed"}]
     # 简单查询的路径：
     # supervisor → sql → reflect → conflict → analysis → reviewer → retry_router → final
     # （`conflict` / `reviewer` / `retry_router` 都是确定性节点，同样留下痕迹）

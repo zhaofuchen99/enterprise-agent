@@ -150,6 +150,9 @@ def build_supervisor_node(settings: Settings, gateway: ModelGateway) -> Callable
                 "review_retries_left", settings.loop.max_reviewer_evidence
             ),
             "replans_left": state.get("replans_left", settings.loop.max_replans),
+            # 重试计数**没有配置初值**（它不是预算，18.2 的 `task.retrying.attempt`），
+            # 从 0 起。`.get` 与上面三行同形，为重投与直接喂 State 的测试兜底
+            "retry_attempt": state.get("retry_attempt", 0),
             "errors": [],
             "next_route": _route_for(task_list[0]),
         }

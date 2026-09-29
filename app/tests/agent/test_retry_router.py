@@ -212,6 +212,33 @@ def test_expand_only_routes_and_touches_no_budget() -> None:
     assert "review_result" not in update
 
 
+def test_the_attempt_counter_increments_only_on_a_legal_retry() -> None:
+    """`retry_attempt` 数的是**合法重试**（18.2 的 `task.retrying.attempt`）。
+
+    三个形态都要走一遍——它们落在**三个不同的返回点**上，漏掉任一处都表现为
+    "某类重试的 attempt 永远不增"，而事件里那个数字看起来仍然合理。
+    """
+    node = build_retry_router_node()
+
+    # ① 补证：走到函数末尾的正常返回路径
+    assert node(_state())["retry_attempt"] == 1
+
+    # ② EXPAND 走的是**提前 return**（14.4 要求它不扣 `review_retries_left`），
+    #    而它同样是一次重试——计数写在那两行之前正是为了覆盖它
+    expanded = node(_state(review_result=_review(retry_target="expand")))
+    assert expanded["retry_route"] is Route.EXPAND
+    assert expanded["retry_attempt"] == 1
+
+    # ③ 降级：预算耗尽，`retry_route` 是 None。**没有发生重试这件事**，
+    #    计数器不该动——动了的话 `task.retrying` 会为一个假事件发出去
+    degraded = node(_state(review_retries_left=0))
+    assert degraded["retry_route"] is None
+    assert "retry_attempt" not in degraded
+
+    # ④ 它是**递增的计数器**而不是布尔量：两次重试分别记 1、2
+    assert node(_state(retry_attempt=1))["retry_attempt"] == 2
+
+
 def test_a_passing_review_changes_nothing() -> None:
     """PASS 时路由节点是个空操作——它每次任务都会跑，不能有副作用。"""
     update = build_retry_router_node()(_state(review_result=_review(status="PASS")))

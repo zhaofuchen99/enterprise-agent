@@ -242,6 +242,14 @@ class AgentState(TypedDict, total=False):
     #: **长得一模一样**（两者都没有 PENDING 步骤），条件边推不出来。
     #: 见 `nodes/retry_router.py` 的模块说明。
     retry_route: Route | None
+    #: **本任务第几次合法重试**（18.2 的 `task.retrying.attempt`）。
+    #: 由 `retry_router` 在真的路由出去时 +1——降级（`_degrade`）与不重试
+    #: 都不加，它们没有发生重试这件事。
+    #:
+    #: 立一个独立计数器而不是从四类预算反推：预算是递减的"还剩几次"，
+    #: 与"这是第几次"不是同一件事；而 `expansions_left` 还被 `reflect` 的
+    #: 计划演进正常路径消耗（那不是重试），减出来会把那些算进来。
+    retry_attempt: int
 
     # ---------------------------------------------------------- 收敛与产出
     errors: Annotated[list[AgentError], merge_errors]

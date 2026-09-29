@@ -22,26 +22,33 @@ Stream 的保留期是配出来的（`stream_ttl_seconds`），而"这个任务�
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.ids import IdPrefix, new_id
 
-#: 节点级事件的类型（18.2 的事件清单）：`node.started` / `node.completed` /
-#: `node.failed`。**故意不写成 Enum**：这一列与工具级事件（`tool.completed`
-#: 等，属 Phase 10）共用同一张表，而读路径 `list_trace_events` 会把整张表
+#: 轨迹事件的类型（18.2 的事件清单）：节点级的 `node.started` / `node.completed` /
+#: `node.failed`，以及工具级的 `tool.completed`。**故意不写成 Enum**：
+#: 节点级与工具级事件共用同一张表，而读路径 `list_trace_events` 会把整张表
 #: 的事件都读出来——写死成封闭取值之后，第一条工具事件就会让 `/trace` 报校验错。
-#: 封闭性写在写入侧：只有 `agent/tracing.py` 一个地方造这些值。
+#: 封闭性写在写入侧：只有 `agent/tracing.py` 与 `agent/nodes/tool_nodes.py` 造这些值。
 NodeEventType = str
 
 
 class NodeTrace(BaseModel):
-    """一次节点执行的进入/离开事件（16.7 的一行）。
+    """一行轨迹（16.7）。**节点级与工具级共用这个形状**。
 
-    **成对出现**：`node.started` 与 `node.completed` / `node.failed`。
+    节点级**成对出现**：`node.started` 与 `node.completed` / `node.failed`。
     只记后者的话，一个卡住的节点在轨迹上表现为"什么都没发生"——
     而那正是最需要看出来的情况（18.4 的 `heartbeat` 事件是同一个问题的
     流侧答案：15 秒无事件就要发心跳，让客户端知道服务还活着）。
+
+    工具级只有 `tool.completed` 一条（18.2 的清单里**没有** `tool.started`，
+    详设 10.x 的"记录 `tool.started` 轨迹"与它冲突，按清单优先处理并已登记）。
+    两种行靠 `tool` 是否为空来区分——**这不是一个可有可无的标记，是判别式**：
+    `/trace?include_tools=false` 的过滤条件就是它，写错了会把工具事件
+    混进节点事件列表，而那两类的读者不是同一批。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -50,15 +57,24 @@ class NodeTrace(BaseModel):
     #: 该任务内的执行序号，从 1 起。**落库时统一分配**（见模块 docstring）。
     sequence: int = 0
     #: 节点名（`supervisor` / `sql` / `rag` / `reflect` / `conflict` /
-    #: `analysis` / `reviewer` / `final`）
+    #: `analysis` / `reviewer` / `final`）。工具级事件也带它——「哪个节点里
+    #: 调的这个工具」是读工具事件时的第一个上下文。
     node: str
-    #: `node.started` / `node.completed` / `node.failed`
+    #: 产生这条事件的工具（`sql` / `rag`）。**节点级事件恒为空**。
+    tool: str | None = None
+    #: 节点级：`node.started` / `node.completed` / `node.failed`；
+    #: 工具级：`tool.completed`
     event_type: NodeEventType
     #: 节点离开时的状态。进入时恒为 `RUNNING`。
     status: str
     #: **只有离开事件有值**：进入事件没有耗时可言，给它 0 会被读成"瞬间完成"。
     duration_ms: int | None = None
     error_code: str | None = None
+    #: 脱敏后的摘要（工具级事件放 `summary`）。**节点级恒为空**。
+    #: 16.7 的列注释把脱敏纪律写在表上（"不得包含 prompt 全文、模型原始输出
+    #: 或工具原始行数据，只留哈希、版本与摘要"），这里再写一遍是因为
+    #: **写入侧在这里**——表注释不是一道能被执行的防线。
+    payload: dict[str, Any] | None = None
     created_at: datetime
 
 

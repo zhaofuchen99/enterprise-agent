@@ -294,9 +294,16 @@ async def test_full_loop_through_a_real_worker(
         "retry_router",
         "final",
     ]
-    # **每个进入都有一个离开**：卡住的节点在只有离开事件的轨迹上看不出来
-    assert [row.node for row in trace if row.event_type != "node.started"] == started
-    assert all(row.duration_ms is not None for row in trace if row.event_type != "node.started")
+    # **每个进入都有一个离开**：卡住的节点在只有离开事件的轨迹上看不出来。
+    # 按类型取，而不是"非 `node.started` 的即是离开"——这张表**也装工具级事件**
+    # （`tool.completed`，工具节点跑完一步时落一行），后者混进来会让断言挂在
+    # 一条本来就不是节点事件的行上
+    leaves = [row for row in trace if row.event_type in {"node.completed", "node.failed"}]
+    assert [row.node for row in leaves] == started
+    assert all(row.duration_ms is not None for row in leaves)
+    # 工具级事件**真的落了库**，且 `tool` 列不再是 NULL（它此前恒为空）
+    tool_rows = [row for row in trace if row.tool]
+    assert [row.tool for row in tool_rows] == ["sql_query"]
 
     # SQL 真的执行了：证据带着结果落进 `agent_evidence`，
     # 而它同时是"答案里那条引用点得开"的依据

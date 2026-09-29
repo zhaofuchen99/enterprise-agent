@@ -209,6 +209,58 @@ async def test_out_of_range_parameters_are_rejected(
         assert response.status_code == 400, query
 
 
+async def test_include_tools_defaults_to_on_and_can_be_turned_off(
+    client: AsyncClient, app: FastAPI, analyst_headers: dict[str, str]
+) -> None:
+    """`include_tools` 默认**开启**（17.4 只写了参数名，没写默认值）。
+
+    默认开的依据是"调用方忘了传参"时两种错的代价不对称：漏掉工具事件会让
+    一次排查少一层线索，而多带几条事件的代价只是一点带宽。
+    """
+    task_id = await _create_task(client, analyst_headers)
+    await app.state.artifacts.save(
+        task_id,
+        trace_id="trc_0000000000000000000001",
+        trace_events=[
+            _traced("sql", "node.started", None),
+            NodeTrace(
+                node="sql",
+                tool="sql_query",
+                event_type="tool.completed",
+                status="SUCCEEDED",
+                duration_ms=386,
+                payload={"summary": "返回 6 行区域汇总数据"},
+                created_at=datetime(2026, 9, 18, 12, 0, 0, tzinfo=UTC),
+            ),
+            _traced("sql", "node.completed", 400),
+        ],
+    )
+
+    default = await client.get(f"/api/agent/tasks/{task_id}/trace", headers=analyst_headers)
+    events = default.json()["data"]["events"]
+
+    assert [item["type"] for item in events] == [
+        "node.started",
+        "tool.completed",
+        "node.completed",
+    ]
+    # **摘要在契约层平铺出来**：客户端不该为了读一句摘要去解一层约定形状的嵌套
+    assert events[1]["tool"] == "sql_query"
+    assert events[1]["summary"] == "返回 6 行区域汇总数据"
+    # 节点级事件两个字段都是空的——那正是过滤条件认的判别式
+    assert events[0]["tool"] is None
+    assert events[0]["summary"] is None
+
+    without = await client.get(
+        f"/api/agent/tasks/{task_id}/trace?include_tools=false", headers=analyst_headers
+    )
+
+    assert [item["type"] for item in without.json()["data"]["events"]] == [
+        "node.started",
+        "node.completed",
+    ]
+
+
 async def test_trace_incomplete_is_carried_through(
     client: AsyncClient, app: FastAPI, analyst_headers: dict[str, str]
 ) -> None:

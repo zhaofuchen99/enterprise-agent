@@ -61,6 +61,18 @@ class JobQueue(Protocol):
         """
         ...
 
+    async def depth(self) -> int:
+        """队列里等待领取的任务数（19.4.3 的"队列深度"）。
+
+        **它是"提前发现故障"的信号**：Worker 全挂的时候任务还在照常入队、
+        接口还在照常返回 202、客户端看不到任何异常——队列深度是唯一在涨的
+        东西。19.4.3 的原话就点了它和心跳失败数这两个。
+
+        返回的是一次数出来的瞬时值（Redis 侧是 `ZCARD`，O(1)），
+        不做分页也不抽样：要的就是准确。
+        """
+        ...
+
     async def aclose(self) -> None: ...
 
 
@@ -114,6 +126,13 @@ class ArqJobQueue:
         #    否则它去查 `arq:queue`，而任务其实躺在 `q:agent` 里，永远返回 not_found。
         job = Job(task_id, self._pool, _queue_name=self._queue_name)
         return await job.status() in _PENDING_STATUSES
+
+    async def depth(self) -> int:
+        # arq 的队列就是一个 ZSET（`q:agent`），`ZCARD` 正是"还有多少没被领走"。
+        # **不能写成 `len(await self._pool.zrange(...))`**：那会把整个队列
+        # 拉回进程内数一遍，积压时正是它最慢的时候——而这个指标的全部意义
+        # 就在于积压时还能被采到
+        return int(await self._pool.zcard(self._queue_name))
 
     async def aclose(self) -> None:
         await self._pool.aclose()

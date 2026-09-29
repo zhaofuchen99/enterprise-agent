@@ -86,12 +86,23 @@ class AgentArtifactRepository:
         raise NotImplementedError
 
     async def list_trace_events(
-        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+        self,
+        task_id: str,
+        *,
+        after_sequence: int | None = None,
+        limit: int | None = None,
+        include_tools: bool = True,
     ) -> list[NodeTrace]:
-        """按 `sequence` 升序取轨迹（17.4 的 `after_sequence` / `limit`）。
+        """按 `sequence` 升序取轨迹（17.4 的 `after_sequence` / `limit` / `include_tools`）。
 
         **排序是语义的一部分**：`(task_id, sequence)` 的唯一索引就是顺序保证
         （18.3），重放时按它排出来的就是真实执行顺序。
+
+        **`include_tools` 默认带上**（17.4 只规定了参数名，没规定默认值）：
+        这个端点的用途是复盘"这个任务当时怎么跑的"，而"跑了哪个工具、
+        成没成、花了多久"正是要看的东西。要只看节点编排才显式传 false。
+        两种默认值在"调用方忘了传参"时的代价不对称——**漏掉工具事件会让
+        一次排查少一层线索，而多带几条事件的代价只是一点带宽**。
         """
         raise NotImplementedError
 
@@ -161,10 +172,19 @@ class SqlAgentArtifactRepository(AgentArtifactRepository):
         return [_evidence_of(row) for row in rows]
 
     async def list_trace_events(
-        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+        self,
+        task_id: str,
+        *,
+        after_sequence: int | None = None,
+        limit: int | None = None,
+        include_tools: bool = True,
     ) -> list[NodeTrace]:
         """SQL 实现。**按 `sequence` 升序**——那是 18.3 的顺序保证本身。"""
         statement = select(AgentTraceEvent).where(AgentTraceEvent.task_id == task_id)
+        if not include_tools:
+            # 工具级事件靠 `tool` 非空识别——那是 `domain/trace.py` 写下的判别式，
+            # 不在这里另立一份判据（两份判据漂移的症状是"某类事件再也过滤不掉"）
+            statement = statement.where(AgentTraceEvent.tool.is_(None))
         if after_sequence is not None:
             # **严格大于**：`after_sequence` 的语义是"我已经有的最后一条"，
             # 用 `>=` 会让客户端每次重连都重复拿到同一条。
@@ -222,12 +242,20 @@ class InMemoryAgentArtifactRepository(AgentArtifactRepository):
         return list(self.evidence.get(task_id, ()))
 
     async def list_trace_events(
-        self, task_id: str, *, after_sequence: int | None = None, limit: int | None = None
+        self,
+        task_id: str,
+        *,
+        after_sequence: int | None = None,
+        limit: int | None = None,
+        include_tools: bool = True,
     ) -> list[NodeTrace]:
         rows = [
             item
             for item in sorted(self._trace.get(task_id, ()), key=lambda x: x.sequence)
-            if after_sequence is None or item.sequence > after_sequence
+            # 与 SQL 实现同一个判据（`tool` 非空即工具事件），两个实现给出
+            # 同一个结论是它们存在的意义——不一致时"某个过滤条件只在连库时生效"
+            if (include_tools or not item.tool)
+            and (after_sequence is None or item.sequence > after_sequence)
         ]
         return rows[:limit] if limit is not None else rows
 
@@ -385,10 +413,10 @@ def _trace_row(task_id: str, trace_id: str, sequence: int, item: NodeTrace) -> A
         trace_id=trace_id,
         sequence=sequence,
         node=item.node,
-        tool=None,
+        tool=item.tool,
         event_type=item.event_type,
         status=item.status,
-        payload_json=None,
+        payload_json=item.payload,
         duration_ms=item.duration_ms,
         error_code=item.error_code,
         created_at=to_db_time(item.created_at),
@@ -396,16 +424,18 @@ def _trace_row(task_id: str, trace_id: str, sequence: int, item: NodeTrace) -> A
 
 
 def _trace_of(row: AgentTraceEvent) -> NodeTrace:
-    """读回来。`tool` / `payload_json` 不进 `NodeTrace`——前者是工具事件的字段、
-    后者留给需要携带结构化负载的事件；节点级事件两者都不用。"""
+    """读回来。`tool` / `payload` 是**工具级事件**的字段，节点级事件两者都为空
+    ——那正是 `/trace?include_tools=false` 的过滤依据。"""
     return NodeTrace(
         id=row.id,
         sequence=row.sequence,
         node=row.node,
+        tool=row.tool,
         event_type=row.event_type,
         status=row.status,
         duration_ms=row.duration_ms,
         error_code=row.error_code,
+        payload=row.payload_json,
         created_at=row.created_at.replace(tzinfo=UTC),
     )
 

@@ -38,7 +38,7 @@ from app.core.config import Settings
 from app.core.errors import DEFAULT_RETRYABLE, ErrorCode
 from app.domain.task import Task, TaskOutcome, TaskStatus
 from app.infrastructure.logging import bind_context
-from app.infrastructure.observability import capture_trace_context, span
+from app.infrastructure.observability import capture_trace_context, counter, histogram, span
 from app.infrastructure.queue import JobQueue
 from app.infrastructure.redis import RedisKey, register_scripts
 from app.repositories.agent_repo import AgentArtifactRepository
@@ -222,6 +222,14 @@ class TaskRunner:
                 # 捕获范围从 RedisError 放宽到 Exception 是 Phase 2 的连带影响：
                 # 心跳写入从纯 Redis 变成「MySQL 权威 + Redis 快通道」，
                 # 数据库异常（SQLAlchemyError）原先不在这条路径上。
+                # 19.4.3 点名"心跳失败数"是分层架构下能**提前**发现故障的信号之一：
+                # 它涨起来说明 Redis / MySQL 有一侧在抖，而那时任务还都跑得好好的
+                # ——日志里的 warning 没人会一直盯着，一个持续上升的数才会被看见
+                counter(
+                    "agent.worker.heartbeat_failures",
+                    unit="{failure}",
+                    description="心跳写入失败次数",
+                ).add(1)
                 logger.warning("心跳写入失败：%s", type(exc).__name__, extra={"task_id": task_id})
 
     # ------------------------------------------------------------------ 取消
@@ -465,6 +473,7 @@ class TaskRunner:
     async def _emit_final(
         self, task: Task, event_type: TaskEventType, data: dict[str, object]
     ) -> None:
+        _record_task_metrics(task)
         await self._events.publish(
             task_id=task.id, trace_id=task.trace_id, event_type=event_type, data=dict(data)
         )
@@ -504,6 +513,13 @@ class TaskRunner:
                 outcome = await self._task_failed_as_orphan(task, now)
                 reclaimed += 1 if outcome is not None else 0
             if reclaimed:
+                # ⚠️ 这里是**单轮增量**（单轮扫描上限 `_SCAN_BATCH`），不是累计值——
+                # 交给 Counter 去累加，"至今回收了多少"才是对的
+                counter(
+                    "agent.worker.orphans_reclaimed",
+                    unit="{task}",
+                    description="回收的孤儿任务数（单轮增量）",
+                ).add(reclaimed)
                 logger.warning("回收了 %d 个孤儿任务", reclaimed, extra={"status": "RECLAIMED"})
             return ReclaimReport(scanned=len(stale), reclaimed=reclaimed)
 
@@ -564,6 +580,18 @@ class TaskRunner:
             if await self.enqueue(task):
                 requeued += 1
                 logger.warning("任务重新投递（第 %d 次）", attempts, extra={"task_id": task.id})
+        if requeued:
+            counter("agent.worker.requeued", unit="{task}", description="补偿扫描重投的任务数").add(
+                requeued
+            )
+        if failed:
+            # **"重投成功"与"投不进去"分开记**：前者是补偿在正常工作，
+            # 后者说明队列那条路彻底断了（超过 `max_requeue_attempts`）。
+            # 合成一个数的话，补偿机制一边救回任务一边不断失败，
+            # 看起来只是"重投了一批"——而那是两件处置完全不同的事
+            counter(
+                "agent.worker.undeliverable", unit="{task}", description="重投超限而失败的任务数"
+            ).add(failed)
         return ReconcileReport(scanned=len(stale), requeued=requeued, failed=failed)
 
     async def _bump_requeue(self, task_id: str) -> int:
@@ -630,3 +658,36 @@ class TaskRunner:
                 except (aioredis.RedisError, OSError):
                     # 释放失败只影响下一轮的互斥性，锁会自己过期，不值得中断
                     logger.warning("释放锁失败，等待 TTL 自动过期：%s", purpose)
+
+
+def _record_task_metrics(task: Task) -> None:
+    """任务数与两个耗时（19.4.3）。**只在 `_emit_final` 里调用**。
+
+    那是三个终态的唯一出口（成功 / 失败 / 取消都经过它），所以任务数既不会
+    漏也不会重复——而漏掉一条终态的代价是"某类任务永远不出现在报表里"，
+    那恰恰是最需要看到的那一类。
+
+    两个耗时都守 `is None`：`started_at` 为空意味着**领取前就被取消**
+    （QUEUED → CANCELLED），那种任务没有"执行耗时"可言。记 0 会稀释直方图，
+    而 0 会让 P50 看起来好得不像话——一个由"没发生"充数的统计量。
+
+    ⚠️ **包在 `try` 里**：这里在终态事件发布**之前**，指标 SDK 一旦抛出去会把
+    终态事件一起带倒——而丢掉一条指标比丢掉一次终态严重得多（同 `_emit` 的
+    纪律：不拿可用性换可观测性）。SDK 的正常路径不抛，这一层是给
+    "参数类型写错"那类开发者错误兜底。
+    """
+    try:
+        counter("agent.task.finished", unit="{task}", description="任务终态数").add(
+            1, {"status": str(task.status)}
+        )
+        if task.started_at is None:
+            return
+        histogram("agent.task.queue_wait", unit="s", description="从入队到被领取的等待").record(
+            (task.started_at - task.queued_at).total_seconds()
+        )
+        if task.finished_at is not None:
+            histogram("agent.task.duration", unit="s", description="从领取到收尾的执行耗时").record(
+                (task.finished_at - task.started_at).total_seconds()
+            )
+    except Exception as exc:  # pragma: no cover - SDK 正常路径不抛
+        logger.warning("任务指标记录失败（不影响收尾）：%s", type(exc).__name__)

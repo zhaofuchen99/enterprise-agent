@@ -66,6 +66,20 @@ class TaskEventType(StrEnum):
     #: 节点**返回**了失败（不抛异常）。抛出异常的节点在此留下痕迹的通道是
     #: `trace_incomplete`，见 `agent/tracing.py` 的能力边界说明
     NODE_FAILED = "node.failed"
+    #: 一次工具执行结束（工具节点）。data: tool、status、summary、duration_ms
+    #:
+    #: **只有 `completed`，没有 `started`**：18.2 的清单与需求 7.3 的清单里
+    #: 都只有前者，而详设 10.x 那句「记录 `tool.started` 轨迹和 SSE」与它们
+    #: 冲突——按"清单优先"处理，已作为文档不一致登记。依据不只是"清单更长"：
+    #: 开始时刻可以从 `duration_ms` 反推，而每个工具两条事件会让事件量翻倍，
+    #: 且 `tool.started` 上没有任何 information 是 `node.started` 没给的
+    TOOL_COMPLETED = "tool.completed"
+    #: 一次合法重试（`retry_router`）。data: target、reason_code、attempt
+    #:
+    #: 在它之前，"审查要求补证并重试了"这件事只活在图里——用户看到的是一条
+    #: 卡了很久、然后答案突然变化的流。19.4 明写它属"任务循环对用户可见"的
+    #: 那一组（与 `progress.assessed` / `plan.updated` 并列）
+    TASK_RETRYING = "task.retrying"
     #: 审查完成（`reviewer`）。data: status、score、issue_count
     REVIEW_COMPLETED = "review.completed"
     #: 需要用户补充输入（`supervisor` 判 CLARIFICATION）。

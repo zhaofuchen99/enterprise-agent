@@ -1,0 +1,34 @@
+# OTel Collector：把 API 与 Worker 推来的 trace 与指标打到 stdout（开发环境）。
+#
+# **为什么是 collector + debug exporter，而不是 Prometheus + Grafana**：
+# 19.4.3 明写「不要求自建 Prometheus 集群，但指标必须被采集而非只写日志」。
+# 本地验证要回答的问题是"这些指标有没有真的被送出来、带着哪些属性"，
+# 而不是"图好不好看"——`debug` exporter 把每一批导出原样打成 JSON，
+# 正好是那个问题的答案，代价只是多一个容器。
+#
+# ⚠️ **它不属于产品的一部分**：生产部署把 `OTLP_ENDPOINT` 指向真正的后端即可，
+# 这个容器与这份配置都不参与（Phase 14 的话题）。
+#
+# 端口与 OTLP_ENDPOINT 的关系：应用侧用的是 HTTP exporter（`.../v1/traces`、
+# `.../v1/metrics`），所以 receiver 只需要开 http，4318 就是它的默认端口。
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  # `verbosity: normal` 足以看到指标名、值与**属性**（哪个 tool / node / status）；
+  # 调成 detailed 会把每条 measurement 都展开，本地刷屏到看不出东西
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]

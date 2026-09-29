@@ -125,6 +125,23 @@ services:
       retries: 10
       start_period: 15s
 
+  # OTel Collector：把 API 与 Worker 推来的 trace 与指标打到 stdout。
+  # **只在开发环境用**——生产把 `OTLP_ENDPOINT` 指向真后端即可，
+  # 这个容器与 `configs/otel-collector.yaml` 都不参与（Phase 14 的话题）。
+  # 与 `otel_enabled` 一样是"可选的观测后端"，没起来不影响任务执行。
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: ea-otel-collector
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./configs/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      # 只映射 4318（OTLP/HTTP）：应用侧用的就是 HTTP exporter。
+      # **不映射 4317**（gRPC）：这份配置里的 receiver 根本没开它，
+      # 映射一个没人监听的端口会让"连不上"看起来像防火墙问题。
+      - "4318:4318"
+
+
 volumes:
   redis-data:
   agent-mysql-data:

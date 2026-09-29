@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import redis.asyncio as aioredis
@@ -26,7 +28,13 @@ from app.core.config import Settings, get_settings
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_API, clear_context, setup_logging
 from app.infrastructure.model_gateway import ModelGateway, build_model_gateway
-from app.infrastructure.observability import setup_error_tracking, setup_observability
+from app.infrastructure.observability import (
+    counter,
+    set_queue_depth,
+    setup_error_tracking,
+    setup_observability,
+    shutdown_observability,
+)
 from app.infrastructure.queue import ArqJobQueue, JobQueue
 from app.infrastructure.redis import create_client
 from app.repositories import Repositories, build_sql_repositories
@@ -37,6 +45,8 @@ from app.services.rate_limit import RedisFixedWindowLimiter
 from app.services.stream_token import StreamTokenService
 from app.services.task_runner import TaskRunner
 from app.services.task_service import TaskService
+
+logger = logging.getLogger(__name__)
 
 #: 演示控制台的静态目录（`app/static/index.html`）。
 #: **用 `Path(__file__)` 推而不是相对路径**：进程的工作目录取决于启动方式
@@ -168,14 +178,62 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 归本进程所有，退出时在 finally 里释放。
     gateway = build_model_gateway(settings)
     wire_dependencies(app, settings, queue=queue, gateway=gateway)
+    # 队列深度的抽样（19.4.3）。**放在 API 进程而不是 Worker 的 cron**：
+    # Worker 全挂时队列深度才会涨，而那一刻 Worker 的定时任务恰好也不跑了
+    # ——最需要这个信号的时刻它缺席。代价如实记下：多副本 API 会各导一份
+    # （当前部署是单 API + 单 Worker，见 docker-compose.dev.yml）。
+    depth_task = asyncio.create_task(_sample_queue_depth(settings, queue))
     try:
         yield
     finally:
+        depth_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await depth_task
         clear_context()
+        # OTel 收尾**放在最前面**：它要 flush 还没导出的 span 与指标，
+        # 而下面几步会把它们的落点（连接池）先关掉
+        shutdown_observability()
         await gateway.aclose()
         await queue.aclose()
         await redis.aclose()
         await db_engine.dispose()
+
+
+async def _sample_queue_depth(settings: Settings, queue: JobQueue) -> None:
+    """定期把队列深度喂给 `ObservableGauge`，并在积压时记账、告警。
+
+    `ObservableGauge` 是**采集时回调取值**的，而那个回调不能 await（见
+    `observability.set_queue_depth`）——取值的活儿因此由这个循环干。
+
+    超过 `queue_backlog_threshold` 时**同时**记一条 WARNING 与一个计数：
+    只有数字没有阈值的话，"积压"要靠人一直盯着看；而只有日志没有指标的话，
+    "积压过几次、多久一次"就查不出来（19.4.3 要的是"被采集"，
+    不是"被打进日志里"）。
+    """
+    interval = settings.observability.queue_depth_interval_seconds
+    threshold = settings.worker.queue_backlog_threshold
+    while True:
+        try:
+            depth = await queue.depth()
+        except Exception as exc:
+            # 读不到**不该让这个循环退出**：它是个观察者，
+            # 而观察者在被观察对象出问题时停摆，是最糟的时机
+            logger.warning("读取队列深度失败：%s", type(exc).__name__)
+        else:
+            set_queue_depth(depth)
+            if depth > threshold:
+                counter(
+                    "agent.queue.backlog_exceeded",
+                    unit="{sample}",
+                    description="队列深度超过阈值的采样次数",
+                ).add(1)
+                logger.warning(
+                    "队列积压：%d 个任务待领取（阈值 %d）",
+                    depth,
+                    threshold,
+                    extra={"status": "BACKLOG"},
+                )
+        await asyncio.sleep(interval)
 
 
 def create_app() -> FastAPI:

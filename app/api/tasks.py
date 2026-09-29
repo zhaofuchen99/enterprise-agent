@@ -77,11 +77,14 @@ async def get_task(
     response_model=ApiResponse[TaskTraceData],
     summary="查询任务的执行轨迹",
     description=(
-        "按执行顺序返回每个节点的进入/离开事件。\n\n"
+        "按执行顺序返回节点级与工具级事件。\n\n"
         "**这张表是事件流的权威重放来源**（详细设计 18.3）：Redis Stream 会被 "
         "MAXLEN 裁剪，客户端断线重连后要补历史必须回到这里。\n\n"
         "`after_sequence` 用于增量拉取——语义是「我已经有的最后一条」，"
-        "因此是**严格大于**，用 `>=` 会让每次重连都重复拿到同一条。"
+        "因此是**严格大于**，用 `>=` 会让每次重连都重复拿到同一条。\n\n"
+        "`include_tools` 默认**开启**：轨迹的用处是复盘「这个任务当时怎么跑的」，"
+        "而「跑了哪个工具、成没成、花了多久」正是要看的东西。只看节点编排"
+        "（哪几个节点被走到）才需要传 `false`。"
     ),
     dependencies=[Depends(require_task_status_rate_limit)],
     responses=error_responses(
@@ -100,12 +103,20 @@ async def get_task_trace(
     trace_id: TraceIdDep,
     after_sequence: Annotated[int | None, Query(ge=0, description="只返回序号大于它的事件")] = None,
     limit: Annotated[int | None, Query(ge=1, le=500, description="最多返回多少条")] = None,
+    include_tools: Annotated[
+        bool, Query(description="是否包含工具级事件（`tool.completed`），默认包含")
+    ] = True,
 ) -> ApiResponse[TaskTraceData]:
     # **先走一次 service 拿任务**：权限判定（跨用户 403）与任务存在性都在那里，
     # 直接用仓储读轨迹会绕过这两道检查——而轨迹里带着节点名与耗时，
     # 是**未授权用户不该看到**的执行细节。
     task = await service.get_task(user=user, task_id=task_id)
-    events = await artifacts.list_trace_events(task.id, after_sequence=after_sequence, limit=limit)
+    events = await artifacts.list_trace_events(
+        task.id,
+        after_sequence=after_sequence,
+        limit=limit,
+        include_tools=include_tools,
+    )
     bind_context(task_id=task.id, conversation_id=task.conversation_id)
     return ApiResponse(
         code=SuccessCode.OK,
@@ -121,6 +132,11 @@ async def get_task_trace(
                     status=item.status,
                     duration_ms=item.duration_ms,
                     timestamp=item.created_at,
+                    tool=item.tool,
+                    # 摘要在域对象上嵌在 `payload` 里（16.7 那张表只有一列
+                    # `payload_json`），到契约层平铺开：客户端不该为了读一句
+                    # 摘要去解一层约定形状的嵌套
+                    summary=(item.payload or {}).get("summary"),
                 )
                 for item in events
             ],

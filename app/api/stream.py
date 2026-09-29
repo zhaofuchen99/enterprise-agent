@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from app.core.config import Settings
 from app.domain.events import TaskEvent, TaskEventType
 from app.domain.task import Task, TaskStatus
+from app.infrastructure.observability import up_down_counter
 from app.services.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,13 @@ async def stream_frames(
     # 而一个任务的事件是几十条量级。设一个更小的上限等于**丢事件**——
     # 丢掉的那些之后再也拿不回来（游标已经越过它们），
     # 而"丢了一部分"与"全都补上了"在客户端看来是一样的。
+    # 当前打开的 SSE 连接数（19.4.3）。**用 `UpDownCounter` 而不是 `Counter`**：
+    # 连接是会减下去的量，只加不减的话"此刻有几个连接"就永远读不出来
+    # （只剩一个累计到过多少，而那个数随时间单调上涨、不携带任何信息）
+    connections = up_down_counter(
+        "agent.sse.connections", unit="{connection}", description="当前打开的 SSE 连接数"
+    )
+    connections.add(1)
     try:
         replayed = await bus.read(task.id, after_id=cursor)
         yield snapshot_frame(task, replay_lost=await _replay_lost(bus, task.id, after_id))
@@ -242,6 +250,11 @@ async def stream_frames(
         bound = {"task_id": task.id, "conversation_id": task.conversation_id}
         logger.exception("事件流异常终止（客户端应退回轮询状态接口）", extra=bound)
         return
+    finally:
+        # **三个出口都经过这里**：正常收到 `done`、上面那条 `return`、以及异常降级。
+        # 少释放一次的症状是"连接数只增不减"——而它在报表上看起来只是
+        # "有很多人连着"，不会有人去查一个偏高的数
+        connections.add(-1)
 
 
 __all__ = [
