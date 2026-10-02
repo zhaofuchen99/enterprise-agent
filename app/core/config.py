@@ -404,6 +404,13 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     #: 任务超时必须与 loop.max_expansions 联动（开发流程 5.4），见下方校验
     task_timeout_seconds: int = Field(default=600, ge=30, le=7200)
+    #: `/health/ready` 里**每一条依赖探针**的超时。
+    #:
+    #: 探针是**并发**跑的，所以这个值就是 ready 的最坏延迟上界（不是总和的）。
+    #: 编排层每隔几秒打一次 ready，不设上界的话"某个依赖挂了"会让每一次
+    #: 健康检查都吊在那里——探测本身变成一种负载，还拖慢摘除决策。
+    #: 结果另有 5 秒缓存（`infrastructure/health.py`），连续探测不会重复打穿。
+    health_probe_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
 
     # -------------------------------------------------------- 任务配额与限流
     #: 单次问题最大长度。FR-CHAT-001 业务规则：默认 4,000 字，**可配置**。

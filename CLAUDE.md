@@ -29,6 +29,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**14.1 的第二阶段（结构化模型审查）也接上了**（2026-09-27 晚）：四条判断落成结构化输出，issue 的 code **由代码从布尔推出来**（模型不写自由文本 code），**一律 WARNING——模型不能独自把答案拦下**（见约定 105）。`CLARIFY` 从此有了产出者。**2026-09-28 补上 `plan_extend`（计划演进）**：详设 6.1 的 `reflect -> plan_extend -> dispatch` 那条回边补齐，`retry_router` 的 `expand` 分支从此有落点——14.4 路由表里那一行**不再是"能路由但没人接"**。`plan_deltas` / `plan_revision` / `trigger_finding_id` 三样第一次有了生产者，`agent_plan_revision` 表（建表起一直空着）接上了写入方，`agent_task_step.origin` 能分出 `EXTENDED`。**循环类评测（`任务循环与自适应下钻` 5 条）随之可写**，见 Phase 13。**仍未做**：`WAITING_CLARIFICATION` 状态位、`retry_target=replan` 的产出者（模型审查的四个布尔里没有哪个问的是"计划本身不可执行"）——已登记 |
 | **多轮追问**（FR-CHAT-003 会话内短期记忆） | ✅ 完成（2026-09-28） | 冲刺方案 §7 **明确拒绝砍掉**的那条需求，此前**零实现**：`agent_message` 表从 Phase 2 建好起没有任何写入方，`AgentState.context_summary` 是个从没被填过的占位字段。本次交付：**`Message` 领域对象 + `MessageRepository`**（Protocol/内存/SQL 三份，`agent_message` 第一次被真的读写）、**`ConversationContext`**（详设 15.1 的五字段，`app/domain/memory.py` 的纯函数 `group_turns` / `build_conversation_context`）、**`ConversationService`**（用户消息在 `create_task` 写、助手消息在 `_finish_succeeded` 写，落库失败吞异常但记 `memory.record_failed`）、**上下文进图**（`load_conversation_context` 读最近 10 轮 + 各任务口径 → `supervisor` 的 `{context}`，prompt 升 `1.1.0`）、**`IntentResult.resolved_question`**（代词解析后的问题，FR-CHAT-003 的"输出：解析后的问题"）+ **`current_question()` 收口**（下游四处从读 `user_query` 改为读本轮问题——**不换的话「那 Q2 呢」会被原样送进 SQL 生成器**，见约定 112）。**实测三连问**（2026-09-28，`make demo ONLY=demo-memory-followup` 3/3）：「2025年Q3华东地区的净销售额是多少？」→「那Q2呢？」→「和去年比呢？」——第 2 轮解析成「2025年Q2华东地区的净销售额是多少」（区域继承、期间换掉，答案 127,576,714.27 与 `demo-sql-q2` 的真值一致），第 3 轮 `comparison=YOY`。**它跑第一轮就发现一个真缺陷**：同一条问题另一次跑生成了**绑定参数错**的 SQL（"2024年Q2"实际求 2024-04~2025-04，差 4 倍还给出同比 −74.43% 的结论），SQL 语法与白名单全过、只有区间错——见约定 117。**未做**：写 `agent_conversation.context_summary_json`（避免第二份真相）、`metric_definitions` 填充（需指标目录跨层注入）、失败/取消也写 `SYSTEM_NOTICE`、`token_count` 真实计量、多轮类进 golden 评测集、会话列表/删除 API 与 180 天清理——已登记。**同日全量回归**：`make check` **979 单测** + `make test-integration` **121** 全绿；`make demo` 稳定 **7/7** + 观察 **5/5**（多轮那条占 3 轮）；`make eval-agent` 稳定 **23/24 = 96%**、观察 1/1——**唯一那条红是审查器的门禁误报，不是本次改动引起的**（见约定 118）。⚠️ 回归前按约定 100 **重启了 `make run`** |
 | **冲突检测扩类**（Phase 9 切片：DEFINITION + TIME） | ✅ 完成（2026-10-02） | 冲突检测从**一类扩到三类**（VALUE / DEFINITION / TIME），`SCOPE` 与 `SOURCE` 各有各的缺前提、仍然不做（见约定 38 与 `nodes/conflict.py` 的清单）。**两侧数据其实一直都在，只是没人用**：清单的 METRIC 文档早就声明了 `metric_code`、SQL 侧证据早就在填 `definition_version`——缺的是"文档侧那一段管道"。本次打通它（清单 → `corpus_report.json` → payload → 证据），新增三个文档级字段 `metric_code` / `definition_version` / `stat_cutoff`（+ `agent_evidence` 两列的迁移，顺带补上 `stat_period` 那个一直没落库的列）。**DEFINITION** 比文档声明的口径版本与指标目录的 `version`（只比版本，不要求范围/期间相同——口径是指标级属性，而且口径说明文档的 scope 恒为空）；**TIME** 判「文档自称的期间被它自己的统计截止日截短」，**不判「两侧期间不同」**——后者会把上一轮刚修掉的 157%–1133% 假冲突换个 type 名放回来（见约定 130）。期间被截短的同一对证据**只报 TIME 不报 VALUE**（约定 131）。语料加了一类缺陷 `DEFINITION_CONFLICT`（**10 类变 11 类**，约定 133），注入在 `MD-005`（`order_count`：文档 v1.1 vs 目录 v1.0）。`verify-corpus` 的标注按「比对的两端在不在离线拿得到」重新划：**DEFINITION → `[OK]`**、TIME 保持 `[注入]`、**顺带把 SOURCE 从 `[OK]` 改成 `[注入]`**（它没有检测器，只验了材料齐备，约定 132）。冲突评测集按需求 11.2 从 5 条补到 **10 条**（DEFINITION 2 + TIME 1 正面、零冲突 4 条守反方向），40 条单测 + 迁移。**实测**：`make check` **1029** + 集成 **122** 全绿；`make eval-agent` 全量 **40 条、稳定用例 38/38 = 100%**（工具选择 5/5、**多源冲突 10/10**、审查 5/5、澄清 5/5、循环 15/15）、观察 2/2；`make demo` 稳定 7/7 + 观察 5/5；`make verify-corpus` **11/11**；`make eval-sql` 10/10；`make eval-rag` Recall@8 **20/20**、定位一致率 19/20。⚠️ **同一份代码之前那次全量是 35/38 = 92%**（三条失败里 `agent-conflict-03` 是真问题——判据被检索运气绑住，已改成钉「机制 + 行」；另两条是审查第二阶段的模型抖动）——**两次都记在 `eval_agent._DEFAULT_BASELINE` 的注释里**，单次满分不是证据。⚠️ **它跑第一轮就抓到一个真缺陷**：`validate_content` 只采样前 4096 字节再整段解码，**采样窗口把一个汉字切成两半**时报"不是合法的 UTF-8"——症状指向生成器而根因在我们自己，见约定 134。**未做**：`SCOPE` / `SOURCE` 两类（各有各的缺前提，见约定 38） |
+| **性能压测 + 故障注入**（Phase 13 的第 3、4 项 + 修演练暴露的缺陷） | ✅ 完成（2026-10-02） | 需求 8.1 的 8 条性能指标第一次被**量过**（此前一条没有），8.2 的 7 条恢复要求与开发流程 6.15 的 9 类故障第一次被**演练过**。**新增 `make load-test`**（四个场景：`probe` 亚秒级 / `sql`·`multi` 串行任务级 / `capacity` 并发投递），目标值抄需求原文**不跟实测走**。**实测**（一次全量，n 见下）：NFR-P-01 状态查询 P95 **16ms**（目标 300ms，n=200）、NFR-P-02 SSE 建连 P95 **9ms**（目标 1s，n=100）、NFR-P-03 首个进度事件 P95 **461ms**（目标 1s，n=40）、NFR-P-04 简单 SQL 任务 P95 **6.8s**（目标 15s，n=20）、NFR-P-05 多源分析任务 P95 **16.0s**（目标 60s，n=20）——**五条都达标**。两个并发指标的关键在于**它是可配置的**：`WORKER__CONCURRENCY=4`（默认）时峰值只有 **4 个**、排队等待 P95 **22.9s**（两条都 ✗）；改成 **24** 之后峰值 **20 个** ✓、排队等待 P95 **0.51s** ✓，**20 个任务全部成功、错误率 0%**。⚠️ 但需求把 NFR-P-08 的口径钉在"Worker 并发 4"，而 NFR-P-06 要 ≥20——**按原文这两条不同时成立**（见约定 139），如实报告、**不改目标**。**四个真修复**：① **Qdrant 挂掉从 `INTERNAL_ERROR` 改成可重试的 `UPSTREAM_UNAVAILABLE`**——异常在 `QdrantVectorStore` 读路径包（**唯一知道它来自谁**的那一层），异常元组是 `docker stop ea-qdrant` **实测**出来的（不是从文档抄的，抄的那版一个都接不住）；顺带修 `trace_incomplete` 从 True 变 False（失败从"图里正常失败"走，`/trace` 因此看得到那一步）。② `error_class_of` 抽成**两份工具共用的一份**，修掉 RAG 侧把 `UPSTREAM_UNAVAILABLE` 错贴成 `VALIDATION`（那会建议"让模型重试解析"）；删掉 `TASK_TIMEOUT` 那条**死映射**（全仓无生产者）。③ `/health/ready` 分级：**判 503 的唯一标准是"这个实例完全不能用"**，Qdrant/业务库/对象存储进 `degraded`（200）；探针可注入、结果缓存 5 秒。④ 孤儿回收置 `trace_incomplete=True`（被 `kill -9` 的 Worker 一条轨迹都没留，而 `/trace` 显示"完整但空"）。**故障注入的载体分工**：能确定性断言的进 integration（模型 429、业务库断连、Qdrant 挂、轨迹落库失败、孤儿回收、`reconcile_queue` 重投、SSE 客户端断开），要真跑容器的写进演练命令。⚠️ **三处如实记账**：压测**绕开产品配额**（它测的是配额之外的容量）；**NFR-P-08 与 P-06 在给定任务耗时下数学互斥**（不改目标、给根因与理论吞吐）；**Redis 挂时建任务仍返回 202、任务停在 QUEUED** 与 R 8.2「快速返回可重试错误」不一致（钉住现状 + 登记三态 `enqueue` 的改法）。**全量回归**：`make check` **1047** + 集成 **125** 全绿；`make demo` 稳定 **7/7** + 观察 5/5；`make eval-agent` 全量 40 条、稳定用例 **37/38 = 97%**（工具选择 5/5、多源冲突 10/10、审查 5/5、澄清 4/5、循环 15/15）——唯一失败的 `agent-clarify-02`（「这个月的销售情况怎么样？」该不该澄清）是**模型判定**，与本次改动无关 |
 | **可观测性补齐**（19.4.3 指标 + 工具级轨迹 + `task.retrying`） | ✅ 完成（2026-09-29） | 19.4.3 的指标**全接**：`observability.py` 有了 meter（`counter` / `histogram` / `up_down_counter` / **幂等** `MeterProvider` / `shutdown_observability`），`docker-compose.dev.yml` 加了 `ea-otel-collector`（debug exporter 打 stdout，不引 Prometheus/Grafana——19.4.3 只要求"被采集"）。**`agent_trace_event.tool` 不再恒为 NULL**、`/trace` 有了 17.4 的 `include_tools`（默认**开**）、`tool.completed` 与 `task.retrying` 两个事件第一次有了生产者。**实测一条真任务**：collector 收到九个新指标（`agent.node.duration` / `agent.task.{finished,duration,queue_wait}` / `agent.tool.calls` / `agent.sql.attempts` / `agent.review.verdicts` / `llm.tokens` / `agent.queue.depth`），`llm.cost` **正确缺席**（单价未配是"未计量"不是"零成本"，约定 126）；`/trace` 17 条含 1 条工具级、`?include_tools=false` 16 条含 0 条。⚠️ **它跑第一轮就抓到一个自 Phase 1.5 起就存在的真缺陷**：`OTLP_ENDPOINT` 被当完整 URL 用，而 `OTLPSpanExporter(endpoint=...)` **不会**替你补 `/v1/traces` —— 导出恒 404，而 `OTEL_ENABLED=false` 时完全看不出来（**见约定 122**）。`make check` **1013** + 集成 **122** 全绿。**未做**：`agent_message.token_count`（19.4.2 的红线，见约定 126）、`answer.delta`、SSE 侧 `tool.completed` 的端到端断言（派生逻辑有单测，流那一段没单独跑） |
 | 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
@@ -1295,6 +1296,98 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     而根因是我们自己截断的。改用 `codecs.getincrementaldecoder("utf-8")`：
     不完整的尾巴留在缓冲里，**中间的坏字节照样抛**（有正反两条用例钉着）。
 
+### 性能压测与故障注入期间新立的临时约定
+
+135. **外部依赖的异常要在「唯一知道它来自谁」的那一层包**（`QdrantVectorStore`
+    的读路径：`search_dense` / `search_sparse` / `hybrid_rrf` / `fetch`）。
+    往上包（`Retriever` / Tool）会把自己的编程错误（`TypeError`/`KeyError`）
+    也伪装成"可重试的上游故障"——**把一个永久缺陷降级成一次抖动**。
+    两条纪律：
+    - **只包传输/服务类异常**（`_QDRANT_FAILURES`），绝不 `except Exception`；
+    - **写路径不包**（`upsert` / `ensure_collection` / `set_status`）——
+      `make ingest` 与 `verify-corpus` 靠原始异常报"入库失败"。
+
+    ⚠️ **异常元组是实测出来的，不是从文档抄的**：`docker stop ea-qdrant` 之后实测
+    抛的是 `ResponseHandlingException <- httpx.ConnectError <- OSError
+    <- ConnectionRefusedError`。⚠️ **实验脚本自己少传一个参数会抛 `TypeError`，
+    看起来与"Qdrant 挂了"一模一样**（这条坑在写这版时就踩到一次）——
+    所以契约用例**正反两条**：传输异常被包、`TypeError` 原样冒出。
+
+    修完的副作用是好的：`trace_incomplete` 从 `True` 变 `False`。今天异常穿到
+    `graph.ainvoke` 与 `TaskRunner.execute` 的 `except Exception`，图上一条轨迹
+    都没落；修完是**一次正常的步骤失败**，`/trace` 里能看到"这一步失败了"。
+    第三个"外部依赖挂了"至此与另两个同待遇（Redis → degraded、
+    业务库 → 可重试的 `UPSTREAM_UNAVAILABLE`）。
+
+136. **错误码与错误类别是两条轴，别压成一个**（`tools/base.error_class_of`）：
+    `code` 是给客户端的契约（19.1 的**封闭**码表，不许新增同义码，
+    不许为了"更贴切"加一个）；`error_class` 是内部 9.4 分类，它才表达
+    "是超时还是连接被拒"。SQL 超时因此是
+    **`UPSTREAM_UNAVAILABLE`（503/可重试）+ `error_class="TIMEOUT"`**。
+
+    ⚠️ **`TASK_TIMEOUT` 全仓没有任何生产者**（只有定义、504 映射、一条
+    "映射到 504"的测试，和 `_CODE_CLASS` 里一条**死映射**）。它的语义是
+    **任务总预算**（504 / 不重试 /「返回已有证据和限制」），与"这条查询跑了
+    10 秒"差一个量级——用它会让人误判整个任务终结了。死映射已删，
+    理由钉成了断言（`tests/tools/test_base.py::test_task_timeout_is_deliberately_absent`）。
+    任务总预算实际由 arq 的 `job_timeout` 杀进程兑现，收尾是
+    `WORKER_INTERRUPTED`——**这是文档与实现的一处语义空洞，已登记**。
+
+137. **判 503 的唯一标准是「这个实例完全不能用」**（`/health/ready`）。
+    今天只有 MySQL 满足（唯一权威、无降级路径）；Redis / Qdrant / 业务库 /
+    对象存储都只影响**部分功能**（状态查询、已缓存结果仍可用），
+    一律 **200 + `degraded`**。报 not_ready 会让编排层摘掉实例，
+    而摘掉它恰恰是最不该做的事（同约定 127 的队列积压）。
+    两条配套纪律：
+    - **探针必须可注入**（`app/tests/conftest.py` 的 `build_app` 注入假探针）。
+      不可注入的话单测会去连真 Qdrant——**这是单测能跑的前提，不是可选项**；
+    - **结果要缓存几秒**（`_PROBE_CACHE_SECONDS`）。不缓存时依赖一挂，
+      每一次 ready 都要等满探针超时——"探测本身"变成一种负载，
+      而 ready 从毫秒变成秒级。
+    ⚠️ 排查时注意**缓存会吃掉刚停依赖后的第一次探测**：实测踩到过
+    "停了 Qdrant 还报 ready"，等过缓存窗口才是真结果。
+
+138. **孤儿回收要置 `trace_incomplete=True`**（`_task_failed_as_orphan`）。
+    Worker 被 `kill -9` 时一条轨迹都没来得及落，而 `/trace` 会返回
+    "完整但空"——与"这个任务真的没有执行过任何一步"长得一模一样。
+    不置位读起来像"任务什么都没做"，真相是"我们看不到它做了什么"。
+
+139. **压测的那两个数必须连着它们的代价一起说**：
+    - **压测绕开了产品配额**（单用户 3 个并发 / 建任务 10 每分钟 /
+      状态查询 120 每分钟，三道闸门都挡 20 并发）。它测的是**配额之外的容量**，
+      不是"默认配置下的用户体验"；配额本身由单测/集成覆盖。
+      ⚠️ 放开用的那几个值是**配置上界**（`config.py` 的 `le=`），再往上写
+      **启动即失败**——实测踩到：写 `RATE_LIMIT_CREATE_PER_MINUTE=2000`
+      让 Worker 起不来（上界 1000）。
+    - **NFR-P-08（排队等待 P95 ≤ 2s）与 NFR-P-06（并发 ≥20）在给定任务耗时下
+      数学互斥**：单任务 S≈5–15s、W=4 时第 20 个任务等 ≈4S。
+      要两条同时成立必须 W ≥ 20。**这不是实现缺陷，是两条指标在给定 S 下的
+      一致性冲突**；需求原文已有"应在确定模型、硬件后重新校准"，
+      所以**不改目标、不改判据**，只给根因与理论吞吐估算。
+    ⚠️ **排队等待只能在并发场景量**：串行跑时它恒为 0，量它等于量一个恒等式，
+    而那个 0 会被读成"排队没问题"。
+
+140. **「有没有重复执行」只有一个可靠判据：数 SSE 重放里 `task.started` 的条数**。
+    另外三个候选**都不可靠**，而且失败方式都不报错：
+    - `agent_task.worker_id` —— **会被后一次执行覆盖**；
+    - 证据 / 工具调用行数 —— 落库是**整体替换**（`agent_repo.save` 先清后写），
+      重跑也是同一批行数；
+    - 助手消息 —— 用 `replace_for_task` 写（约定 113），**不是 append-only**。
+    `task.started` 由 `TaskRunner` 在 `claim` **成功之后**发一次，
+    而 `claim` 是 `QUEUED → RUNNING` 的条件更新——第二个领取者失败、也就不发第二条。
+
+141. **所有步骤都因故障失败时，任务终态仍是 `SUCCEEDED`**（2026-10-02 实测记录）。
+    单源任务在依赖挂掉时，图会走到"如实拒答"那条路：终态 `SUCCEEDED`、
+    `error_code` 为 `None`、而故障写进了答案的限制清单里
+    （"执行期间的错误：`UPSTREAM_UNAVAILABLE`…"）。
+    与**模型不可用那条不对称**（那条 supervisor 就挂了 ⇒ `FAILED`），
+    因为那时还没有任何步骤、也就没有"如实拒答"这条路。
+
+    ⚠️ **代价是它会被算进成功率**——要把"全步骤因故障失败"反映到终态上，
+    动的是状态机与评测分母（同约定 89 的取向），属独立切片，**已登记**。
+    当前行为有 integration 用例显式钉着（**钉的是现状 + 写明这是发现**，
+    不是"这样对"）。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -1350,6 +1443,12 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **SSE 侧 `tool.completed` 的端到端断言**：本次只验了 `/trace`（工具级事件确实落了库、带 tool 与 summary），走 Redis 流那条路没单独跑。派生逻辑是同一条（`_derived_events`），所以缺的是验证不是实现 | 需要时 |
 | **多轮类进 `eval_agent_golden.yaml`**：本次只落在 `make demo`（见约定 115）。要进评测集得同时改 `CATEGORIES` / `_EXPECTED_PER_CATEGORY` 与重定基线 | 下一项 |
 | **按类设阈值（把分类通过率变成门禁）**：2026-10-02 评测集涨到 40 条之后，全局 85% 基线**拦不住"某一类（5 条）整体失效"**了——丢 5 条只剩 86.8%（> 85%），而单类的退化现在只有报告里那张分类表看得见。把每类的最低通过率写成判据（比如各 ≥ 60%）比抬高全局基线更对：**全局数字同时要"拦整类退化"与"容模型抖动"两件事，而那两件事在 40 条的规模上已经开始打架了** | 需要时 |
+| **`/health/detail`（admin-only）**：Phase 14 施工项 3 要它（Qdrant/业务库/对象存储的逐条延迟、队列深度、当前配置）。**本批只做了"降级状态进健康检查"那半**（需求 8.2 要求的），`/detail` 那半属 Phase 14。做的时候注意：它**不是探针**——编排层只能用 `/health/live` 与 `/health/ready` | Phase 14 |
+| **`reconcile_queue` 的分布式锁**：`reclaim_orphans` 有 `_exclusive("orphan_reclaim")`，它没有——多实例会并发扫。**判定为"省扫"而不是缺陷**（正确性靠 `enqueue` 的 `_job_id` 幂等 + `is_pending` 兜住），但那个判定**只有同进程串行的用例**撑着。做法：先补一条"两个实例并发 reconcile 只重投一次"的 integration，**红了才修** | 需要时 |
+| **`JobQueue.enqueue` 改成三态**（`ENQUEUED` / `ALREADY_QUEUED` / `FAILED`）：需求 8.2 明写"任务投递失败则**快速返回可重试错误**"，而今天 Redis 挂了仍返回 202、任务停在 QUEUED，`reconcile_queue` 在 Redis 一直挂着时也 `continue` 掉、永远不会置 `ENQUEUE_FAILED`。⚠️ **不能只改 `_dispatch`**：现在的 `bool` 把"Redis 挂了"与"幂等命中"**混成同一个 `False`**，直接拿它判 503 会把幂等重放也判成失败。要动 Protocol + 2 实现 + 调用点 | 需要时 |
+| **`TASK_TIMEOUT` 的产出**：19.1 定义了它的优雅停（"返回已有证据和限制"），而实际由 arq 的 `job_timeout` 杀进程、由孤儿回收写成 `WORKER_INTERRUPTED`。**这个码全仓没有生产者**（见约定 136）——要么实现优雅停，要么从 19.1 删掉它 | 需要时 |
+| **「全步骤因故障失败」反映到任务终态**：今天单源任务在依赖挂掉时终态是 `SUCCEEDED`（+ 如实拒答 + 限制里带错误码），会被算进成功率（见约定 141） | 需要时 |
+| **`SCENARIO=capacity` 需要 `WORKER__CONCURRENCY ≥ 20`**：`make load-test` 的容量场景要先把 Worker 并发提上去才有意义（默认 4 时峰值只能是 4，而那个 ✗ 说的是"默认配置达不到"，不是"系统达不到"）。把两档配置的实测都跑一遍并写进报告，是**下一项** | 下一项 |
 | **`WAITING_CLARIFICATION` 续跑**（详设 15.2 的 `parent_task_id`）：用户补充后新建 task 并复用原计划摘要，是**另一片**（要动任务终态与 API/SSE 侧）。会话内短期记忆不含它 | 需要时 |
 | 会话列表 / 删除 API 与 180 天保留期清理（`make cleanup` 仍是占位实现）。`agent_message.deleted_at` 的过滤**已经写好并有集成用例钉着**，只是还没有生产者 | Phase 12 / 需要时 |
 | ~~拒答句进 `claims` 导致 `CLAIM_WITHOUT_EVIDENCE` 误报~~ **已修（2026-09-28）**：`ClaimKind` 加 `ABSENCE`，豁免要求 `ABSENCE` **且** `refused`（见约定 118）；`_evidence_ratio` 的分母同步排除。analysis prompt 升 `1.4.0` | ✅ 本次 |

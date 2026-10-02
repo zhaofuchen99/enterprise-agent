@@ -26,6 +26,11 @@ from app.api.errors import register_exception_handlers
 from app.api.middleware import TraceContextMiddleware
 from app.core.config import Settings, get_settings
 from app.infrastructure.db import create_engine, create_session_factory
+from app.infrastructure.health import (
+    DependencyProbe,
+    build_dependency_probes,
+    run_probes,
+)
 from app.infrastructure.logging import SERVICE_API, clear_context, setup_logging
 from app.infrastructure.model_gateway import ModelGateway, build_model_gateway
 from app.infrastructure.observability import (
@@ -183,6 +188,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ——最需要这个信号的时刻它缺席。代价如实记下：多副本 API 会各导一份
     # （当前部署是单 API + 单 Worker，见 docker-compose.dev.yml）。
     depth_task = asyncio.create_task(_sample_queue_depth(settings, queue))
+    # `/health/ready` 的依赖探针（详设 20.3）。**建一次、挂到 app.state**：
+    # ready 会被编排层每隔几秒打一次，每次请求现建客户端等于把健康检查
+    # 本身变成一种负载。探针内部的连接在进程退出时关（与 redis / engine 同段）。
+    probes = build_dependency_probes(settings)
+    app.state.dependency_probes = probes
     try:
         yield
     finally:
@@ -193,6 +203,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # OTel 收尾**放在最前面**：它要 flush 还没导出的 span 与指标，
         # 而下面几步会把它们的落点（连接池）先关掉
         shutdown_observability()
+        for probe in probes:
+            with suppress(Exception):
+                await probe.aclose()
         await gateway.aclose()
         await queue.aclose()
         await redis.aclose()
@@ -285,24 +298,27 @@ def create_app() -> FastAPI:
 
     @app.get("/health/ready", tags=["health"], summary="就绪探针")
     async def health_ready(request: Request) -> Response:
-        """关键外部依赖是否可用。
+        """关键外部依赖是否可用（详设 20.3、需求 8.2）。
 
-        **两个依赖的处理刻意不同**：
+        **两类依赖的处理刻意不同，判据是「这个实例还能不能用」**：
 
-        - **Redis 不可用返回 200 + `degraded`，不是 503。** 这不是放松要求：
-          Phase 1.5 已经实现了降级路径（限流退回本地令牌桶、投递失败由补偿扫描
-          兜底），API 在 Redis 挂掉时仍能对外服务。此时报 not_ready 会让编排层
-          摘掉这个实例，而摘掉它恰恰是最不该做的事——降级路径本来就是为了
-          「Redis 挂了也要撑住」而存在的。
         - **MySQL 不可用返回 503。** Phase 2 起它是任务、会话、用户的**唯一权威**，
           没有任何降级路径：库连不上时登录、建任务、查状态全部失败，
           此时如实报 not_ready 让编排层摘掉实例才是对的。
+        - **其余依赖不可用返回 200 + `degraded`，不是 503。** Redis（限流退回
+          本地令牌桶、投递失败由补偿扫描兜底）、Qdrant、业务库、对象存储都只影响
+          **部分功能**——状态查询与已缓存结果的读取照常可用。报 not_ready 会让
+          编排层摘掉实例，而摘掉它恰恰是最不该做的事：降级路径本来就是为了
+          「依赖挂了也要撑住」而存在的。
 
-        Milvus 的就绪检查随 Phase 5 一并接入。
+        ⚠️ **队列积压刻意不在这里**（CLAUDE.md 约定 127）：积压是"消费能力下降"，
+        而 Worker 全挂时才会积压——那一刻正是要保住 API 实例的时候。
+        它只记日志与指标，不进任何探针。
         """
-        redis_client: aioredis.Redis = request.app.state.redis
         sessions: async_sessionmaker[AsyncSession] = request.app.state.sessions
 
+        # MySQL 逐条判、不进探针那一套：探针表达的是"部分功能降级"，
+        # 而它是"实例不能用"——两者混在一起会让阈值与语义一起糊掉
         try:
             async with sessions() as session:
                 await session.execute(text("SELECT 1"))
@@ -317,23 +333,35 @@ def create_app() -> FastAPI:
             )
 
         degraded: list[str] = []
+        checked: list[str] = ["mysql"]
+
+        # Redis 不走探针：它是 API 自己持有的连接，而**限流器的降级状态**比
+        # 一次 ping 更能说明问题（它带熔断与收紧系数，见 `rate_limit.py`）
+        checked.append("redis")
         try:
-            await redis_client.ping()
+            await request.app.state.redis.ping()
         except Exception as exc:
             degraded.append(f"redis({type(exc).__name__})")
+
+        limiter = request.app.state.rate_limiter
+        if limiter.is_degraded:
+            checked.append("rate_limit")
+            degraded.append(f"rate_limit({limiter.last_degraded_reason})")
+
+        probes: list[DependencyProbe] = request.app.state.dependency_probes
+        for result in await run_probes(
+            probes, timeout_seconds=settings.health_probe_timeout_seconds
+        ):
+            checked.append(result.name)
+            if not result.ok:
+                degraded.append(result.error or result.name)
 
         if degraded:
             return JSONResponse(
                 status_code=200,
-                content={
-                    "status": "degraded",
-                    "degraded": degraded,
-                    "checked": ["mysql", "redis"],
-                },
+                content={"status": "degraded", "degraded": degraded, "checked": checked},
             )
-        return JSONResponse(
-            status_code=200, content={"status": "ready", "checked": ["mysql", "redis"]}
-        )
+        return JSONResponse(status_code=200, content={"status": "ready", "checked": checked})
 
     return app
 

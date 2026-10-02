@@ -22,6 +22,7 @@ from arq.worker import Worker
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
+from app.core.errors import ErrorCode
 from app.domain.task import Task, TaskStatus
 from app.infrastructure.queue import TASK_JOB_NAME, ArqJobQueue
 from app.infrastructure.redis import RedisKey, create_client
@@ -428,6 +429,11 @@ async def test_orphan_reclamation_picks_up_a_dead_worker_task(
     reclaimed = await repo.get(task.id)
     assert reclaimed is not None
     assert reclaimed.status is TaskStatus.FAILED
+    assert reclaimed.error_code == ErrorCode.WORKER_INTERRUPTED.value
+    # **轨迹不完整必须置位**：Worker 是被强杀的，一条轨迹都没来得及落。
+    # 不置位的话 `/trace` 返回"完整但空"，读起来像"这任务什么都没做"，
+    # 而真相是"我们看不到它做了什么"——两者的处置完全不同。
+    assert reclaimed.trace_incomplete is True
     assert await repo.count_active("usr_int") == 0
 
 
@@ -533,3 +539,182 @@ async def test_events_from_a_real_worker_reach_a_subscriber_on_another_instance(
     # 任务循环的判定必须在流里（18.2：`progress.assessed` 不允许省略）
     assert TaskEventType.PROGRESS_ASSESSED.value in frames
     assert TaskEventType.REVIEW_COMPLETED.value in frames
+
+
+# ======================================================= 故障注入（需求 8.2 / 开发流程 6.15）
+
+
+async def _run_one_task(task: Task, *, repo: SqlTaskRepository, job_timeout: int = 30) -> Task:
+    """投递 → 跑一轮 burst Worker → 取回终态。
+
+    抽出来是因为本段每条用例都要跑一次完整链路，而 **Worker 的装配段
+    （`on_startup`）在四段里都是同一份**——复制四遍的话，改一处漏三处
+    的症状是"某条用例测的还是旧装配"。
+    """
+    settings = get_settings()
+    queue = await ArqJobQueue.create(settings)
+    try:
+        await queue.enqueue(task_id=task.id, trace_id=task.trace_id, trace_context={})
+    finally:
+        await queue.aclose()
+
+    worker = Worker(
+        functions=WorkerSettings.functions,
+        queue_name=RedisKey.queue(),
+        redis_settings=WorkerSettings.redis_settings,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        burst=True,
+        max_jobs=1,
+        job_timeout=job_timeout,
+    )
+    await worker.async_run()
+
+    finished = await repo.get(task.id)
+    assert finished is not None
+    return finished
+
+
+async def test_a_qdrant_outage_is_reported_as_a_retryable_upstream_error(
+    redis: aioredis.Redis,
+    repo: SqlTaskRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qdrant 挂掉 → 任务报 `UPSTREAM_UNAVAILABLE`，**不是 `INTERNAL_ERROR`**。
+
+    这里用的是**真的 `QdrantVectorStore`，只是指向一个没人监听的端口**——
+    不用替身假装失败。整条链路（检索器 → RAG 工具 → 图 → 任务收尾）都真的跑了一遍，
+    所以它同时验了 `vector_store._QDRANT_FAILURES` 那层包装在链路里生效。
+
+    **修之前**：原始异常穿到 `graph.ainvoke` 与 `TaskRunner.execute` 的
+    `except Exception`，任务以 `INTERNAL_ERROR` + `trace_incomplete` 收场
+    ——"内部错误"不可重试，而它其实是一次外部依赖不可用。
+    **修之后**：一次**正常的步骤失败**，图正常收尾、轨迹完整可查。
+
+    ⚠️ 同时钉住**反向**那一条（约定 29）：**绝不能**变成 `NO_RELEVANT_KNOWLEDGE`。
+    "服务挂了"与"语料里没有"的处置完全相反，后者会对着用户说"公司没有这条制度"。
+    """
+    from app.agent.schemas.plan import IntentResult
+    from app.agent.schemas.review import ModelReview
+    from app.infrastructure.vector_store import QdrantVectorStore
+    from app.tests.fakes import FakeModelGateway
+    from app.tools.rag.schemas import QueryRewrite
+
+    # 指向死端口的**真** Qdrant 实现：连不上是即时的，用例不会挂住
+    monkeypatch.setattr(
+        "app.worker.build_vector_store",
+        lambda _settings: QdrantVectorStore(url="http://127.0.0.1:1", collection="whatever"),
+    )
+    monkeypatch.setattr(
+        "app.worker.build_model_gateway",
+        lambda _settings: FakeModelGateway(
+            # ⚠️ **脚本必须按真实调用顺序排**，而且**只有三次**：
+            # ① supervisor 出意图；② 改写（它排在检索之前，所以会先成功）；
+            # ③ 审查的第二阶段。
+            # **没有 analysis 那一次**——检索失败 ⇒ 一条证据都没有 ⇒
+            # `analysis` 走的是**代码置位拒答**那条路，模型压根不被调用
+            # （约定 82）。多排一项的话会错位，表现是 reviewer 拿到
+            # AnalysisResult 并报 ValidationError，而任务以 INTERNAL_ERROR 收场
+            # ——报错指向"内部错误"，不指向脚本（这条实测踩到过）。
+            [
+                IntentResult(intent="QUERY", required_sources=("rag",), confidence=0.9),
+                QueryRewrite(queries=("华东区域渠道折扣政策",)),
+                ModelReview(),
+            ]
+        ),
+    )
+
+    task = _task("tsk_0000000000000000000011")
+    await repo.add(task)
+
+    finished = await _run_one_task(task, repo=repo)
+
+    answer = finished.final_answer_md or ""
+    # ① **故障被如实说出来**，而且说的是"服务不可用"而不是"公司没有这条制度"
+    assert ErrorCode.UPSTREAM_UNAVAILABLE.value in answer
+    assert ErrorCode.NO_RELEVANT_KNOWLEDGE.value not in answer
+    # ② 轨迹这次是**完整**的：失败发生在图里，收尾路径正常返回，五张表照常落库。
+    #    修之前这里是 `True`——而那个 `True` 表达的是"我们什么都没看到"，
+    #    不是"任务没跑"。
+    assert finished.trace_incomplete is False
+
+    # ③ **如实记下一处现状**：这一条的终态是 `SUCCEEDED`，不是 `FAILED`。
+    #    它表达的是"任务跑完了、并且如实说出了自己答不了"，而不是"没出问题"。
+    #    与模型不可用那条**不对称**（那条 supervisor 就挂了 ⇒ FAILED），
+    #    因为那时还没有任何步骤、也就没有"如实拒答"这条路。
+    #    ⚠️ 代价是它会被算进成功率——要把"全步骤因故障失败"反映到终态上，
+    #    动的是状态机与评测分母，属独立切片（已登记）。
+    assert finished.status is TaskStatus.SUCCEEDED
+    assert finished.error_code is None
+
+
+async def test_a_model_outage_fails_the_task_with_a_retryable_code(
+    redis: aioredis.Redis,
+    repo: SqlTaskRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型不可用 → 任务 FAILED 且**报得出是什么问题**，不是一句"内部错误"。
+
+    supervisor 走的是"模型不可用就报错，**不降级成两路都查**"（约定 35）：
+    降级看起来更稳，但它会在故障期间把 FR-PLAN-002 那条验收悄悄作废，
+    而结果看起来完全正常（确实拿到了数据）。
+    """
+    from app.tests.fakes import FakeFailure, FakeModelGateway
+
+    monkeypatch.setattr(
+        "app.worker.build_model_gateway",
+        lambda _settings: FakeModelGateway([], failure=FakeFailure.RATE_LIMITED),
+    )
+
+    task = _task("tsk_0000000000000000000012")
+    await repo.add(task)
+
+    finished = await _run_one_task(task, repo=repo)
+
+    assert finished.status is TaskStatus.FAILED
+    assert finished.error_code == ErrorCode.MODEL_RATE_LIMITED.value
+
+
+async def test_reconcile_queue_redelivers_a_task_that_never_reached_the_queue(
+    redis: aioredis.Redis, repo: SqlTaskRepository
+) -> None:
+    """写库成功但**没进队列** → 补偿扫描重投（详设 17.1）。
+
+    这是 `reconcile_queue` 的**唯一集成覆盖**。单元测试用 fakeredis 验了逻辑，
+    而"真 Redis 上 `is_pending` 与 `enqueue` 的配合"只有这里能验——
+    写错的话症状是**任务永远停在 QUEUED**，而没有任何地方报错：
+    用户在界面上看到"排队中"，等多久都是排队中。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.repositories.agent_repo import InMemoryAgentArtifactRepository
+    from app.services.task_runner import TaskRunner
+
+    settings = get_settings()
+    # **只把 queued_at 造旧，status 保持 QUEUED**：这就是"写库成功、投递没成"
+    # 的现场。`TaskPatch` 刻意没有 `queued_at`（它是建档时写一次的事实），
+    # 所以这里在造对象时直接给旧值，而不是事后改。
+    stale = datetime.now(UTC) - timedelta(seconds=settings.worker.queue_reconcile_seconds * 2)
+    task = _task("tsk_0000000000000000000013").model_copy(update={"queued_at": stale})
+    await repo.add(task)
+
+    queue = await ArqJobQueue.create(settings)
+    runner = TaskRunner(
+        tasks=repo,
+        queue=queue,
+        events=RedisStreamEventBus(redis, settings),
+        settings=settings,
+        redis=redis,
+        artifacts=InMemoryAgentArtifactRepository(),
+    )
+    report = await runner.reconcile_queue()
+
+    assert report.requeued == 1
+    assert await queue.is_pending(task.id) is True
+    still_queued = await repo.get(task.id)
+    assert still_queued is not None and still_queued.status is TaskStatus.QUEUED
+
+    # **再跑一次不会重复投递**：`is_pending` 先问队列（"排队慢"与"真丢了"
+    # 是两件事），而 `enqueue` 的 `_job_id` 去重再兜一道
+    assert (await runner.reconcile_queue()).requeued == 0
+    await queue.aclose()

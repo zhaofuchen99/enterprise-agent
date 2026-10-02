@@ -117,6 +117,7 @@ def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None =
         FakeJobQueue,
         FakeModelGateway,
         FakeSessionFactory,
+        build_fake_probes,
         build_memory_repositories,
     )
 
@@ -126,6 +127,11 @@ def build_app(fake_redis: fakeredis.aioredis.FakeRedis, queue: JobQueue | None =
     # 就绪探针会拿 sessions 执行 SELECT 1；注入替身而不是真实工厂，
     # 使探针的调用形状仍然被覆盖（503 分支见 integration 用例）。
     application.state.sessions = FakeSessionFactory()
+    # `/health/ready` 的依赖探针（Qdrant / 业务库 / 对象存储）**必须注入替身**：
+    # 真实的那些会去连网，而"单元测试不依赖任何外部组件"是 `make test` 的契约。
+    # 这里注入的是"三条都健康"；要验降级分支的用例自己覆盖
+    # `application.state.dependency_probes`。
+    application.state.dependency_probes = build_fake_probes()
     wire_dependencies(
         application,
         settings,

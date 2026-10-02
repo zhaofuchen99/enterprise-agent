@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from app.core.config import Settings
 from app.core.errors import AgentError, ErrorCode
+from app.infrastructure.health import ProbeResult
 from app.infrastructure.model_gateway import (
     ModelGateway,
     PromptSource,
@@ -359,3 +360,41 @@ def build_memory_repositories(settings: Settings) -> Repositories:
         documents=InMemoryKnowledgeDocumentRepository(),
         artifacts=InMemoryAgentArtifactRepository(),
     )
+
+
+class FakeProbe:
+    """依赖探针的替身（`infrastructure/health.py` 的 `DependencyProbe`）。
+
+    单元测试**不能连真 Qdrant / 业务库 / MinIO**——不注入它的话，`/health/ready`
+    会在 `make check` 里真的去打网络，而那正是"单元测试不依赖外部组件"这条
+    契约要挡住的事。**探针可注入不是可选项，是单测能跑的前提。**
+
+    `ok=False` 时 `error` 的形状与真实探针一致（`redis(ConnectionError)`），
+    因为 `/health/ready` 的响应体把这一串原样报出去——形状不一致的话，
+    用例钉住的就不是线上真正会出现的那个字符串。
+    """
+
+    def __init__(self, name: str, *, ok: bool = True, reason: str = "ConnectionError") -> None:
+        self.name = name
+        self._ok = ok
+        self._reason = reason
+        self.closed = False
+        self.probes = 0
+
+    async def probe(self) -> ProbeResult:
+        self.probes += 1
+        if self._ok:
+            return ProbeResult(self.name, True, latency_ms=0)
+        return ProbeResult(self.name, False, latency_ms=0, error=f"{self.name}({self._reason})")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def build_fake_probes(*, ok: bool = True) -> list[FakeProbe]:
+    """探针替身的一组默认值：名字与真实装配**逐字一致**。
+
+    名字不一致的话，`checked` 列表会与实际部署不同，而那条断言看起来
+    仍然在验东西。
+    """
+    return [FakeProbe(name, ok=ok) for name in ("qdrant", "business_db", "object_storage")]

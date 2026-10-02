@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -177,7 +177,7 @@ async def stream_frames(
     bus: EventBus,
     settings: Settings,
     after_id: str | None = None,
-) -> AsyncIterator[SseFrame]:
+) -> AsyncGenerator[SseFrame, None]:
     """一个任务的 SSE 帧序列（不含 HTTP 细节，因此可以脱离 ASGI 测）。
 
     Args:

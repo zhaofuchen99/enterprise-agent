@@ -531,6 +531,11 @@ class TaskRunner:
                 finished_at=now,
                 error_code=ErrorCode.WORKER_INTERRUPTED.value,
                 error_message="执行该任务的 Worker 已失联，任务被回收",
+                # **这一条必须置位**：Worker 是被强杀的（`kill -9`），
+                # 一条轨迹都没来得及落——`/trace` 会返回"完整但空"，
+                # 与"这个任务真的没有执行过任何一步"长得一模一样。
+                # 不置位的症状读起来像"任务什么都没做"，而真相是"我们看不到它做了什么"。
+                trace_incomplete=True,
             ),
             at=now,
             only_if_status=TaskStatus.RUNNING,

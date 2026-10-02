@@ -43,12 +43,15 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from datetime import date
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from app.core.config import Settings
+from app.core.errors import AgentError, ErrorCode
 
 #: 稠密向量在 collection 里的字段名（11.5 的「命名向量」）
 DENSE_VECTOR = "dense"
@@ -267,6 +270,50 @@ class VectorStore(Protocol):
 
 # --------------------------------------------------------------------- Qdrant
 
+#: Qdrant 客户端在**传输/服务**两类故障下抛出的异常。
+#:
+#: 实测（2026-10-02，`docker stop ea-qdrant` 之后跑一次检索）：
+#:
+#:     ResponseHandlingException <- httpx.ConnectError <- httpcore.ConnectError
+#:       <- OSError <- ConnectionRefusedError
+#:
+#: 所以最外层是 `ResponseHandlingException`，但它**不是唯一可能**：非 2xx
+#: （collection 不存在等）走 `UnexpectedResponse`，而 httpx 自己的异常在某些
+#: 调用路径上可能原样冒出。**这四个是一组实测结论，不是从文档抄的**——
+#: 最初按文档猜的那一版一个都接不住（真正抛出来的东西比文档写的更靠内层）。
+_QDRANT_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    ResponseHandlingException,
+    UnexpectedResponse,
+    httpx.HTTPError,
+    OSError,
+)
+
+
+def _upstream(operation: str, exc: BaseException) -> AgentError:
+    """Qdrant 的传输/服务故障 → **可重试的上游不可用**（19.1 的 503）。
+
+    为什么要包：不包的话原始异常会一路穿到 `graph.ainvoke` 与
+    `TaskRunner.execute` 的 `except Exception`，任务以 `INTERNAL_ERROR`
+    收场（"内部错误"），而它其实是一次**外部依赖不可用**——不可重试、
+    只剩一个异常类名，与业务库断连、模型 429 的待遇完全不同。
+
+    ⚠️ **只包真属于"上游挂了"的异常，绝不 `except Exception`**：
+    `TypeError` / `KeyError` 这类是**我们自己的 bug**，把它也伪装成
+    "可重试的上游故障"等于把一个永久性缺陷降级成一次抖动——它会重试、
+    会失败，而排查方向被指向 Qdrant。（这个坑在写这一版时就踩过一次：
+    实验脚本少传一个参数抛 `TypeError`，看起来与"Qdrant 挂了"一模一样。）
+    """
+    return AgentError(
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+        "向量检索服务暂时不可用，请稍后重试",
+        details={
+            "error_class": "TRANSIENT",
+            "store": "qdrant",
+            "operation": operation,
+            "cause": type(exc).__name__,
+        },
+    )
+
 
 class QdrantVectorStore:
     """Qdrant 服务端实现（TBC-05 选定的形态）。
@@ -355,27 +402,33 @@ class QdrantVectorStore:
     async def search_dense(
         self, query: Sequence[float], *, limit: int, chunk_filter: ChunkFilter
     ) -> list[ScoredPoint]:
-        result = await self._client.query_points(
-            self._collection,
-            query=list(query),
-            using=DENSE_VECTOR,
-            limit=limit,
-            query_filter=_build_filter(chunk_filter),
-            with_payload=True,
-        )
+        try:
+            result = await self._client.query_points(
+                self._collection,
+                query=list(query),
+                using=DENSE_VECTOR,
+                limit=limit,
+                query_filter=_build_filter(chunk_filter),
+                with_payload=True,
+            )
+        except _QDRANT_FAILURES as exc:
+            raise _upstream("search_dense", exc) from exc
         return _to_scored(result.points)
 
     async def search_sparse(
         self, query: dict[int, float], *, limit: int, chunk_filter: ChunkFilter
     ) -> list[ScoredPoint]:
-        result = await self._client.query_points(
-            self._collection,
-            query=_to_sparse(query),
-            using=SPARSE_VECTOR,
-            limit=limit,
-            query_filter=_build_filter(chunk_filter),
-            with_payload=True,
-        )
+        try:
+            result = await self._client.query_points(
+                self._collection,
+                query=_to_sparse(query),
+                using=SPARSE_VECTOR,
+                limit=limit,
+                query_filter=_build_filter(chunk_filter),
+                with_payload=True,
+            )
+        except _QDRANT_FAILURES as exc:
+            raise _upstream("search_sparse", exc) from exc
         return _to_scored(result.points)
 
     async def hybrid_rrf(
@@ -393,26 +446,29 @@ class QdrantVectorStore:
         才是最终候选数——把两路都设成最终值会让"每路多召回一些、由融合来筛"
         这个前提失效，融合就只是在两个已经很窄的集合里挑。
         """
-        result = await self._client.query_points(
-            self._collection,
-            prefetch=[
-                models.Prefetch(
-                    query=list(dense_query),
-                    using=DENSE_VECTOR,
-                    limit=limit,
-                    filter=_build_filter(chunk_filter),
-                ),
-                models.Prefetch(
-                    query=_to_sparse(sparse_query),
-                    using=SPARSE_VECTOR,
-                    limit=limit,
-                    filter=_build_filter(chunk_filter),
-                ),
-            ],
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=limit,
-            with_payload=True,
-        )
+        try:
+            result = await self._client.query_points(
+                self._collection,
+                prefetch=[
+                    models.Prefetch(
+                        query=list(dense_query),
+                        using=DENSE_VECTOR,
+                        limit=limit,
+                        filter=_build_filter(chunk_filter),
+                    ),
+                    models.Prefetch(
+                        query=_to_sparse(sparse_query),
+                        using=SPARSE_VECTOR,
+                        limit=limit,
+                        filter=_build_filter(chunk_filter),
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+            )
+        except _QDRANT_FAILURES as exc:
+            raise _upstream("hybrid_rrf", exc) from exc
         return _to_scored(result.points)
 
     async def set_status(self, chunk_ids: Sequence[str], status: str) -> None:
@@ -451,15 +507,18 @@ class QdrantVectorStore:
 
     async def fetch(self, chunk_filter: ChunkFilter, *, limit: int) -> list[ChunkRecord]:
         _require_document_scope(chunk_filter)
-        records, _ = await self._client.scroll(
-            self._collection,
-            scroll_filter=_build_filter(chunk_filter),
-            limit=limit,
-            # 取 payload 不取向量：调用方要的是正文与标量字段，而向量
-            # 每次都是 1024 维浮点——白搬一趟。
-            with_payload=True,
-            with_vectors=False,
-        )
+        try:
+            records, _ = await self._client.scroll(
+                self._collection,
+                scroll_filter=_build_filter(chunk_filter),
+                limit=limit,
+                # 取 payload 不取向量：调用方要的是正文与标量字段，而向量
+                # 每次都是 1024 维浮点——白搬一趟。
+                with_payload=True,
+                with_vectors=False,
+            )
+        except _QDRANT_FAILURES as exc:
+            raise _upstream("fetch", exc) from exc
         return [_to_record(dict(item.payload or {})) for item in records]
 
     async def aclose(self) -> None:

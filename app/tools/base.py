@@ -24,7 +24,7 @@ Phase 4 只有 SQL 一个 Tool，写不写这套基类都能跑通。之所以�
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,6 +50,42 @@ ErrorClass = Literal[
     "TIMEOUT",  # 工具超时 → 可降级则继续，否则失败
     "INTERNAL",  # 未分类代码错误 → 失败并记录堆栈
 ]
+
+#: 错误码 → 9.4 的错误类别。**两个工具共用这一份**（`sql/tool.py` 与 `rag/tool.py`）。
+#:
+#: 各写一份的漂移方式是"同一个码在两边给出不同类别"，而类别决定的是**下一步动作**
+#: （重试 1 次 / 定向修复 / 终止步骤）——症状是两个工具对同一种故障反应不同，
+#: 且没有任何地方报错。这一条已经发生过：RAG 侧曾把上游不可用错贴成 `VALIDATION`，
+#: 而 `VALIDATION` 的默认动作是"让模型重试解析"，等于建议了一个错的动作。
+#:
+#: 只列**工具层可能看到**的码，不照抄 19.1 全表：表里属于 API 层的那些
+#: （`AUTHENTICATION_REQUIRED` / `TASK_NOT_FOUND` …）出现在工具结果里说明有 bug，
+#: 落到兜底的 `INTERNAL` 才对。
+_CODE_ERROR_CLASS: Final[dict[str, ErrorClass]] = {
+    "SQL_VALIDATION_FAILED": "SECURITY",
+    "SQL_EXECUTION_REPAIRABLE": "REPAIRABLE",
+    "UPSTREAM_UNAVAILABLE": "TRANSIENT",
+    "MODEL_RATE_LIMITED": "TRANSIENT",
+    "REDIS_UNAVAILABLE": "TRANSIENT",
+    "RATE_LIMITED": "TRANSIENT",
+    "MODEL_OUTPUT_INVALID": "VALIDATION",
+    "PLAN_INVALID": "VALIDATION",
+    "NO_RELEVANT_KNOWLEDGE": "EMPTY_RESULT",
+    "INTERNAL_ERROR": "INTERNAL",
+}
+
+
+def error_class_of(code: str) -> ErrorClass:
+    """错误码 → 9.4 的错误类别。码表外的码落 `INTERNAL`（不猜）。
+
+    ⚠️ **这里没有 `TASK_TIMEOUT`，是故意的**：19.1 给它的是**任务总预算**语义
+    （504 / 不重试 /「返回已有证据和限制」），而工具层遇到的超时是**单次调用的
+    时间预算**（如 `SQL_TOOL__TIMEOUT_SECONDS` 的 10 秒）——两者差一个量级，
+    用 504 会让客户端误判"整个任务终结了"。单次超时按 `UPSTREAM_UNAVAILABLE`
+    （503 / 可重试）报，而"是超时还是连接被拒"由 `error_class` 表达
+    （`SqlExecutionError.error_class` 带 `TIMEOUT`，见 `sql/executor.py`）。
+    """
+    return _CODE_ERROR_CLASS.get(code, "INTERNAL")
 
 
 class ToolContext(BaseModel):
@@ -144,4 +180,5 @@ __all__ = [
     "ToolName",
     "ToolResult",
     "ToolStatus",
+    "error_class_of",
 ]

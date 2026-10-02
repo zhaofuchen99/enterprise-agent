@@ -489,6 +489,9 @@ async def test_reclaim_fails_tasks_whose_worker_disappeared(
     assert loaded is not None
     assert loaded.status is TaskStatus.FAILED
     assert loaded.error_code == ErrorCode.WORKER_INTERRUPTED.value
+    # **轨迹不完整也要置位**：Worker 被强杀，一条轨迹都没落。
+    # 不置位的话 `/trace` 返回"完整但空"，读起来像"这任务什么都没做"。
+    assert loaded.trace_incomplete is True
     # 回收的**主要目的**是释放并发配额：不释放的话用户被永久限流
     assert await repo.count_active("usr_1") == 0
     published = await events.read("tsk_0000000001AAAAAAAAAAAA")

@@ -8,6 +8,10 @@ COMPOSE := docker compose -f docker-compose.dev.yml
 .PHONY: migrate revision seed seed-business verify-business cleanup corpus corpus-list
 .PHONY: dict tokenize chunk vocab
 .PHONY: model-smoke sql eval-sql vector-spike
+# 评测与演示这一组原先**漏了 .PHONY**（`eval-rag` / `eval-agent` / `demo` /
+# `verify-corpus` 都不在里面）。漏掉的后果是：目录里一旦出现同名文件，
+# make 会认为"这个目标已经有了、不用跑"，而那表现为"命令什么都没做"。补上。
+.PHONY: eval-rag eval-agent eval-agent-ask demo demo-ask verify-corpus calibrate-rerank load-test
 
 help:  ## 显示所有可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -157,6 +161,53 @@ eval-agent-ask:  ## 先跑一遍再固化：make eval-agent-ask Q="某条还没�
 	uv run python scripts/eval_agent.py --ask "$(Q)" $(if $(ACCOUNT),--as $(ACCOUNT),)
 demo:  ## 端到端演示九条固化问题（前置：另一个终端跑 make run）
 	uv run python scripts/demo.py $(if $(ONLY),--only $(ONLY),) $(if $(BASE),--base $(BASE),) $(if $(ASK),--ask "$(ASK)",)
+
+# ⚠️ 压测**必须先在放开配额的环境里跑**（见 scripts/load_test.py 的文件头）。
+# 这几个值是**配置上界**（`config.py` 的 `le=`），再往上写启动即失败：
+#   MAX_RUNNING_TASKS_PER_USER=100 RATE_LIMIT_CREATE_PER_MINUTE=1000 \
+#   RATE_LIMIT_STATUS_PER_MINUTE=10000 RATE_LIMIT_STREAM_PER_MINUTE=1000 \
+#   WORKER__CONCURRENCY=<按场景，capacity 场景要 ≥20> make run
+# 否则第 4 个任务起就是 429，而报告上看起来像"系统扛不住"。
+load-test:  ## 性能基线压测（需求 8.1 的 NFR-P-01..08；前置：按压测 env 重启 make run）
+	uv run python scripts/load_test.py \
+		$(if $(SCENARIO),--scenario $(SCENARIO),) \
+		$(if $(SAMPLES),--samples $(SAMPLES),) \
+		$(if $(ACCOUNT),--account $(ACCOUNT),) \
+		$(if $(BASE),--base $(BASE),)
+
+# ---------------------------------------------------------------- 故障演练
+#
+# **不做成 make 目标**：它们要 stop/start 真实容器、要等心跳超时（30s+），
+# 且**中间态需要人看**（"degraded 里报的是哪一条"就是结论本身）。
+# 自动化成一条命令会把"观察"压成"通过/失败"，而这里要留下的恰恰是观察。
+# 每一条都只动 **ea-\* 容器**——⚠️ `ollama` 不是本项目的（裸容器，可能被
+# 别的项目共用），embedding 故障一律用进程内替身模拟，**绝不 stop 它**。
+#
+# ① Redis 不可用（降级而非不可用）
+#    docker stop ea-redis
+#    curl -s localhost:8000/health/ready
+#      → 200 + {"status":"degraded","degraded":["redis(ConnectionError)"]}
+#    curl -D - -o /dev/null -X POST localhost:8000/api/agent/chat …
+#      → **202** + `x-ratelimit-degraded: true` + 配额收紧为一半（×0.5）
+#      → ⚠️ 实测记录：任务**停在 QUEUED**（不报错、不快速失败）——
+#        与需求 8.2「投递失败则快速返回可重试错误」不一致，已登记
+#    docker start ea-redis
+#      → 补偿扫描（cron 30s）会把它重投，实测 ~20s 内 QUEUED → RUNNING
+#
+# ② 业务库 / ③ Qdrant 不可用（同一个"外部依赖挂了"要同一种待遇）
+#    docker stop ea-business-mysql   # 或 ea-qdrant
+#    make eval-agent-ask Q="2025年Q3华东地区的净销售额是多少？"
+#      → 答案的限制段写「执行期间的错误：UPSTREAM_UNAVAILABLE - …」，
+#        **不是 `INTERNAL_ERROR`、更不是 `NO_RELEVANT_KNOWLEDGE`**
+#      → 任务终态是 SUCCEEDED（如实拒答），见约定 141
+#    docker start ea-business-mysql  # 或 ea-qdrant
+#
+# ④ Worker 强杀 → 孤儿回收
+#    # 先起一个任务、等它 RUNNING，再：
+#    kill -9 $(pgrep -f "app[.]worker")
+#    make worker        # 起一个新的：孤儿回收是**活着的 Worker 的 cron** 干的
+#    # 等 > WORKER__HEARTBEAT_TTL_SECONDS（30s）后查任务：
+#      → FAILED + WORKER_INTERRUPTED + **trace_incomplete = true**（约定 138）
 
 # 账号变量叫 ACCOUNT 不叫 AS：`AS` 是 make 的**内建变量**（汇编器命令，
 # 值就是 "as"），`$(if $(AS),...)` 因此恒为真，命令会变成 `--as as`。

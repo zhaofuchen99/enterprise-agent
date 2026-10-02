@@ -465,3 +465,59 @@ async def test_an_infrastructure_failure_ends_the_stream_without_done(
     # 快照照发（它来自建连时的任务对象，不需要 Redis），
     # 然后流**干净地结束**——没有 done，也没有把异常抛给 ASGI
     assert [frame.event_type for frame in frames] == ["snapshot"]
+
+
+def _gauge(reader: Any, name: str) -> float:
+    """从 InMemoryMetricReader 里读出某个仪表的当前值（同步仪表 = 累计和）。"""
+    for resource in reader.get_metrics_data().resource_metrics:
+        for scope in resource.scope_metrics:
+            for metric in scope.metrics:
+                if metric.name == name:
+                    points = metric.data.data_points
+                    return float(points[0].value) if points else 0.0
+    return 0.0
+
+
+async def test_a_client_that_disconnects_early_drops_the_connection(
+    settings: Any, fake_redis: fakeredis.aioredis.FakeRedis
+) -> None:
+    """客户端**主动断开**：不发 `done`，连接计数减回，且不抛给 ASGI。
+
+    这与 `test_an_infrastructure_failure_ends_the_stream_without_done` 是
+    **两条不同的路径**：那一条是"服务端读 Redis 时炸了"，这一条是
+    "客户端自己不读了"。后者走 `GeneratorExit`——它是 `BaseException` 的子类，
+    **不被 `except Exception` 捕获**，所以流不会被误判成"正常结束"而补一个 `done`，
+    也不会打一条误导的"流异常终止"日志。
+
+    **不加 `request.is_disconnected()` 嗅探**：现有路径已经正确，而多一个不承重的
+    分支写错反而会提前掐断一条**正常**的流（18.4 的取舍）。这条用例钉的就是
+    "现状是对的"——将来谁动了 `except` 的粒度，它先红。
+
+    ⚠️ 连接计数必须回到 0：它挂在 `finally` 上，而**客户端断开正是最容易漏掉
+    释放的那个出口**。泄漏的症状是"`agent.sse.connections` 只增不减"，
+    而它在报表上看起来只是"有很多人连着"——不会有人去查一个偏高的数。
+    """
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from app.infrastructure.observability import (
+        configure_metrics_for_testing,
+        reset_for_testing,
+    )
+
+    reader = InMemoryMetricReader()
+    # **先 reset 再 configure**：仪表是**按名字缓存**的（`observability._instrument`），
+    # 前一个用例建出来的那个绑在别的 meter 上——不清缓存的话这里读到的恒为 0，
+    # 而"恒为 0"恰好也是这条断言期望的值，于是它会永远绿得没有意义。
+    reset_for_testing()
+    configure_metrics_for_testing(reader)
+    try:
+        frames = stream_frames(task=_task(), bus=_bus(fake_redis, settings), settings=settings)
+        first = await frames.__anext__()
+        assert first.event_type == "snapshot"
+        assert _gauge(reader, "agent.sse.connections") == 1.0
+
+        await frames.aclose()  # 客户端把连接断了
+
+        assert _gauge(reader, "agent.sse.connections") == 0.0
+    finally:
+        reset_for_testing()

@@ -42,7 +42,7 @@ from app.infrastructure.observability import span
 from app.infrastructure.storage import ObjectStorage
 from app.infrastructure.vector_store import VectorStore
 from app.repositories.vocab_repo import VocabRepository
-from app.tools.base import ToolContext, ToolError, ToolName, ToolResult
+from app.tools.base import ToolContext, ToolError, ToolName, ToolResult, error_class_of
 from app.tools.rag.evidence import build_document_evidence
 from app.tools.rag.reranker import SKIP_DISABLED, Reranker
 from app.tools.rag.retriever import Retriever
@@ -243,7 +243,13 @@ def _failure_result(call_id: str, started_at: datetime, exc: AgentError) -> Tool
         error=ToolError(
             code=exc.code.value,
             message=exc.message,
-            error_class="INTERNAL" if exc.code is ErrorCode.INTERNAL_ERROR else "VALIDATION",
+            # **按码查表，不再写死两个值**：原来那句
+            # `"INTERNAL" if code is INTERNAL_ERROR else "VALIDATION"` 会把
+            # `UPSTREAM_UNAVAILABLE`（向量库或 embedding 服务挂了）贴成
+            # `VALIDATION`，而 9.4 里 `VALIDATION` 的默认动作是"让模型重试解析"
+            # ——等于对一次服务故障建议了一个错的动作。表在 `tools/base.py`，
+            # 与 SQL Tool 共用同一份（见那里的说明）。
+            error_class=error_class_of(exc.code.value),
             # 重试与否由 Graph 路由按错误码决定（9.3），这里只传递事实
             retryable=exc.retryable,
             safe_detail=str(exc.details) if exc.details else None,

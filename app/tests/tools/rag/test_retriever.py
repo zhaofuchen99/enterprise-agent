@@ -1314,3 +1314,33 @@ async def test_table_position_reaches_the_evidence_locator(
 
     table_evidence = [e for e in evidence if e.locator["is_table"]]
     assert table_evidence and table_evidence[0].locator["table_row"] == [1, 3]
+
+
+async def test_tool_maps_an_upstream_outage_to_transient(
+    settings: Settings, vocabulary: Vocabulary
+) -> None:
+    """工具层把"上游挂了"贴成 `TRANSIENT`，**不是 `VALIDATION`**。
+
+    9.4 里 `VALIDATION` 的默认动作是"让模型结构化重试 1 次"——对一次服务故障
+    建议那个动作，等于把一次网络抖动当成"模型没按格式回"。
+
+    这一条与 `test_embedding_outage_is_not_reported_as_no_knowledge` 是同一处
+    故障的两端：那条钉"别把故障说成没有知识"，这条钉"别把故障归错类"。
+    """
+    store = InMemoryVectorStore()
+    await store.upsert([_point(0, text="华东渠道折扣", dense=[1.0, 0, 0, 0])])
+    gateway = _one_query_gateway(settings, "华东区域渠道折扣政策", [1.0, 0, 0, 0])
+    gateway.failure = FakeFailure.UNAVAILABLE
+    tool = RagRetrieveTool(
+        settings=settings, retriever=_retriever(settings, store, gateway, vocabulary)
+    )
+
+    result = await tool.execute(RagQueryArgs(question="华东区域渠道折扣政策"), _context())
+
+    assert result.status == "FAILED"
+    assert result.error is not None
+    assert result.error.code == ErrorCode.UPSTREAM_UNAVAILABLE.value
+    assert result.error.error_class == "TRANSIENT"
+    assert result.error.retryable is True
+    # 与"语料里没有"是两条路：那条有它自己的码与类别
+    assert result.error.code != ErrorCode.NO_RELEVANT_KNOWLEDGE.value

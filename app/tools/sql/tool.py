@@ -54,7 +54,14 @@ from app.domain.evidence import Evidence
 from app.domain.user import PermissionScope, UserRole
 from app.infrastructure.model_gateway import ModelGateway, StructuredResult, TokenUsage
 from app.infrastructure.observability import span
-from app.tools.base import ErrorClass, ToolContext, ToolError, ToolName, ToolResult
+from app.tools.base import (
+    ErrorClass,
+    ToolContext,
+    ToolError,
+    ToolName,
+    ToolResult,
+    error_class_of,
+)
 from app.tools.sql.evidence import build_evidence
 from app.tools.sql.executor import SqlExecutionError, SqlExecutor, SqlRunner
 from app.tools.sql.generator import SqlGenerator
@@ -73,19 +80,6 @@ from app.tools.sql.validator import SqlValidationError, SqlValidator
 
 #: 本工具的名字，写进 `agent_tool_call.tool_name` 与 Trace。
 TOOL_NAME: Final[ToolName] = "sql_query"
-
-#: 错误码 -> 详设 9.4 的错误类别。只覆盖「工具自己能产生的」那几个：
-#: 模型限流与上游不可用在网关那侧已经分好类，这里只是把码翻回类别。
-_CODE_CLASS: Final[dict[str, ErrorClass]] = {
-    "SQL_VALIDATION_FAILED": "SECURITY",
-    "SQL_EXECUTION_REPAIRABLE": "REPAIRABLE",
-    "TASK_TIMEOUT": "TIMEOUT",
-    "UPSTREAM_UNAVAILABLE": "TRANSIENT",
-    "MODEL_RATE_LIMITED": "TRANSIENT",
-    "MODEL_OUTPUT_INVALID": "VALIDATION",
-    "PLAN_INVALID": "VALIDATION",
-    "REDIS_UNAVAILABLE": "TRANSIENT",
-}
 
 
 @dataclass(frozen=True)
@@ -525,7 +519,7 @@ def _failure_result(call_id: str, started_at: datetime, exc: AgentError) -> Tool
     `message` 面向用户，「查询涉及当前账号无权访问的字段」这句话要能看懂，
     但**不能带上具体是哪个字段**——那本身就是一条越权信息。
     """
-    error_class: ErrorClass = getattr(exc, "error_class", None) or _class_of_code(exc.code.value)
+    error_class: ErrorClass = getattr(exc, "error_class", None) or error_class_of(exc.code.value)
     return ToolResult(
         call_id=call_id,
         tool=TOOL_NAME,
@@ -605,7 +599,7 @@ def _failed_attempt(
     exc: AgentError,
     started: float,
 ) -> SqlAttempt:
-    error_class: ErrorClass = getattr(exc, "error_class", None) or _class_of_code(exc.code.value)
+    error_class: ErrorClass = getattr(exc, "error_class", None) or error_class_of(exc.code.value)
     return SqlAttempt(
         attempt_no=attempt_no,
         stage="EXECUTE",
@@ -616,10 +610,6 @@ def _failed_attempt(
         error_summary=getattr(exc, "safe_detail", None) or exc.message,
         duration_ms=int((time.monotonic() - started) * 1000),
     )
-
-
-def _class_of_code(code: str) -> ErrorClass:
-    return _CODE_CLASS.get(code, "INTERNAL")
 
 
 # ------------------------------------------------------------------ 装配点
