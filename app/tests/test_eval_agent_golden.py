@@ -28,7 +28,10 @@ from scripts.eval_agent import CATEGORIES, GOLDEN_PATH, load_cases
 #: 就没有意义了。
 _EXPECTED_COUNTS: dict[str, int] = {
     "tool_selection": 5,
-    "conflict": 5,
+    # 需求规格 11.2 第 5 项原文要求「10 条多源冲突问题」，2026-10-02 补齐
+    # （原先 5 条）。三类判据各占一块：VALUE 02、DEFINITION 06/07、
+    # TIME 08，另有 04/05/09/10 四条零冲突用例守反方向。
+    "conflict": 10,
     "reviewer": 5,
     "clarification": 5,
     # 详设 22.10.5 明写"循环类问题至少 15 条"。**其余十类不跟着涨**
@@ -47,7 +50,7 @@ def _cases() -> list[dict[str, Any]]:
 
 
 def test_the_set_has_the_planned_number_of_cases() -> None:
-    """总量 = 各类条数之和（四类各 5 + 循环 15 = 35）。
+    """总量 = 各类条数之和（5 + **10** + 5 + 5 + 15 = 40）。
 
     数字要能被断言，不能只看总数——总数对了而分布错了（比如 12+5+2+1），
     某一类的通过率就没有意义了。

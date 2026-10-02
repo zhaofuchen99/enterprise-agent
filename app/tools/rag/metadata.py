@@ -100,6 +100,20 @@ class ChunkMetadata(BaseModel):
     #: 公司口径、区域报告里是区域口径，**光看表头分不出来**。漏掉它的后果是
     #: 把同一个总体当成两个，或者反过来把两个总体当成一个。
     document_scope: dict[str, str] = Field(default_factory=dict)
+    #: **统计截止日**（含入的最后一天），来自报告自身的 `report.cutoff`
+    #: （`month_end` 在入库侧已解析成具体日期）。
+    #: 它单独说明不了问题，要与它自称的 `stat_period` 配对：
+    #: 早于该期间末端即为**截短** → TIME 冲突（`conflict._claim_truncated`）。
+    #: `None` 表示**不知道**（非报告类文档没有这一项）。
+    stat_cutoff: date | None = None
+    #: 文档级**指标 code**，只对 METRIC 类口径说明文档有值——
+    #: 一篇 REPORT 同时讲五个指标，给它一个 code 会把它**错分组**。
+    #: 有了它，文档侧的 `definition_version` 才有比对的对象。
+    metric_code: str | None = None
+    #: 文档声明的**口径版本**（清单的 `definition_version`），与文档修订版本
+    #: `document_version` **是两件事**：后者进 `document_id`，前者只描述口径。
+    #: 与指标目录的 `MetricSpec.version` 不等即为 DEFINITION 冲突。
+    definition_version: str | None = None
     #: 发布态（PROCESSING / ACTIVE / FAILED / ARCHIVED），见模块 docstring 的偏离 1
     status: DocumentStatus = DocumentStatus.PROCESSING
     classification: str = "INTERNAL"
@@ -161,6 +175,9 @@ def metadata_for(
     published_at: datetime | None = None,
     stat_period: str | None = None,
     document_scope: dict[str, str] | None = None,
+    stat_cutoff: date | None = None,
+    metric_code: str | None = None,
+    definition_version: str | None = None,
     status: DocumentStatus = DocumentStatus.PROCESSING,
 ) -> ChunkMetadata:
     """`Chunk` + 文档级元数据 → 一块的 `ChunkMetadata`。
@@ -192,6 +209,9 @@ def metadata_for(
         # 但里面这个 dict 不是——入库时调用方复用它、事后改一下，
         # 已经写进 payload 的那份会跟着变，而那是"入库之后 payload 还会动"。
         document_scope=dict(document_scope or {}),
+        stat_cutoff=stat_cutoff,
+        metric_code=metric_code,
+        definition_version=definition_version,
         status=status,
         classification=classification,
         source_kind=source_kind,

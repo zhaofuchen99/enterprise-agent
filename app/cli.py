@@ -18,7 +18,7 @@ import json
 import sys
 import tempfile
 from collections.abc import Callable, Coroutine, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -30,6 +30,7 @@ from app.agent.schemas import SmokeAnswer
 from app.core.config import Settings, get_settings
 from app.core.errors import AgentError
 from app.domain.knowledge import SourceKind
+from app.domain.period import period_bounds
 from app.infrastructure.cache import VersionedCache
 from app.infrastructure.db import create_engine, create_session_factory
 from app.infrastructure.logging import SERVICE_CLI, setup_logging
@@ -56,6 +57,7 @@ from app.tools.rag.schemas import RagQueryArgs
 from app.tools.rag.tokenizer import Tokenizer, load_stopwords, normalize, normalize_numbers
 from app.tools.rag.tool import build_rag_retrieve_tool, build_retriever
 from app.tools.rag.vocabulary import build_vocabulary, export_snapshot, load_vocabulary
+from app.tools.sql.schema_provider import load_catalog
 from app.tools.sql.schemas import SqlQueryArgs
 from app.tools.sql.tool import build_cli_context, build_sql_query_tool
 
@@ -777,10 +779,12 @@ def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
     而这一处是**所有文档的来源标记唯一产生的地方**——FR-SEARCH-001 的
     SOURCE 冲突判定全靠它。在这里转，错了就在启动时错。
 
-    报告的 `report` 块在这里拆成两个字段（`stat_period` / `document_scope`）：
-    它们是"这一版说的是哪段时间、哪个范围"，**冲突检测判"两边是不是同一个
-    总体"靠它们**。只认 `region` 与 `channel` 两个键——`report` 里另外那些
-    （`basis` / `cutoff` / `outlook`）不是维度，塞进 scope 会造出对不上的键。
+    报告的 `report` 块在这里拆成三个字段（`stat_period` / `document_scope` /
+    `stat_cutoff`）：它们是"这一版说的是哪段时间、哪个范围、统计到哪一天"，
+    **冲突检测判"两边是不是同一个总体、这份报告自称的期间有没有被截短"
+    靠它们**。`document_scope` 只认 `region` 与 `channel` 两个键——`report`
+    里另外那些（`basis` / `outlook`）不是维度，塞进 scope 会造出对不上的键；
+    `cutoff` 则单独成了 `stat_cutoff`（它不是维度，但与期间配对时是判据）。
     """
     report: dict[str, Any] = item.get("report") or {}
     return DocumentMetadata(
@@ -796,7 +800,35 @@ def _metadata_from_entry(item: dict[str, Any]) -> DocumentMetadata:
         published_at=_parse_datetime(item.get("published_at")),
         stat_period=str(report["period"]) if report.get("period") else None,
         document_scope={key: str(report[key]) for key in _DOCUMENT_SCOPE_KEYS if report.get(key)},
+        stat_cutoff=_resolve_cutoff(report.get("cutoff"), report.get("period")),
+        # 文档级指标 code 与口径版本：只有 METRIC 类口径说明文档声明它们
+        # （清单里逐篇写的 `metric_code:` / `definition_version:`）。
+        # 一篇 REPORT 同时讲五个指标，给它一个 code 会把它错分组。
+        metric_code=str(item["metric_code"]) if item.get("metric_code") else None,
+        definition_version=(
+            str(item["definition_version"]) if item.get("definition_version") else None
+        ),
     )
+
+
+def _resolve_cutoff(value: Any, period: Any) -> date | None:
+    """清单的 `report.cutoff` → 具体日期。判不出返回 `None`。
+
+    `month_end` 是个**相对**说法——"这一期最后一月的月末"——所以必须先把它
+    自称的期间解成区间，再取 `end - 1 天`（区间是半开的）。单看 `month_end`
+    是解不出日期的，这正是它在清单里没被写成日期的原因。
+
+    ⚠️ **解不出来时返回 `None` 而不是抛异常**：`None` 的语义是"不知道截止日"
+    （约定与 `stat_period` 一致），而 TIME 判据对"不知道"的处置是**不报**。
+    抛异常会让一篇写错了 `period` 的文档卡住整批入库。
+    """
+    if not value:
+        return None
+    text = str(value)
+    if text != "month_end":
+        return _parse_date(text)
+    bounds = period_bounds(str(period)) if period else None
+    return None if bounds is None else bounds[1] - timedelta(days=1)
 
 
 def _parse_date(value: Any) -> date | None:
@@ -1016,7 +1048,7 @@ def _parse_date_arg(value: str) -> date | None:
 
 
 async def _verify_corpus(settings: Settings, args: argparse.Namespace) -> int:
-    """逐条检出 10 类缺陷注入（开发流程 6.7 的门禁）。
+    """逐条检出 11 类缺陷注入（开发流程 6.7 的门禁）。
 
     **断言的是产物，不是清单标注**（CLAUDE.md 约定 11）：清单里写
     `defects: [CROSS_PAGE_TABLE]` 只是一句声明，第一版语料就是三份标注齐全、
@@ -1052,11 +1084,13 @@ async def _verify_corpus(settings: Settings, args: argparse.Namespace) -> int:
         golden = load_golden()
         corpus_text = "\n".join(chunk["payload"].get("text") or "" for chunk in chunks)
         provinces = await _region_province_counts(settings)
+        metric_versions = _catalog_metric_versions(settings)
 
         results = [
             verify.check_furniture(chunks),
             await verify.check_version_pair(documents, chunks, retriever),
             verify.check_value_conflict(documents, chunks),
+            verify.check_definition_conflict(documents, chunks, metric_versions),
             verify.check_time_conflict(documents, chunks),
             verify.check_scope_conflict(documents, chunks, provinces),
             verify.check_source_pair(documents, records, chunks),
@@ -1117,6 +1151,17 @@ async def _region_province_counts(settings: Settings) -> dict[str, int]:
         await engine.dispose()
 
 
+def _catalog_metric_versions(settings: Settings) -> dict[str, str]:
+    """指标目录里的 `code → 口径版本`，供 DEFINITION 冲突的语料侧比对。
+
+    读的是**与 SQL Tool 同一份目录**（`SQL_TOOL__CATALOG_PATH`）：
+    另开一份读法的话，"文档说 v1.1、目录说 v1.0"这条断言会在两处给出不同答案，
+    而 verify-corpus 的意义正是回答"真正被用的那一份是什么"。
+    """
+    catalog = load_catalog(settings.sql_tool.catalog_path)
+    return {metric.code: metric.version for metric in catalog.metrics}
+
+
 def _print_verify_results(results: Sequence[Any]) -> int:
     width = max(len(result.name) for result in results)
     for result in results:
@@ -1127,7 +1172,7 @@ def _print_verify_results(results: Sequence[Any]) -> int:
     print("─" * 72)
     print(
         f"检出 {len(results) - len(failed)}/{len(results)} 类"
-        f"｜其中 {len(injected)} 类只验证了语料侧（冲突检出属 Phase 9）"
+        f"｜其中 {len(injected)} 类只验证了语料侧（跨源比对要在任务里才跑得出来）"
     )
     if failed:
         print("未通过：")
@@ -1237,7 +1282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--department", action="append", default=[], metavar="部门", help="部门过滤（可重复）"
     )
     retrieve.set_defaults(as_of="", doc_type=[], department=[])
-    sub.add_parser("verify-corpus", help="逐条检出 10 类缺陷注入（详细设计 6.7 的门禁）")
+    sub.add_parser("verify-corpus", help="逐条检出 11 类缺陷注入（详细设计 6.7 的门禁）")
     reindex = sub.add_parser(
         "reindex",
         help="从归档原文重建向量索引——改了写进 payload 的字段之后用它（`make ingest` 会全跳过）",

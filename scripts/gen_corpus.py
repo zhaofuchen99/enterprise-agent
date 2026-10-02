@@ -69,6 +69,9 @@ from app.core.config import get_settings
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = ROOT / "configs" / "corpus_manifest.yaml"
 HANDWRITTEN_DIR = ROOT / "configs" / "corpus_handwritten"
+#: 指标目录。**只读它的 `metrics[].version`**，用来核对口径说明声明的
+#: `definition_version`——清单里那句「版本号必须与目录一致」不是文档，是判据。
+CATALOG_PATH = ROOT / "configs" / "schema_catalog.yaml"
 DEFAULT_OUT = ROOT / "data" / "corpus"
 
 #: 公司抬头。演示系统按 TBC-01 是自建演示系统，没有真实企业主体，
@@ -146,6 +149,29 @@ class DocSpec:
     published_at: str | None
     defects: tuple[str, ...]
     raw: dict[str, Any]
+
+    @property
+    def metric_code(self) -> str | None:
+        """文档级指标 code——**只有指标口径说明（METRIC）有**。
+
+        其余类型为 `None`：一篇报告同时讲五个指标，给它一个文档级 code
+        会把它错分组（冲突检测第 1 步按 metric_code 分组）。
+        """
+        value = self.raw.get("metric_code")
+        return str(value) if value else None
+
+    @property
+    def definition_version(self) -> str | None:
+        """文档声明的**口径版本**。与 `version`（文档修订版本）是两件事。
+
+        只有声明了 `metric_code` 的口径说明才谈得上口径版本，所以这里
+        顺带把两道门都卡上——一篇 POLICY 写了 `definition_version` 会被忽略，
+        而忽略是无声的，所以 `check_injection` 另有一条断言钉住这一点。
+        """
+        if self.metric_code is None:
+            return None
+        value = self.raw.get("definition_version")
+        return str(value) if value else None
 
     @property
     def confidential(self) -> bool:
@@ -1308,6 +1334,22 @@ METRIC_CONTENT: dict[str, tuple[str, str, str, tuple[str, ...], tuple[str, ...]]
 }
 
 
+def definition_version_row(spec: DocSpec) -> tuple[tuple[str, str], ...]:
+    """口径版本那一行（「指标信息」表里），**没声明就返回空**。
+
+    为什么要单独渲染它：`version` 是**文档修订版本**，`definition_version` 是
+    **口径版本**——两个数字说的是两件事，而读者只会把「版本」那一行当成口径版本。
+    不写它的话，一篇描述 v1.1 口径的文档在正文里看起来仍是 v1.0（它的文档版本），
+    于是证据上的口径与读者眼里的口径对不上。
+
+    只在声明了 `definition_version` 时才出现：报告、制度不描述口径，
+    多一行「口径版本 —」只会让人问"为什么这里是空的"。
+    """
+    if spec.definition_version is None:
+        return ()
+    return (("口径版本", spec.definition_version),)
+
+
 def render_metric(spec: DocSpec, facts: Facts) -> list[Block]:
     code = spec.raw.get("metric_code", "")
     detailed = DETAILED_METRICS.get(code)
@@ -1334,6 +1376,7 @@ def render_metric(spec: DocSpec, facts: Facts) -> list[Block]:
             (
                 ("指标编码", code or "—"),
                 ("版本", spec.version),
+                *definition_version_row(spec),
                 ("责任部门", spec.department or "—"),
                 ("生效日期", spec.effective_from or "—"),
             ),
@@ -1370,6 +1413,7 @@ def render_net_sales(spec: DocSpec, facts: Facts) -> list[Block]:
             (
                 ("指标编码", "net_sales"),
                 ("版本", spec.version),
+                *definition_version_row(spec),
                 ("责任部门", "财务部"),
                 ("生效日期", spec.effective_from or "—"),
                 ("计算粒度", "订单行"),
@@ -1430,7 +1474,12 @@ def render_gross_sales(spec: DocSpec, facts: Facts) -> list[Block]:
         Table(
             "指标信息",
             ("项目", "内容"),
-            (("指标编码", "gross_sales"), ("版本", spec.version), ("责任部门", "财务部")),
+            (
+                ("指标编码", "gross_sales"),
+                ("版本", spec.version),
+                *definition_version_row(spec),
+                ("责任部门", "财务部"),
+            ),
             repeat_header=False,
         ),
         Heading(1, "一、指标定义"),
@@ -1498,6 +1547,7 @@ def render_target_metric(spec: DocSpec, facts: Facts) -> list[Block]:
             (
                 ("指标编码", "sales_target_amount"),
                 ("版本", spec.version),
+                *definition_version_row(spec),
                 ("责任部门", "财务部"),
                 ("计算粒度", "月 × 区域 × 产品线"),
             ),
@@ -2335,6 +2385,63 @@ def check_injection(path: Path, spec: DocSpec, blocks: list[Block]) -> list[str]
     return problems
 
 
+def check_definition_versions(specs: Sequence[DocSpec]) -> list[str]:
+    """口径说明声明的 `definition_version` 与**指标目录**对得上吗。
+
+    **为什么这个自检不放在 `check_injection` 里**：那个函数逐篇回读产物，
+    而这个判据要的是"文档侧 vs 目录侧"的**跨文件比对**——一篇文档自己
+    怎么改都改不出「与目录不一致」这件事。所以它看清单与目录两个文件，
+    在生成之前就能跑。
+
+    三条断言，缺一条这个缺陷都可能以「已注入」的名义静默失效：
+
+    1. 有 `metric_code` 的口径说明**必须**声明 `definition_version`
+       —— 缺了它，文档侧证据那个字段恒为 None，DEFINITION 冲突永远不比。
+    2. 标了 `DEFINITION_CONFLICT` 的**必须真的**与目录版本不等
+       —— 否则它是个没生效的注入，而门禁会照常报"检出 N 处"。
+    3. 没标的**必须真的**与目录版本相等
+       —— 这是清单那句政策（"版本号必须与目录一致"）的自动化；
+       少了它，一次手滑改版本会造出一处没人知道的 DEFINITION 冲突。
+    """
+    catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+    versions = {m["code"]: str(m.get("version", "")) for m in catalog.get("metrics", [])}
+
+    problems: list[str] = []
+    for spec in specs:
+        code = spec.metric_code
+        if code is None:
+            if spec.definition_version is not None:
+                problems.append(
+                    f"{spec.id} 声明了 definition_version 却没有 metric_code——"
+                    "没有指标就没有可比的口径，这个字段会被静默丢掉"
+                )
+            continue
+        if code not in versions:
+            problems.append(f"{spec.id} 的 metric_code={code} 在指标目录里不存在")
+            continue
+        if spec.definition_version is None:
+            problems.append(
+                f"{spec.id}（{code}）没有声明 definition_version——"
+                "文档侧证据的口径版本会恒为 None，DEFINITION 冲突永远检不出来"
+            )
+            continue
+        injected = "DEFINITION_CONFLICT" in spec.defects
+        differs = spec.definition_version != versions[code]
+        if injected and not differs:
+            problems.append(
+                f"{spec.id} 标了 DEFINITION_CONFLICT，但它的 definition_version "
+                f"（{spec.definition_version}）与目录 version（{versions[code]}）相同，"
+                "没有构成口径不一致"
+            )
+        if not injected and differs:
+            problems.append(
+                f"{spec.id}（{code}）的口径版本 {spec.definition_version} "
+                f"与目录 {versions[code]} 不一致，但**没有**标 DEFINITION_CONFLICT——"
+                "这是一处没被登记的注入"
+            )
+    return problems
+
+
 def resolve_titles(specs: list[DocSpec], facts: Facts) -> None:
     """产品资料的标题取自 `dim_product`，不在清单里手抄。
 
@@ -2406,6 +2513,12 @@ def generate(
                 # 「分产品线」表头，全公司报告与区域报告说的是两个总体）。
                 # 丢了它，检索回来的证据就不知道自己属于哪一期、哪个范围。
                 "report": dict(spec.raw.get("report") or {}),
+                # **文档级指标 code 与口径版本要带进产物**：它们原先只写在清单里，
+                # `raw` 里躺着却没人往下传——于是文档侧证据的 `metric_code` /
+                # `definition_version` 恒为 None，DEFINITION 冲突**永远检不出来**，
+                # 而答案照出、评测照跑，没有任何地方指向这里。
+                "metric_code": spec.metric_code,
+                "definition_version": spec.definition_version,
                 "classification": spec.classification,
                 "defects": list(spec.defects),
                 "char_count": text_len,
@@ -2463,6 +2576,8 @@ async def main_async(args: argparse.Namespace) -> int:
         shutil.rmtree(out_dir)
     print(f"生成到 {out_dir} …")
     records, injection_failures = generate(specs, facts, out_dir)
+    # 口径版本核对是**跨文件**的（清单 vs 指标目录），所以不挂在逐篇回读那里
+    injection_failures.extend(check_definition_versions(specs))
 
     # 生成报告：`verify-corpus` 与入库脚本都读它，避免各自重新解析文件系统
     report = {

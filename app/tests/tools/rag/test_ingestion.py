@@ -878,3 +878,87 @@ async def test_payload_carries_the_document_level_period_and_scope(
 
     assert restored.stat_period == "2025-Q3"
     assert restored.document_scope == {"region": "华东"}
+
+
+async def test_payload_carries_the_conflict_metadata(
+    tmp_path: Path,
+    settings: Settings,
+    storage: LocalObjectStorage,
+    vector_store: InMemoryVectorStore,
+    documents: InMemoryKnowledgeDocumentRepository,
+    gateway: FakeModelGateway,
+    vocabulary: object,
+) -> None:
+    """文档级的三样冲突判据（口径 code / 口径版本 / 统计截止日）必须进 payload。
+
+    **不加这条断言，它们会是三个恒为 `None` 的字段**——`from_payload` 带默认值，
+    所以缺了也不报错，症状是 DEFINITION 与 TIME 冲突**永远检不出来**，
+    而答案照出、评测照跑，没有任何地方指向 payload。上一条用例守着
+    「期间与范围」，这一条守着「口径与截止日」，两条各自独立。
+
+    `stat_cutoff` 用**非月末的日期**（9/25）：月末值恰好等于期间末端，
+    断言它等于月末就分不出"正确解析"与"根本没传下来"。
+    """
+    from app.tools.rag.metadata import ChunkMetadata
+
+    await _ingest(
+        _write(tmp_path),
+        settings=settings,
+        storage=storage,
+        vector_store=vector_store,
+        documents=documents,
+        gateway=gateway,
+        vocabulary=vocabulary,
+        metadata=_metadata(
+            stat_period="2025-Q3",
+            stat_cutoff=date(2025, 9, 25),
+            metric_code="order_count",
+            definition_version="v1.1",
+        ),
+    )
+
+    hits = await vector_store.search_dense(
+        [0.1] * settings.embedding_dim,
+        limit=1,
+        chunk_filter=ChunkFilter(document_ids=("policy/east-china-channel-discount@v1.0",)),
+    )
+    restored = ChunkMetadata.from_payload(hits[0].payload)
+
+    assert restored.metric_code == "order_count"
+    assert restored.definition_version == "v1.1"
+    assert restored.stat_cutoff == date(2025, 9, 25)
+
+
+def test_the_sample_window_may_cut_a_character_in_half(tmp_path: Path) -> None:
+    """采样窗口把一个多字节字符切成两半时**不该判成非法 UTF-8**。
+
+    实测（2026-10-02）：`MD-006.txt` 长 4108 字节，前 4096 恰好落在一个汉字中间，
+    于是一份**完全合法**的 UTF-8 文件被拒，报的是"不是合法的 UTF-8：
+    unexpected end of data"。这条报错把排查方向指向生成器或编辑器，
+    而根因是**校验自己只采样了 4096 字节**——`head.decode("utf-8")` 把
+    "我们截断的"当成了"文件坏掉的"。
+
+    构造：1500 个三字节汉字 = 4500 字节，边界必然压在字符中间。
+    """
+    from app.tools.rag.ingestion import validate_content
+
+    path = tmp_path / "sample.txt"
+    path.write_text("甲" * 1500, encoding="utf-8")
+
+    validate_content(path, "txt")  # 不抛即通过
+
+
+def test_a_broken_byte_in_the_middle_is_still_rejected(tmp_path: Path) -> None:
+    """对照：**中间**真有坏字节仍然要拒。
+
+    放宽的只是"末尾被采样窗口截断"那一种。没有这条对照，一个
+    "解码失败就放过"的实现也能让上一条通过——而那会让真正的二进制文件
+    一路走到解析器才炸，报错指向的地方完全不同。
+    """
+    from app.tools.rag.ingestion import validate_content
+
+    path = tmp_path / "broken.txt"
+    path.write_bytes("正常内容".encode() + b"\xff\xfe" + "后续".encode())
+
+    with pytest.raises(AgentError):
+        validate_content(path, "txt")

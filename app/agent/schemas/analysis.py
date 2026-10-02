@@ -103,7 +103,8 @@ class AnalysisResult(BaseModel):
     #: 那条路上判——那件事只有它能判。
     refused: bool
     claims: tuple[SupportedClaim, ...] = ()
-    #: 冲突描述。切片内的冲突检测属 Phase 9（本版恒为空，见 `nodes/analysis.py`）
+    #: 冲突描述（检测器在 `analysis` **之前**算好并交给模型披露，详设 6.1 的顺序）。
+    #: 模型照抄即可，再由 `final` 落到答案里——**不给模型"要不要提"的选择权**
     conflicts: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
     follow_up_questions: tuple[str, ...] = ()

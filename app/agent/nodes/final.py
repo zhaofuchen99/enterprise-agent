@@ -156,17 +156,21 @@ def _render(
     if analysis.conflicts:
         lines.append("## 数据不一致（需人工核对）")
         # **冲突必须显式列出来，而且要说清"没有谁对谁错的结论"**：
-        # 检测器只发现不一致，判谁对要靠 13.2 的证据优先级（Phase 9）。
+        # 检测器只发现不一致，判谁对要靠 13.2 的证据优先级——**那一层没有实现**
+        # （`Conflict.resolution` 恒为 `UNRESOLVED`）。
         # 只说"发现冲突"而不说"未判定"，读者会默认系统已经选好了。
         lines.extend(f"- {item}" for item in analysis.conflicts)
         lines.append("")
-        lines.append("> 以上不一致已检出但**未判定哪一方为准**（证据优先级判定属 Phase 9）。")
+        lines.append("> 以上不一致已检出但**未判定哪一方为准**（13.2 的证据优先级判定尚未实现）。")
         lines.append("")
     else:
-        # **把"没检出"与"没检测"分开说**：切片内只做 VALUE 一类（见
+        # **把"没检出"与"没检测"分开说**：切片内只做三类（见
         # `nodes/conflict.py` 的清单）。写"没有冲突"会让读答案的人以为
-        # 五类都比过了，而实际只比了一类。
-        lines.append("> 本次只对「同口径数值」做了比对，未覆盖口径/时点/范围/来源四类冲突。")
+        # 五类都比过了，而实际只比了三类。
+        lines.append(
+            "> 本次比对了「同口径数值」「口径版本」「统计时点」三类，"
+            "未覆盖范围（SCOPE）与来源（SOURCE）两类冲突。"
+        )
         lines.append("")
 
     if review is not None and review.warnings:

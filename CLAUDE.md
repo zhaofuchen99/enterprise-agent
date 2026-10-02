@@ -28,6 +28,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 7 Evidence 冲突检测 | ✅ 完成（切片版） | **只做 VALUE 一类**（同口径数值超容差），`conflict` 节点（`app/agent/nodes/conflict.py`）。文档侧认**表格行**、SQL 侧认证据 `claim`，靠**指标目录**把表头映射到 `metric_code`；容差取「绝对 1 元 / 相对 0.1%」较大者（13.4 第 4 步）。冲突在 `analysis` **之前**算好并交给模型披露（详设 6.1 的顺序），`final` 单列「数据不一致（需人工核对）」并注明**未判定谁对**。**实测**：端到端检出「报告表格 11,039.58 万元 vs 库 111,967,031.73，差 1.42%」 |
 | 8 Reviewer-lite + **重试回路** | ✅ 完成（2026-09-27 扩到第二阶段） | **14.1 的确定性六条** + **14.4 的 `retry_router`**（`app/agent/nodes/retry_router.py`）：审查判 `RETRY` 时按 14.4 的路由表分派，**预算耗尽降级为 CLARIFY / FAIL 并记 `retry_budget_exhausted`**，**不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态（约定 101）。四类预算里 `max_replans` / `max_reviewer_evidence` **接上了**；`max_total_steps` 也接上做了回边的最后一道护栏（原先跑飞只有 `recursion_limit` 兜底，而它留下的是 `INTERNAL_ERROR` + 空轨迹，见约定 102）。**14.1 的第二阶段（结构化模型审查）也接上了**（2026-09-27 晚）：四条判断落成结构化输出，issue 的 code **由代码从布尔推出来**（模型不写自由文本 code），**一律 WARNING——模型不能独自把答案拦下**（见约定 105）。`CLARIFY` 从此有了产出者。**2026-09-28 补上 `plan_extend`（计划演进）**：详设 6.1 的 `reflect -> plan_extend -> dispatch` 那条回边补齐，`retry_router` 的 `expand` 分支从此有落点——14.4 路由表里那一行**不再是"能路由但没人接"**。`plan_deltas` / `plan_revision` / `trigger_finding_id` 三样第一次有了生产者，`agent_plan_revision` 表（建表起一直空着）接上了写入方，`agent_task_step.origin` 能分出 `EXTENDED`。**循环类评测（`任务循环与自适应下钻` 5 条）随之可写**，见 Phase 13。**仍未做**：`WAITING_CLARIFICATION` 状态位、`retry_target=replan` 的产出者（模型审查的四个布尔里没有哪个问的是"计划本身不可执行"）——已登记 |
 | **多轮追问**（FR-CHAT-003 会话内短期记忆） | ✅ 完成（2026-09-28） | 冲刺方案 §7 **明确拒绝砍掉**的那条需求，此前**零实现**：`agent_message` 表从 Phase 2 建好起没有任何写入方，`AgentState.context_summary` 是个从没被填过的占位字段。本次交付：**`Message` 领域对象 + `MessageRepository`**（Protocol/内存/SQL 三份，`agent_message` 第一次被真的读写）、**`ConversationContext`**（详设 15.1 的五字段，`app/domain/memory.py` 的纯函数 `group_turns` / `build_conversation_context`）、**`ConversationService`**（用户消息在 `create_task` 写、助手消息在 `_finish_succeeded` 写，落库失败吞异常但记 `memory.record_failed`）、**上下文进图**（`load_conversation_context` 读最近 10 轮 + 各任务口径 → `supervisor` 的 `{context}`，prompt 升 `1.1.0`）、**`IntentResult.resolved_question`**（代词解析后的问题，FR-CHAT-003 的"输出：解析后的问题"）+ **`current_question()` 收口**（下游四处从读 `user_query` 改为读本轮问题——**不换的话「那 Q2 呢」会被原样送进 SQL 生成器**，见约定 112）。**实测三连问**（2026-09-28，`make demo ONLY=demo-memory-followup` 3/3）：「2025年Q3华东地区的净销售额是多少？」→「那Q2呢？」→「和去年比呢？」——第 2 轮解析成「2025年Q2华东地区的净销售额是多少」（区域继承、期间换掉，答案 127,576,714.27 与 `demo-sql-q2` 的真值一致），第 3 轮 `comparison=YOY`。**它跑第一轮就发现一个真缺陷**：同一条问题另一次跑生成了**绑定参数错**的 SQL（"2024年Q2"实际求 2024-04~2025-04，差 4 倍还给出同比 −74.43% 的结论），SQL 语法与白名单全过、只有区间错——见约定 117。**未做**：写 `agent_conversation.context_summary_json`（避免第二份真相）、`metric_definitions` 填充（需指标目录跨层注入）、失败/取消也写 `SYSTEM_NOTICE`、`token_count` 真实计量、多轮类进 golden 评测集、会话列表/删除 API 与 180 天清理——已登记。**同日全量回归**：`make check` **979 单测** + `make test-integration` **121** 全绿；`make demo` 稳定 **7/7** + 观察 **5/5**（多轮那条占 3 轮）；`make eval-agent` 稳定 **23/24 = 96%**、观察 1/1——**唯一那条红是审查器的门禁误报，不是本次改动引起的**（见约定 118）。⚠️ 回归前按约定 100 **重启了 `make run`** |
+| **冲突检测扩类**（Phase 9 切片：DEFINITION + TIME） | ✅ 完成（2026-10-02） | 冲突检测从**一类扩到三类**（VALUE / DEFINITION / TIME），`SCOPE` 与 `SOURCE` 各有各的缺前提、仍然不做（见约定 38 与 `nodes/conflict.py` 的清单）。**两侧数据其实一直都在，只是没人用**：清单的 METRIC 文档早就声明了 `metric_code`、SQL 侧证据早就在填 `definition_version`——缺的是"文档侧那一段管道"。本次打通它（清单 → `corpus_report.json` → payload → 证据），新增三个文档级字段 `metric_code` / `definition_version` / `stat_cutoff`（+ `agent_evidence` 两列的迁移，顺带补上 `stat_period` 那个一直没落库的列）。**DEFINITION** 比文档声明的口径版本与指标目录的 `version`（只比版本，不要求范围/期间相同——口径是指标级属性，而且口径说明文档的 scope 恒为空）；**TIME** 判「文档自称的期间被它自己的统计截止日截短」，**不判「两侧期间不同」**——后者会把上一轮刚修掉的 157%–1133% 假冲突换个 type 名放回来（见约定 130）。期间被截短的同一对证据**只报 TIME 不报 VALUE**（约定 131）。语料加了一类缺陷 `DEFINITION_CONFLICT`（**10 类变 11 类**，约定 133），注入在 `MD-005`（`order_count`：文档 v1.1 vs 目录 v1.0）。`verify-corpus` 的标注按「比对的两端在不在离线拿得到」重新划：**DEFINITION → `[OK]`**、TIME 保持 `[注入]`、**顺带把 SOURCE 从 `[OK]` 改成 `[注入]`**（它没有检测器，只验了材料齐备，约定 132）。冲突评测集按需求 11.2 从 5 条补到 **10 条**（DEFINITION 2 + TIME 1 正面、零冲突 4 条守反方向），40 条单测 + 迁移。**实测**：`make check` **1029** + 集成 **122** 全绿；`make eval-agent` 全量 **40 条、稳定用例 38/38 = 100%**（工具选择 5/5、**多源冲突 10/10**、审查 5/5、澄清 5/5、循环 15/15）、观察 2/2；`make demo` 稳定 7/7 + 观察 5/5；`make verify-corpus` **11/11**；`make eval-sql` 10/10；`make eval-rag` Recall@8 **20/20**、定位一致率 19/20。⚠️ **同一份代码之前那次全量是 35/38 = 92%**（三条失败里 `agent-conflict-03` 是真问题——判据被检索运气绑住，已改成钉「机制 + 行」；另两条是审查第二阶段的模型抖动）——**两次都记在 `eval_agent._DEFAULT_BASELINE` 的注释里**，单次满分不是证据。⚠️ **它跑第一轮就抓到一个真缺陷**：`validate_content` 只采样前 4096 字节再整段解码，**采样窗口把一个汉字切成两半**时报"不是合法的 UTF-8"——症状指向生成器而根因在我们自己，见约定 134。**未做**：`SCOPE` / `SOURCE` 两类（各有各的缺前提，见约定 38） |
 | **可观测性补齐**（19.4.3 指标 + 工具级轨迹 + `task.retrying`） | ✅ 完成（2026-09-29） | 19.4.3 的指标**全接**：`observability.py` 有了 meter（`counter` / `histogram` / `up_down_counter` / **幂等** `MeterProvider` / `shutdown_observability`），`docker-compose.dev.yml` 加了 `ea-otel-collector`（debug exporter 打 stdout，不引 Prometheus/Grafana——19.4.3 只要求"被采集"）。**`agent_trace_event.tool` 不再恒为 NULL**、`/trace` 有了 17.4 的 `include_tools`（默认**开**）、`tool.completed` 与 `task.retrying` 两个事件第一次有了生产者。**实测一条真任务**：collector 收到九个新指标（`agent.node.duration` / `agent.task.{finished,duration,queue_wait}` / `agent.tool.calls` / `agent.sql.attempts` / `agent.review.verdicts` / `llm.tokens` / `agent.queue.depth`），`llm.cost` **正确缺席**（单价未配是"未计量"不是"零成本"，约定 126）；`/trace` 17 条含 1 条工具级、`?include_tools=false` 16 条含 0 条。⚠️ **它跑第一轮就抓到一个自 Phase 1.5 起就存在的真缺陷**：`OTLP_ENDPOINT` 被当完整 URL 用，而 `OTLPSpanExporter(endpoint=...)` **不会**替你补 `/v1/traces` —— 导出恒 404，而 `OTEL_ENABLED=false` 时完全看不出来（**见约定 122**）。`make check` **1013** + 集成 **122** 全绿。**未做**：`agent_message.token_count`（19.4.2 的红线，见约定 126）、`answer.delta`、SSE 侧 `tool.completed` 的端到端断言（派生逻辑有单测，流那一段没单独跑） |
 | 10 SSE | ✅ 完成（**订阅端点**切片） | `GET /tasks/{id}/stream`（`text/event-stream`）+ `POST /tasks/{id}/stream-token`。**双通道**：先 `read` 补齐（`Last-Event-ID` 之后）再 `subscribe`（`XREAD BLOCK`）实时增量；`snapshot`（带 `replay_lost`）→ 业务事件 → `done` 终止；心跳 15 秒**空闲触发**；**节点级事件已接进同一条流**（`node.started/completed`、`plan.created`、`progress.assessed`、`review.completed`、`clarification.required`），实测一条 15 秒的任务推了 **20+ 条**事件（`make run` + curl 冒烟，帧到达时间戳见提交记录）。**未做**：18.3 的「MySQL 权威重放」（重放暂走 Redis Stream 自身，见约定 68）、`answer.delta`（要网关流式）、`task.retrying`（要 `retry_router`）、Nginx 直通配置（属 Phase 14）。`make check` 753 测试 + 集成 104 全绿 |
 | 10/11 轨迹与埋点 | ✅ 完成（**节点级**切片，自冲刺后置项提前） | `agent/tracing.py` 统一包住八个节点（`node.started` + `node.completed`/`node.failed`）——**「每个节点都有轨迹」是结构性保证**，漏包一个不会有任何症状。落 `agent_trace_event`（仓储 + `sequence` 由写入侧按执行顺序分配、读取按它升序，即 18.3 的顺序保证）+ **17.4 的 `GET /tasks/{id}/trace`**（鉴权与任务详情同源、`after_sequence` 严格大于、`limit` 可增量拉取、`trace_incomplete` 透传）。`trace_incomplete` 的写入侧在 `TaskRunner`：落库失败或图跑到一半中止时置位（FR-TRACE-001 的异常情况）。**未做**：工具级事件（`tool.completed` 与 17.4 的 `include_tools`）、异常路径的事件投递——已登记。`make check` 692 测试 + 集成 103 全绿 |
@@ -222,11 +223,17 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     那是稠密模型各向异性的性质，不是调参能消除的。
     任何"调阈值就能同时提召回又提拒答"的说法都与这份数据不符。
 32. **`verify-corpus` 的两种标注不能混**：`[OK]` 是"在这里就检出了"，
-    `[注入]` 是"语料侧确认注入了、但对应的冲突检出属 Phase 9"。
-    VALUE / TIME 两类冲突现在标的是 `[注入]`——**把它们说成 `[OK]` 就是
-    把"语料里有"说成"系统检得出"**，而 Phase 5 的门禁原文是"10 类缺陷逐条检出"，
-    这个差别必须在面试口径里说清楚。SCOPE 是例外：它在这里就能检出，
-    因为"文档声称的省份数 vs `dim_region` 的实际值"只要把两个数摆在一起就够了。
+    `[注入]` 是"语料侧确认注入了、但真正的结论要跨源比对才出得来"。
+    **把它们说成 `[OK]` 就是把"语料里有"说成"系统检得出"**，
+    这个差别必须在面试口径里说清楚。SCOPE 与 **DEFINITION** 是例外：
+    它们在这里就能检出，因为比对的双方**离线都拿得到**
+    （SCOPE 是"文档声称的省份数 vs `dim_region` 的实际值"，
+    DEFINITION 是"文档 payload 的口径版本 vs 指标目录的 `version`"）。
+    ⚠️ **判据在 2026-10-02 被明确成一句可操作的话——「比对的两端在不在离线拿得到」**
+    （见约定 132）：按这条，SOURCE 也从 `[OK]` 改成了 `[注入]`，
+    因为那个检查只验了"材料齐备"，而 SOURCE 冲突**没有检测器**。
+    ⚠️ **`[注入]` 不等于"系统检不出"**：VALUE / TIME 的检测器都已实现
+    （约定 38），在真实任务里报得出来——标注说的是**这条断言本身证不了那件事**。
 33. **`app/tests/tools/rag/conftest.py` 必须在 import 期先 `jieba.initialize()` 再取基线**。
     前缀词典是惰性构建的，未初始化时 `jieba.dt.FREQ` 是**空字典**；
     取一份空基线再去"恢复"它，等于把词频表清空，而 `initialize()` 因为
@@ -254,10 +261,16 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     而 `PermissionScope` 的空 `region_ids` 表示**不限**（TBC-03）——
     拿它当兜底等于让一个已删除用户的任务拿到全量数据，且不会有任何报错。
 
-38. **冲突检测只做 VALUE 一类，另外四类各有各的缺前提**（`nodes/conflict.py` 列了清单）：
-    `DEFINITION` / `SCOPE` 要文档侧的 `metric_code` 与 `scope`，而分块不带指标 code；
-    `TIME` 要文档的统计期间，而 `event_time` 是**生效区间**（报告恒为空）；
-    `SOURCE` 要判"方向相反"，属 Phase 9。**被问"冲突检测做了多少"时照这个答**，
+38. **冲突检测做五类里的三类（2026-10-02 起），另外两类各有各的缺前提**
+    （`nodes/conflict.py` 列了清单）：
+    - ✅ `VALUE` 同口径数值超容差、✅ `DEFINITION` 口径版本不同、
+      ✅ `TIME` 文档自称的期间被它自己的截止日截短；
+    - ❌ `SCOPE`：语料注入了「文档声称华东含 3 省 vs `dim_region` 记 4」这类缺陷，
+      而那是**文档 vs 数据库事实**——运行时**没有载体承载「数据库侧的范围事实」**
+      （它不是任何一个指标、不来自某次查询）。要做先得设计一个，属独立切片；
+    - ❌ `SOURCE` 要判"方向相反"，而外部材料现在是**自由文本**，取数要知道
+      "这个数说的是哪个指标"——正是 VALUE 刻意不解析正文数字的理由，判据一松必出噪声。
+    **被问"冲突检测做了多少"时照这个答**（三类做了、两类没有、各缺什么），
     不要笼统说"做了冲突检测"。
 39. **文档表头 → `metric_code` 靠指标目录，且精确名优先于别名**。
     `net_sales` 的别名里有「销售额」，而报告里那一列是**含税 − 折扣**口径——
@@ -1200,6 +1213,88 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
     把"消费能力下降"报成"实例不可用"会让编排层摘掉实例，而那恰恰是最不该做的事
     （同限流降级时返回 200 + degraded 的取舍）。
 
+### 冲突检测扩类（DEFINITION + TIME）期间新立的临时约定
+
+128. **`definition_version` 是一个独立的清单键，不复用文档的 `version`**。两者说的
+    是两件事，而它们的**处置完全不同**：
+    - `version` 是**文档修订版本**，进 `document_id = logical_key@version`，
+      决定归档路径、幂等 checksum、`VERSION_PAIR` 过滤与检索去重；
+    - `definition_version` 只描述**口径版本**，随 payload 进证据，与指标目录的
+      `MetricSpec.version` 比对出 DEFINITION 冲突。
+
+    复用 `version` 的症状有二，**都不报错**：① 给文档改个错别字升版，就会让每个
+    跨源的该指标任务都报一条 DEFINITION 冲突——而口径一个字没改；② 注入一处口径
+    版本不一致要改 `version`，那会改掉 `document_id`，而 `ingest._rebuild`
+    只 `delete_document(state.key)`（**新** key），**旧版本的向量点删不掉**
+    → 同一篇文档被召回两版、两条证据。
+
+    ⚠️ 因此 `render_metric` 的「指标信息」表里**「版本」与「口径版本」是两行**
+    （`gen_corpus.definition_version_row`）：只渲染 `version` 的话，
+    一篇描述 v1.1 口径的文档在正文里看起来仍是 v1.0（它的文档版本），
+    证据上的口径与读者眼里的口径就对不上了。
+
+129. **只有 METRIC 类口径说明文档带文档级 `metric_code`，REPORT 不带**。
+    一篇报告同时讲净销售额/含税/折扣/退货/订单行数五个指标，给它一个文档级 code
+    会把它**错分组**（13.4 第 1 步按 metric_code 分组），把「这篇报告 = 某指标」
+    变成一条错误事实。报告侧的指标 code 仍然只活在**表头经目录映射**那一层
+    （`conflict._column_of`），那是正确的粒度。
+
+    ⚠️ **副作用要记住**：DEFINITION 冲突因此只在"口径说明文档 × 同指标 SQL 证据"
+    这一对载体上成立。评测用例的问句必须**同时**触发 RAG 召回那篇口径说明、
+    又跑一次同指标的 SQL（问句里带「口径说明/口径版本/怎么定义的」这类词）。
+
+130. **TIME 判的是「文档自己前后矛盾」，不是「两个来源的期间不同」**
+    （`conflict._claim_truncated`）：报告自称 `2025-Q3` 而统计截止日写在 `09-25`
+    （该季到 09-30）——**它自己的两处声明对不上**。
+
+    另一条路（"两侧期间不等就报 TIME"）看着更直接、还零管道改动，但它的代价是
+    把上一轮刚修掉的东西换个 type 名放回来：「问 Q3 却召回年度/半年报告」极常见，
+    而那批假冲突（157%–1133%）正是这么来的。**判据必须落在文档自身的一致性上。**
+
+    ⚠️ **由此 TIME 说的是"声明不一致"，不是"数字不可比"，两者会分叉**：
+    业务库的日粒度数据只覆盖每月 1–27 日（`business_seed.py` 的 `index % 27`），
+    所以 `cutoff=9/28` 的那两份报告**数字上与完整期间一致**，仍然该报 TIME；
+    只有 `cutoff=9/25` 的《华东…专项分析》才真的少了 9/26–27 两天。
+    **别把这三处一起说成"数字不可比"**。
+
+131. **期间被截短的同一对证据只报 TIME，不报 VALUE**（`_document_conflicts` 里
+    `continue` 掉）。两个数既然不是同一个区间的合计，数值比对的前提就不成立，
+    再报一条"数值差 1.4%"是把「少统计了几天」说成「数字错了」；而 13.3 的
+    `possible_explanations` 里原本只能**猜**"统计时点可能不同"，现在能**判**了。
+
+    ⚠️ **它改变了三条既有评测用例的性质**（01/03 由 VALUE 变 TIME、
+    `demo-cross` 同理），但**判据不变**（仍是包含式），所以用例照样通过——
+    改的是 `proves` 与注释里"这条证明什么"的说法。
+
+132. **`verify-corpus` 的 `[OK]`/`[注入]` 判据是「比对的两端在不在离线拿得到」**，
+    不是"能力有没有实现"：
+    - **DEFINITION → `[OK]`**：两端是文档 payload 的口径版本与指标目录的
+      `metric.version`，都是文件，**这里就是它的检出点**；
+    - **TIME 保持 `[注入]`**：比的是"文档自称的期间 vs 它自己的截止日"，
+      权威的另一侧（MD-010 的关账制度）并没有真的被检索进来；
+    - **顺带把 SOURCE 从 `[OK]` 改成 `[注入]`**：那个检查验的是"两支材料都在库、
+      `source_kind` 标对了"，而 SOURCE 冲突**没有检测器**——只验材料齐备却标
+      `[OK]`，正是约定 32 说的那种"把语料里有说成系统检得出"。
+    - ⚠️ **`[注入]` 不等于"系统检不出"**：三类检测器都已实现，在真实任务里报得出来。
+      标注说的是**这条断言本身证不了那件事**。
+
+133. **缺陷类从 10 类变 11 类**（`defect_kinds` 加了 `DEFINITION_CONFLICT`）。
+    它是 16.11.2 第 2 项「口径不一致」的**另一个维度**：VALUE 是同一版口径下
+    数字对不上，DEFINITION 是**两版口径**——机制与判据都不同，所以独立成一条。
+    约定 11 的自检一并落在 `gen_corpus.check_definition_versions`。
+    ⚠️ **那个自检是跨文件的**（清单 vs 指标目录），所以它不挂在逐篇回读产物的
+    `check_injection` 上，而是像 `verify.check_definition_conflict` 那样单成一条。
+    ⚠️ **注入选在 `order_count`（MD-005）**：报告的表格里**没有「订单行数」列**，
+    所以那份文档端到端只产出一条干净的 DEFINITION，不顺手带出别的冲突；
+    也没有第二份文档讲同一个指标。
+
+134. **`validate_content` 只采样前 4096 字节，所以解码必须容忍"尾巴被截断"**。
+    实测（2026-10-02）：`MD-006.txt` 长 4108 字节，前 4096 恰好落在一个汉字中间，
+    于是一份**完全合法**的 UTF-8 文件被拒，报的是"不是合法的 UTF-8：
+    unexpected end of data"——**症状把排查方向指向生成器或编辑器**，
+    而根因是我们自己截断的。改用 `codecs.getincrementaldecoder("utf-8")`：
+    不完整的尾巴留在缓冲里，**中间的坏字节照样抛**（有正反两条用例钉着）。
+
 ### 【后续扩展】登记
 
 | 项 | 触发阶段 |
@@ -1228,10 +1323,10 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | ~~**11.7 第 ⑧ 步「邻近块扩展」**~~ **已交付**（2026-09-20，见约定 78 与 84）：标注 + 补块两半都做了，补块有 `RAG__TABLE_EXPAND_MAX_ROWS` 边界。**剩余的是放大边界**——把 `analysis._MAX_EVIDENCE` 与证据预算一起抬上去，好让语料里那张 80 行的明细表也能整表补齐。**先要论证值不值**：这类聚合问题的正确来源本来就是数据库，而整表补齐会让每次检索的 prompt 涨约 9KB | 需要时 |
 | **SQL 的 `scope` 只覆盖等值条件**：`WHERE region_name IN ('华东','华南')` 这类范围条件**不抽取**（抽了会把真冲突静默跳过）。后果是这种查询的粒度仍然未知，冲突检测对它退回"多报"那条路 | Phase 9 |
 | ~~**引用不去重**~~ **已交付**（2026-09-20，见约定 86）：同源合并 + 行号区间，并且回答了"引用能不能表达表的一部分" | ✅ Phase 5 收尾 |
-| 文档侧的 `metric_code` / `definition_version` / `scope` 暂时留空（分块不带指标 code，按 `logical_key` 反推是把自由文本约定当语义用）。**13.4 的 DEFINITION / SCOPE 冲突因此暂时只覆盖 SQL 侧**，要等文档与指标目录挂钩 | Phase 9 |
+| ~~文档侧的 `metric_code` / `definition_version` 留空~~ **已交付（2026-10-02）**：METRIC 类口径说明文档的这两个字段从清单一路进了 payload 与证据（约定 128/129），DEFINITION 冲突因此**两端都覆盖**了。⚠️ **`scope` 与它不同**：文档级 `scope` 来自清单的 `report.region/channel`（报告类文档），口径说明文档没有 `report` 块、`scope` 恒为空——这不是遗漏，是那类文档本来就不描述范围 | ✅ 本次 |
 | 把疑问词并入 `configs/rag_stopwords.txt`（更整齐，但改切分必须重跑 `make vocab` + `make ingest` + 检索回归集） | Phase 5 收尾 |
 | ~~**同义词导致的误拒**（金标 rag-06）~~ | **已由重排器解掉**（2026-09-18）：重排生效时拒答由逐候选的重排分判，词汇判据退为诊断信息（见约定 57 与 `test_reranking_can_overrule_the_unseen_topic_criterion`）。**待金标复核**：`make calibrate-rerank` 的分数分布要能证明它没有反过来放过不该答的问题 |
-| **冲突检测的另外四类**（DEFINITION / TIME / SCOPE / SOURCE）：前提分别是文档侧 `metric_code`+`scope`、文档统计期间、方向判定，见 `nodes/conflict.py` 的清单 | Phase 9 |
+| ~~**冲突检测的另外四类**~~ **DEFINITION 与 TIME 已交付（2026-10-02）**：见约定 128–133。**剩下的两类各有各的缺前提，且都不是接线能解决的**：<br>• **`SCOPE`**：语料注入的是「文档声称华东含 3 省 vs `dim_region` 记 4」——那是**文档 vs 数据库事实**，而运行时**没有载体**承载「数据库侧的范围事实」（它不是任何一个指标、不来自某次查询）。要做先得设计一个（新证据源，或让某类查询把维度表的成员关系也带成证据）。<br>• **`SOURCE`**：判据是"外部信号与内部事实**方向相反**"。外部材料现在是**自由文本**（"行业整体向好"），取数要知道"这个数说的是哪个指标"——正是 VALUE 刻意不解析正文数字的理由。要做得先让外部语料带**结构化**的指标行（清单 + 生成器 + 缺陷注入三处一起改），判据才站得住 | Phase 9（SCOPE/SOURCE） |
 | **表格的合计行 vs 分项行**：多维度列的明细行已经被挡住（约定 41），但**单维度列**的表里若既有合计行又有分项行，仍然分不出来——需要表格的合计标记或指标口径的 `grain` | Phase 9 |
 | ~~**Reviewer 第二阶段（模型审查）**~~ **已交付（2026-09-27，见约定 105/106）**：14.1 的四条判断落成结构化输出（`schemas/review.ModelReview`），模型**只能记 WARNING**、不能独自否决，但可以给 `retry_target` 与 `clarification_question`——后者让 `CLARIFY` 第一次有了产出者 | ✅ Phase 8 |
 | ~~**`plan_extend` / `retry_target=expand` 的落点**~~ **已交付（2026-09-28，见约定 107/108）**：`nodes/plan_extend.py`（双入口：`reflect` 给现成步骤不调模型 / `retry_router` 走模型生成），`plan_deltas` + `plan_revision` + `trigger_finding_id` 有了生产者，`agent_plan_revision` 接上写入方，`origin` 分出 `EXTENDED`。⚠️ **6.6.3 的八条校验只做了前提已具备的四条**（总步数、单轮步数、工具闭集、去重键）；**去重的 embedding 相似度**（要向量调用 + 阈值校准）、**`drilldown_path` 与下钻深度**（`objective` 是自由文本，机器判不出"同一实体维度链"，硬做只能得到恒为 1 的假信号）、**`success_criteria`**（`TaskStep` 没这个字段）**三条没做**——已登记 | ✅ 本次 |
@@ -1254,6 +1349,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | **`tool.started` 事件**：详设 10.x（9.3 的七步流程第 2 步）写了"记录 `tool.started` 轨迹和 SSE"，而 **18.2 的事件清单与需求 7.3 的清单里都只有 `tool.completed`**——文档内部不一致，按"清单优先"处理。依据不只是"清单更长"：本实现的 Tool 在节点内**原子执行**，两个事件会由同一行代码前后隔几微秒发出、成为**没有区间的噪声事件**；而"进了工具所在节点还没出来"这件事已经由 `node.started` 表达了。派生点相同，要补是加一行的事 | 需要时 |
 | **SSE 侧 `tool.completed` 的端到端断言**：本次只验了 `/trace`（工具级事件确实落了库、带 tool 与 summary），走 Redis 流那条路没单独跑。派生逻辑是同一条（`_derived_events`），所以缺的是验证不是实现 | 需要时 |
 | **多轮类进 `eval_agent_golden.yaml`**：本次只落在 `make demo`（见约定 115）。要进评测集得同时改 `CATEGORIES` / `_EXPECTED_PER_CATEGORY` 与重定基线 | 下一项 |
+| **按类设阈值（把分类通过率变成门禁）**：2026-10-02 评测集涨到 40 条之后，全局 85% 基线**拦不住"某一类（5 条）整体失效"**了——丢 5 条只剩 86.8%（> 85%），而单类的退化现在只有报告里那张分类表看得见。把每类的最低通过率写成判据（比如各 ≥ 60%）比抬高全局基线更对：**全局数字同时要"拦整类退化"与"容模型抖动"两件事，而那两件事在 40 条的规模上已经开始打架了** | 需要时 |
 | **`WAITING_CLARIFICATION` 续跑**（详设 15.2 的 `parent_task_id`）：用户补充后新建 task 并复用原计划摘要，是**另一片**（要动任务终态与 API/SSE 侧）。会话内短期记忆不含它 | 需要时 |
 | 会话列表 / 删除 API 与 180 天保留期清理（`make cleanup` 仍是占位实现）。`agent_message.deleted_at` 的过滤**已经写好并有集成用例钉着**，只是还没有生产者 | Phase 12 / 需要时 |
 | ~~拒答句进 `claims` 导致 `CLAIM_WITHOUT_EVIDENCE` 误报~~ **已修（2026-09-28）**：`ClaimKind` 加 `ABSENCE`，豁免要求 `ABSENCE` **且** `refused`（见约定 118）；`_evidence_ratio` 的分母同步排除。analysis prompt 升 `1.4.0` | ✅ 本次 |
@@ -1264,7 +1360,7 @@ SQL 查询、知识检索、结果校验与冲突识别在同一个任务循环�
 | 项 | 备注 |
 |---|---|
 | ~~**Reranker**（选型 + 阈值校准）~~ | **已交付（2026-09-18，提前）**：选型 **`BAAI/bge-reranker-v2-m3`（云 cross-encoder，Cohere 契约）**——本机 Ollama 0.32.14 **没有 rerank 端点**（实测 404），本地跑 cross-encoder 要新增数百 MB~GB 的推理栈而本机内存已在 swap。实现 11.7 第 **⑥⑦** 步（重排 + Top-K + 逐候选剔除），`RERANKER_ENABLED` **默认关闭**，关闭与失败同一条降级路径。**阈值待 `make calibrate-rerank` 校准**（脚本已就位，需真 key 跑） |
-| ~~语料扩到 80+ 篇 + 缺陷注入全套（10 类）~~ | **已完成**（2026-09-17）：88 篇、10 类缺陷注入全部回读产物验证。剩余的「阈值必须基于该语料校准」属 ⑧`retriever.py` / ⑫Recall@8，**不得沿用任何小语料取值** |
+| ~~语料扩到 80+ 篇 + 缺陷注入全套（10 类）~~ | **已完成**（2026-09-17）：88 篇、10 类缺陷注入全部回读产物验证。剩余的「阈值必须基于该语料校准」属 ⑧`retriever.py` / ⑫Recall@8，**不得沿用任何小语料取值**。**2026-10-02 扩到 11 类**：加了 `DEFINITION_CONFLICT`（16.11.2 第 2 项的另一个维度，见约定 133），清单 `version` 升到 `2026.10.02-1` |
 | ~~文档版本发布流程（staging → smoke test → publish）~~ | **已移回 Phase 5**。staging 载体是 payload 状态位，不是 partition |
 | 知识管理接口 FR-ADM-001、扫描件 OCR、跨页表格还原 | 入库走脚本不做后台；扫描件 PDF 在语料中保留但**明确标记不支持** |
 | ~~词表扩容机制（`token_id` 只增不改的运维面）~~ | **已移回 Phase 5**。需验证"扩容后历史 chunk 无需重算仍可召回" |

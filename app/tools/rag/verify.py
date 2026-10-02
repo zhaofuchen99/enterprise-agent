@@ -1,4 +1,9 @@
-"""`verify-corpus`：10 类缺陷注入的逐条检出（开发流程 6.7 的门禁）。
+"""`verify-corpus`：11 类缺陷注入的逐条检出（开发流程 6.7 的门禁）。
+
+**11 而不是 16.11.2 的 10**：那 10 项之外多了一条
+`DEFINITION_CONFLICT`（口径版本与指标目录不一致）——它是第 2 项
+「口径不一致」的**另一个维度**（VALUE 是同一版口径下数字对不上，
+它是两版口径），机制与判据都不同，所以独立成一条。
 
 ## 为什么断言的是**产物**而不是清单
 
@@ -10,12 +15,21 @@
 所以这里**只从产物取值**：Qdrant 里的 chunk（`make ingest` 的产物）、
 `knowledge_document` 的行、以及业务库的维度表。清单只用来提供"本该有多少条"。
 
-## 两种标注，别混
+## 两种标注，判据是**比对的两端在不在这里**
 
-- `[OK]`：这条断言**在这里就是它的检出点**，通过即为真的通过。
-- `[注入]`：语料侧的注入**已确认在产物里**，但对应的**冲突检出**属 Phase 9
-  （`agent_conflict` 表与 13.4 的检测算法都还没做）。**不标 [OK]**——
+- `[OK]`：这条断言**在这里就是它的检出点**——比对的双方都能在离线拿到。
+  例：SCOPE（文档声称的省份数 vs 业务库 `dim_region`）、
+  **DEFINITION**（文档 payload 的口径版本 vs 指标目录的 `version`）。
+- `[注入]`：语料侧的注入**已确认在产物里**，但真正的结论要**跨源比对**才出得来，
+  而那个动作发生在一次任务里（检索到文档 + 查到库）。**不标 [OK]**——
   标了就是把"语料里有"说成"系统检得出"，而那是两件事。
+  例：VALUE（报告的含税口径 vs 库里的净销售额）、
+  TIME（文档自称的期间 vs 它自己的截止日——权威的另一侧 MD-010 并没有
+  真的被检索进来比对）。
+
+⚠️ **`[注入]` 不等于"系统检不出"**：13.4 的三类检测器都已经实现
+（`nodes/conflict.py`），这两类在真实任务里是**报得出来的**。标注说的是
+**"这条断言本身证不了那件事"**，不是"能力不存在"。
 
 ## 与 `make eval-rag` 的分工
 
@@ -28,13 +42,14 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.domain.knowledge import DocumentStatus, KnowledgeDocumentRecord
+from app.domain.period import period_bounds
 from app.domain.user import PermissionScope, UserRole
 from app.tools.rag.golden import AbsentCase
 from app.tools.rag.retriever import Retriever
@@ -279,7 +294,8 @@ def check_value_conflict(
 
     这是 `[注入]`：产物里能证明"报告的销售额按含税口径列示、未扣退货"，
     而 MD-001 定义的净销售额要扣退货——两者的差额就是冲突。
-    但**把它检出来**要等 Phase 9 的 13.4 检测算法与 `agent_conflict` 表。
+    但**把它检出来**要在一次真实任务里：得同时检索到那份报告、又查到库里的数，
+    `conflict._document_conflicts` 才比得上。所以这里是 `[注入]`。
     """
     texts = _text_of(chunks)
     specs = _defects_of(documents, "VALUE_CONFLICT")
@@ -294,7 +310,7 @@ def check_value_conflict(
             f"{len(with_note)} 篇的口径声明已在产物里；缺：{'、'.join(missing)}"
             if missing
             else f"{len(with_note)} 篇均带「{_REPORT_BASIS_NOTE}」，与 MD-001 口径不同；"
-            "冲突检出属 Phase 9"
+            "跨源比对在任务里发生（`conflict._document_conflicts`）"
         ),
         ok=not missing,
         injected_only=True,
@@ -304,11 +320,21 @@ def check_value_conflict(
 def check_time_conflict(
     documents: Sequence[dict[str, Any]], chunks: Sequence[dict[str, Any]]
 ) -> CheckResult:
-    """报告的统计截止日与 MD-010 的规定**确实不符**（TIME 冲突的由来）。
+    r"""报告的统计截止日与它**自称的统计期间**对不上（TIME 冲突的由来）。
 
-    判据是从产物的正文里**解析出实际截止日**，与所在月份的最后一天比——
+    判据是从产物的正文里**解析出实际截止日**，与它自称的那一期的最后一天比——
     不看清单的 `cutoff` 字段，因为那字段说的是"生成时想怎么截"，
-    而产物里写了什么才是读者看到的。`[注入]` 的理由同 `check_value_conflict`。
+    而产物里写了什么才是读者看到的。期间取清单的 `report.period`。
+
+    ⚠️ **期间必须来自 `report.period`，不能从 `logical_key` 推**：
+    这一版之前用 `(\d{4})-(\d{2})$` 从 `report/quarterly-2025-Q3` 里抠月末，
+    而那个正则**匹配不上**（结尾是 `Q3` 不是 `-09`），于是直接 `continue`——
+    3 处 TIME 注入里实际只检了月报那一处，另外两处**静默通过**。
+    换成 `period_bounds` 之后四种期间记号（年/半年/季/月）全都覆盖。
+
+    `[注入]` 的理由同 `check_value_conflict`：这里比的是"文档自称的期间 vs
+    文档自称的截止日"，权威的另一侧（MD-010 的关账制度）并没有真的被检索比对，
+    而运行时的 TIME 判据（`conflict._claim_truncated`）走的正是同一条规则。
     """
     texts = _text_of(chunks)
     problems: list[str] = []
@@ -320,25 +346,98 @@ def check_time_conflict(
             problems.append(f"{spec['id']} 的产物里没有截止日标注")
             continue
         stated = date.fromisoformat(found.group(1))
-        # 月末由文档身份推出来（`report/monthly-2025-09` → 2025-09-30），
-        # 不看清单：清单里的 cutoff 是"想写的"，这里要的是"实际上的"
-        month = re.search(r"(\d{4})-(\d{2})$", spec["logical_key"])
-        if month is None:
+        period = str((spec.get("report") or {}).get("period") or "")
+        bounds = period_bounds(period)
+        if bounds is None:
+            problems.append(
+                f"{spec['id']} 的 report.period「{period}」不是可识别的期间记号，"
+                "判不出它自称的是哪一期"
+            )
             continue
-        year, mon = int(month.group(1)), int(month.group(2))
-        month_end = date(year + (mon == 12), mon % 12 + 1, 1) - timedelta(days=1)
-        if stated == month_end:
-            problems.append(f"{spec['id']} 的截止日 {stated} 与月末一致，没构成 TIME 冲突")
+        last_day = bounds[1] - timedelta(days=1)
+        if stated >= last_day:
+            problems.append(
+                f"{spec['id']} 的截止日 {stated} 不早于期间 {period} 的末日 {last_day}，"
+                "没构成 TIME 冲突"
+            )
     return CheckResult(
-        name="统计截止日不同",
+        name="统计截止日与自称期间不符",
         expected=f"{len(specs)} 处",
         detail=(
             "；".join(problems)
             if problems
-            else f"{len(specs)} 处的截止日均早于所在月月末；冲突检出属 Phase 9"
+            else f"{len(specs)} 处的截止日均早于其自称期间的末日（运行时判据同规则）"
         ),
         ok=not problems,
         injected_only=True,
+    )
+
+
+def check_definition_conflict(
+    documents: Sequence[dict[str, Any]],
+    chunks: Sequence[dict[str, Any]],
+    versions: Mapping[str, str],
+) -> CheckResult:
+    """口径说明声明的口径版本与指标目录**真的有出入**（DEFINITION 冲突的由来）。
+
+    ⚠️ **这条是 `[OK]` 而不是 `[注入]`**，理由与 VALUE/TIME 不同：那两条比的
+    是"产物内部的两处声明"（或与一个硬编码惯例），而这条比的是**两个权威文件**
+    ——文档侧的口径版本（清单 → payload）与目录里的 `metric.version`。
+    两端都在这里，不需要检索也不需要运行时，**这就是它的检出点**。
+
+    断言三件事（缺一条这个注入都可能以"已生效"的名义静默失效）：
+
+    1. 带 `metric_code` 的口径说明，**它的 `metric_code` 真的进了 payload**
+       —— 这一条是那个"新字段没写进 payload"的经典失败的防线：
+       少了它，文档侧证据的 `metric_code` 恒为 None，DEFINITION 永远检不出来。
+    2. 标了 `DEFINITION_CONFLICT` 的那篇，payload 里的版本**确实**与目录不等。
+    3. 其余口径说明的版本**确实**与目录相等——清单那句"版本号必须与目录一致"
+       的自动化。
+    """
+    payloads: dict[str, set[str | None]] = defaultdict(set)
+    for chunk in chunks:
+        payload = chunk["payload"]
+        if payload.get("metric_code"):
+            payloads[str(payload.get("document_id"))].add(payload.get("definition_version"))
+
+    problems: list[str] = []
+    flagged = 0
+    for spec in documents:
+        code = spec.get("metric_code")
+        if not code:
+            continue
+        injected = "DEFINITION_CONFLICT" in (spec.get("defects") or ())
+        flagged += int(injected)
+        seen = payloads.get(_doc_key(spec))
+        if not seen:
+            problems.append(f"{spec['id']}（{code}）的 metric_code 没进 payload")
+            continue
+        expected = versions.get(str(code))
+        if expected is None:
+            problems.append(f"{spec['id']} 的 metric_code={code} 在指标目录里不存在")
+            continue
+        for value in sorted(seen, key=str):
+            if injected and value == expected:
+                problems.append(
+                    f"{spec['id']} 标了 DEFINITION_CONFLICT，但 payload 里的口径版本"
+                    f"（{value}）与目录（{expected}）相同，没构成不一致"
+                )
+            if not injected and value != expected:
+                problems.append(
+                    f"{spec['id']} 的口径版本 {value} 与目录 {expected} 不一致，"
+                    "但清单里没标 DEFINITION_CONFLICT——一处没被登记的注入"
+                )
+    return CheckResult(
+        name="口径版本与指标目录不一致",
+        expected=f"{flagged} 处",
+        detail=(
+            "；".join(problems)
+            if problems
+            else f"{flagged} 处的口径版本与目录不符（其余口径说明均与目录一致）"
+        ),
+        ok=not problems and flagged > 0,
+        #: **`[OK]`**：比对两端都在产物与目录里，见 docstring
+        injected_only=False,
     )
 
 
@@ -434,9 +533,17 @@ def check_source_pair(
         detail=(
             "；".join(problems)
             if problems
-            else f"{len(pairs)} 组的两侧均已入库且 source_kind 正确；并列展示与优先级判定属 Phase 9"
+            else f"{len(pairs)} 组的两侧均已入库且 source_kind 正确；"
+            "SOURCE 冲突的检出**尚未实现**（判据是「方向相反」，"
+            "而外部材料现在是自由文本，取数要知道那是哪个指标）"
         ),
         ok=not problems,
+        #: **`[注入]` 而不是 `[OK]`**：这里验的是"两支材料都在库里、
+        #: `source_kind` 标对了"，而《5.5 业务规则》要的是"外部信号与内部
+        #: 事实方向相反时不许覆盖内部事实"——那件事没有检测器
+        #: （`conflict.py` 的清单里 SOURCE 仍在"不做"那一栏）。
+        #: 只验了"材料齐备"却标 `[OK]`，就是把"语料里有"说成"系统检得出"。
+        injected_only=True,
     )
 
 

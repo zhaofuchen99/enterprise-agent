@@ -30,8 +30,8 @@ analysis / reviewer / retry_router / final`（§8.1 的最小集是六个；
 | `rag_rewrite/retrieve/rerank` | 合进 `rag` 节点 | 同上 |
 | `normalize_tool_result` | 合进 `sql`/`rag` 节点 | `nodes/tool_nodes._normalize` |
 | `plan_extend` | **`plan_extend` 节点** | 校验只做前提已具备的那几条，见 `nodes/plan_extend.py` |
-| `conflict_detect` | **`conflict` 节点（切片版）** | 只做 VALUE 一类 |
-| | | 四类缺前提的理由见 `nodes/conflict.py` |
+| `conflict_detect` | **`conflict` 节点（切片版）** | 做 VALUE / DEFINITION / TIME 三类 |
+| | | 另两类缺前提的理由见 `nodes/conflict.py` |
 | `reviewer` | **`reviewer` 节点（两阶段）** | 确定性六条 + 14.1 第二阶段的模型审查 |
 | `retry_router` | **`retry_router` 节点** | 14.4 的逐字实现，五个目标都有落点 |
 | `clarify` | 无 | 澄清以答案文本表达，状态位见【后续扩展】 |

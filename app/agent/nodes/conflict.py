@@ -1,27 +1,29 @@
 """`conflict` 节点：多源冲突检测（详细设计 13.3 / 13.4 的**切片版**）。
 
-## 这一版只做一类冲突，而且是有理由的
+## 这一版做五类里的三类，另外两类各有各的缺前提
 
-13.4 定义了五类。本实现只做 **VALUE**（同口径数值超容差），覆盖的载体只有两种：
+| 类 | 判据（13.4） | 两侧的载体 |
+|---|---|---|
+| `VALUE` | 同口径、同期间、同范围而数值超容差（第 4 步） | 文档**表格行** × SQL 证据的 `claim` |
+| `DEFINITION` | 口径版本不同（第 5 步） | 口径说明文档与指标目录的 `definition_version` |
+| `TIME` | 时间区间不一致（第 6 步） | 报告自称的 `stat_period` 与 `stat_cutoff` |
 
-文档侧认**表格行**：表头给出列名与单位（`区域 | 销售额（万元） | 净销售额（万元）`），
-数据行给出范围与取值（`华东 | 11,233.87 | 11,039.58`）。
-SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
+**`SCOPE` 与 `SOURCE` 仍不在**，两类的缺前提不是同一回事：
 
-**另外四类为什么不在这里**：
-
-- `DEFINITION` / `SCOPE`：要比较口径版本与维度范围，而**文档证据的
-  `metric_code` 与 `scope` 现在是空的**——分块不带指标 code，按 `logical_key`
-  反推是把自由文本约定当语义用（已登记）。两端缺一端就比不了。
-- `TIME`：文档的统计期间不在 `Evidence` 里（`event_time` 是文档的**生效区间**，
-  对报告恒为空）。没有它就无法区分"同期不同数"与"不同期的数"。
-- `SOURCE`：外部与内部相悖属 16.11.2 的注入缺陷，判据是"方向相反"，
-  要靠 Phase 9 的完整版；本版的 `source_kind` 已经进了证据，接口留着。
+- `SCOPE`：语料注入了「文档声称华东含 3 省 vs `dim_region` 记 4」这类缺陷，
+  而那是**文档 vs 数据库事实**——运行时**没有载体承载「数据库侧的范围事实」**
+  （它不是任何一个指标，不来自某次查询）。要做得先设计一个。
+- `SOURCE`：外部与内部相悖，判据是"方向相反"。而外部材料现在是**自由文本**，
+  取数要知道"这个数说的是哪个指标"——正是 VALUE 刻意不解析正文数字的理由。
+  判据一松必然出噪声。
 
 **这份清单就是面试口径**：被问"冲突检测做了多少"时，答案是
-「一类（VALUE）做了，四类没做，各缺什么前提写在这里」，而不是"做了冲突检测"。
+「三类做了（数值/口径版本/统计时点），两类没做、各缺什么前提写在这里」，
+**而不是笼统的"做了冲突检测"**。
 
-## 一个实测出来的关键约束：**两个方向的维度都要对上**
+## 三类各自的判据要点
+
+### VALUE：两个方向的维度都要对上
 
 第一版只把"表里的第一个维度列"当作范围，于是这样一张表会出事：
 
@@ -62,6 +64,38 @@ SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
 每一行都会照比。**多报看得出来**（读者会问"华南这行凭什么对华东的库值"），
 **漏报看不出来**——所以取舍是往多报那边倒的。
 
+### DEFINITION：只比版本号，不要求范围与期间相同
+
+口径是**指标级**属性：「A 按 v1.1、B 按 v1.2」在范围与期间相同或不同时都成立。
+而且口径说明文档没有 `report` 块，它的 `scope` / `stat_period` **恒为空**，
+要求"两边范围相同"等于恒不相等、把这条判据整个关掉。
+
+**两侧版本都非空才比**——"不知道版本"推不出"版本不一致"。
+这条与 `_comparable` 的"未知就放行"方向看似相反，但动作不同：
+那里放行的是**允许数值比对**（往多报那边倒），
+这里要产生的是**一条明确的口径指控**，凭不知道去指控就是编。
+
+### TIME：判「文档自己前后矛盾」，不判「两个来源期间不同」
+
+判据是 `_claim_truncated`：文档自称 `2025-Q3` 而统计截止日写在 `2025-09-25`
+（该季到 9-30）——**它自己的两处声明对不上**。
+
+**为什么不判"两侧期间不等"**（看着更直接、还零管道改动）：那条会把
+「问 Q3 却召回年度/半年报告」这种极常见的情况全部报成 TIME。而本项目刚花
+一整轮修掉的那批假冲突（157%–1133%）正是这么来的——把它们换个 type 名字
+放回来，是把"修复"回退成"改标签"。
+
+⚠️ **由此 TIME 说的是"声明不一致"，不是"数字对不上"**，两者会分叉：
+语料里 `cutoff=9/28` 的两份报告，因为业务库的日粒度数据只到每月 27 日
+（`scripts/business_seed.py` 的 `index % 27`），它们的数与完整期间**其实一致**，
+但仍然该报 TIME——它报的是那份报告的自相矛盾。`cutoff=9/25` 的那份才真的
+少了 9/26–27 两天。**别把这三处一起说成"数字不可比"。**
+
+**期间被截短的同一对证据只报 TIME，不报 VALUE**（`_document_conflicts` 里
+`continue` 掉了）：两个数既然不是同一个区间的合计，数值比对的前提就不成立，
+再报一条"数值差 1.4%"是把「少统计了几天」说成「数字错了」。
+
+## 表头 → metric_code：靠指标目录的名字与别名
 
 文档表头写的是 `净销售额（万元）`，SQL 证据带的是 `metric_code=net_sales`。
 两者能对上，靠的是 `schema_catalog.yaml` 里的**指标名与别名**。
@@ -71,6 +105,10 @@ SQL 侧认证据 `claim` 里渲染出来的 `列=值`。
 按别名匹配会把它错配到 `net_sales` 上，然后报一个**假冲突**。
 所以匹配**先精确名、后退别名**，并在 `detected_difference` 里写明用的是哪一种，
 让读冲突的人知道这个结论有多硬。
+
+⚠️ **目录是这条路的必需品**：VALUE 与 TIME 都靠它把表头翻成指标，
+`catalog is None` 时这两类静默跳过（`build_conflict_node` 的说明）。
+DEFINITION 不依赖它——口径版本两侧都直接长在证据上。
 
 ## 容差（13.4 第 4 步）
 
@@ -83,6 +121,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
+from datetime import date, timedelta
 from typing import Any
 
 from app.agent.state import AgentState
@@ -94,7 +133,7 @@ from app.domain.evidence import (
     ConflictType,
     Evidence,
 )
-from app.domain.period import canonical_period, canonical_token
+from app.domain.period import canonical_period, canonical_token, period_bounds
 
 #: 绝对容差（元）。13.4 第 4 步的默认值。
 _ABS_TOLERANCE = 1.0
@@ -123,25 +162,46 @@ def build_conflict_node(
 ) -> Callable[[AgentState], dict[str, Any]]:
     """构造 `conflict` 节点。
 
-    `catalog` 是 `SchemaCatalog`（指标目录）。**缺省时整条检测静默跳过**——
-    这看起来危险，但它是对的：目录只是"表头 → metric_code"的桥，
+    `catalog` 是 `SchemaCatalog`（指标目录）。**缺省时文档表格那一路静默跳过**
+    ——这看起来危险，但它是对的：目录只是"表头 → metric_code"的桥，
     没有桥就没有可比的配对，而**报不出冲突**与**没有冲突**在最终答案里
-    说法不同（见 `final` 的渲染）。为了让节点在有目录时能工作、
-    无目录时能跑，这里不做断言。
+    说法不同（见 `final` 的渲染）。DEFINITION 那一路不依赖目录
+    （口径版本两侧都已经在证据上），因此不受这个开关影响。
     """
 
     def conflict(state: AgentState) -> dict[str, Any]:
         evidence = list(state.get("evidence") or [])
-        if catalog is None or len(evidence) < 2:
+        if len(evidence) < 2:
             return {"conflicts": []}
-        found = detect_value_conflicts(evidence, catalog=catalog)
-        return {"conflicts": list(found)}
+        return {"conflicts": list(detect_conflicts(evidence, catalog=catalog))}
 
     return conflict
 
 
-def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tuple[Conflict, ...]:
-    """文档声称的数值 vs SQL 查出的数值（13.4 的 VALUE 一类）。
+def detect_conflicts(evidence: Sequence[Evidence], *, catalog: Any | None) -> tuple[Conflict, ...]:
+    """五类里的**三类**（13.4 第 4–6 步）。**这是唯一的公开入口。**
+
+    | 类 | 判据 | 在哪 |
+    |---|---|---|
+    | `DEFINITION` | 同指标、两侧**口径版本**都已知且不等 | `_definition_conflicts` |
+    | `TIME` | 文档自称的统计期间被它自己的**统计截止日**截短 | `_claim_truncated` |
+    | `VALUE` | 同口径、同期间、同范围而数值超容差 | `_document_conflicts` |
+
+    **`SCOPE` 与 `SOURCE` 仍不产出**，理由见模块 docstring。
+
+    顺序有意义：DEFINITION 只看证据对，与文档表格无关，先算；
+    剩下两类都在"文档表格行 × SQL 数值点"这条配对路径上（`_document_conflicts`），
+    而那一路**要目录**。
+    """
+    found = list(_definition_conflicts(evidence))
+    found.extend(_document_conflicts(evidence, catalog=catalog))
+    return tuple(found)
+
+
+def _document_conflicts(
+    evidence: Sequence[Evidence], *, catalog: Any | None
+) -> tuple[Conflict, ...]:
+    """文档表格行 × SQL 数值点这一条配对路径（TIME 与 VALUE 两类）。
 
     配对规则：**指标 + 维度范围 + 统计期间**都对得上才比。
     指标由表头经目录映射得到，维度由**文档级范围**（《华东区域…专项分析》
@@ -150,12 +210,23 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
     期间那一项见 `_same_period`：**跨期间的数不可比**，而这一条是实测补的
     （2025 年 8 月的库值曾被拿去和《上半年经营回顾》《年度经营分析》的
     同类表格比，报出 4 条 157%–1133% 的假冲突）。
+
+    ⚠️ **两级判据在期间这一项上是递进的**：`_same_period` 只比"自称的期间
+    记号相不相等"，相等之后再问一句"这个自称的期间是不是被它自己的截止日
+    截短了"（`_claim_truncated`）。截短了 → 报 **TIME** 并 `continue`，
+    **不报 VALUE**：两个数既然不是同一个区间的合计，数值比对的前提就不成立，
+    再报一条"数值差 1.4%"是把「少统计了几天」说成「数字错了」。
     """
     sql_points = [point for item in evidence if (point := _sql_point(item)) is not None]
-    if not sql_points:
+    if not sql_points or catalog is None:
         return ()
 
     conflicts: list[Conflict] = []
+    #: TIME 的去重键：**它说的是文档的声明，不是某一行、某一个指标的取值**。
+    #: 一篇报告会被切成多块（每块一条证据）、一张表有几行几列，
+    #: 不去重的话同一句"自称 Q3 却只统计到 9/25"会按行按列重复报出来
+    #: ——而读者会以为有十几个问题。按**文档 + 期间 + 截止日**收敛成一条。
+    seen_time: set[tuple[str, str | None, date | None]] = set()
     for item in evidence:
         if item.source_type != "DOCUMENT":
             continue
@@ -170,6 +241,16 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
                     continue
                 if not _same_period(claim, base):
                     continue
+                if _claim_truncated(claim):
+                    key = (
+                        str(item.locator.get("logical_key") or item.id),
+                        claim.period,
+                        claim.stat_cutoff,
+                    )
+                    if key not in seen_time:
+                        seen_time.add(key)
+                        conflicts.append(_build_time_conflict(item, base, claim))
+                    continue
                 difference = _difference(claim.value, base.value)
                 if difference is None:
                     continue
@@ -180,6 +261,70 @@ def detect_value_conflicts(evidence: Sequence[Evidence], *, catalog: Any) -> tup
     return tuple(conflicts)
 
 
+def _definition_conflicts(evidence: Sequence[Evidence]) -> tuple[Conflict, ...]:
+    """口径版本不同的两条证据（13.4 第 5 步）。
+
+    **只比版本号，比不了 scope 与期间**——口径是**指标级**属性：
+    「A 按 v1.1、B 按 v1.2」这件事，在范围与期间相同或不同时都成立。
+    而且 METRIC 类口径说明文档本来就没有 `report` 块，`scope` 与 `stat_period`
+    恒为空，要求它们相等等于把这条判据关掉。
+
+    **两侧都非空才比**：任一为 `None` 是"不知道口径版本"，
+    推不出"不一致"。这与 `_comparable` 的"未知就放行"方向看似相反，
+    但两者说的不是一件事：那里放行的动作是**允许数值比对**（多报方向），
+    这里的动作是**报一条冲突**——凭不知道报冲突就是编。
+    """
+    bases = [
+        item
+        for item in evidence
+        if item.source_type == "SQL" and item.metric_code and item.definition_version
+    ]
+    documents = [
+        item
+        for item in evidence
+        if item.source_type == "DOCUMENT" and item.metric_code and item.definition_version
+    ]
+    if not bases or not documents:
+        return ()
+
+    conflicts: list[Conflict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for document in documents:
+        for base in bases:
+            if document.metric_code != base.metric_code:
+                continue
+            if document.definition_version == base.definition_version:
+                continue
+            # **按文档身份去重**：一篇口径说明会被切成多块，Top-8 可能召回
+            # 两块以上，每块一条证据——不去重会报 2 条一模一样的冲突。
+            # 用 `locator.logical_key`（跨版本稳定）而不是 `id`（每块一个）。
+            key = (
+                str(document.locator.get("logical_key") or document.id),
+                str(document.metric_code),
+                str(document.definition_version),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            conflicts.append(_build_definition_conflict(document, base))
+    return tuple(conflicts)
+
+
+def _claim_truncated(point: _Point) -> bool:
+    """文档自称的统计期间**被它自己的统计截止日截短**了没有。
+
+    期间或截止日任一未知 → `False`（不报）："不知道"推不出"不一致"。
+    `month_end` 在入库侧已被解析成"期间最后一月的月末"，**恒等于**这里的
+    `end - 1 天`，所以正常报告永远不会走到 `True`——这是这条判据不误报的根据。
+    """
+    if point.stat_cutoff is None or point.period is None:
+        return False
+    bounds = period_bounds(point.period)
+    if bounds is None:
+        return False
+    return point.stat_cutoff < bounds[1] - timedelta(days=1)
+
+
 class _Point:
     """一个可比较的数值点（`(指标, 维度集合, 数值)`）。
 
@@ -188,7 +333,15 @@ class _Point:
     产品线限定"。把三个维度里最早出现的那个当成范围，正是那个 93% 假冲突的来源。
     """
 
-    __slots__ = ("evidence_id", "matched_by", "metric_code", "period", "scope", "value")
+    __slots__ = (
+        "evidence_id",
+        "matched_by",
+        "metric_code",
+        "period",
+        "scope",
+        "stat_cutoff",
+        "value",
+    )
 
     def __init__(
         self,
@@ -198,6 +351,7 @@ class _Point:
         value: float,
         matched_by: str,
         period: str | None = None,
+        stat_cutoff: date | None = None,
     ) -> None:
         self.evidence_id = evidence_id
         self.metric_code = metric_code
@@ -206,6 +360,9 @@ class _Point:
         #: **统计期间**记号（`2025-Q3`），`None` 表示**不知道**。
         #: 未知不等于"不限期间"——两者在 `_same_period` 里处置相反。
         self.period = period
+        #: **统计截止日**（含入的最后一天），同样 `None` 表示不知道。
+        #: 与 `period` 配对判这期间有没有被截短（`_claim_truncated`）。
+        self.stat_cutoff = stat_cutoff
         #: `exact`（表头就是指标名）或 `alias`（命中了别名）。
         #: **它决定了这条冲突有多硬**，见模块 docstring 的陷阱说明。
         self.matched_by = matched_by
@@ -399,6 +556,7 @@ def _document_points(item: Evidence, *, catalog: Any) -> list[_Point]:
                     value * unit,
                     matched_by,
                     period=canonical_token(item.stat_period) if item.stat_period else None,
+                    stat_cutoff=item.stat_cutoff,
                 )
             )
     return points
@@ -498,6 +656,82 @@ def _difference(left: float, right: float) -> dict[str, float] | None:
     return {"delta": delta, "ratio": ratio, "tolerance": tolerance}
 
 
+def _scope_suffix(claim: _Point) -> str:
+    """证据范围 → 描述里的 `，范围 region=华东` 后缀。
+
+    **TIME 与 VALUE 必须共用它**：评测判据（`scripts/agent_harness.py`）
+    对冲突描述做的是**子串匹配**，几条用例正是靠 `region=华南` / `region=华东`
+    钉住"报的是哪一行"。两处各写一遍的话，改了一处会让另一处的用例
+    变成永远匹配不上的红——而红的原因看起来与描述文案毫无关系。
+    """
+    if not claim.scope:
+        return ""
+    return "，范围 " + "、".join(f"{k}={v}" for k, v in claim.scope.items())
+
+
+def _build_time_conflict(document: Evidence, base: _Point, claim: _Point) -> Conflict:
+    """一条 TIME 冲突（13.4 第 6 步）。
+
+    ⚠️ **它报的是"声明不一致"，不是"数字对不上"**：判据是文档自称的期间与
+    它自己写下的统计截止日矛盾。所以描述里**不写两边的数值**——
+    写出来读者就会去算差值，而这张单子要说的恰恰是"这两个数不可比"。
+    """
+    bounds = period_bounds(claim.period or "")
+    last_day = (bounds[1] - timedelta(days=1)).isoformat() if bounds else "—"
+    return Conflict(
+        id=new_id(IdPrefix.CONFLICT),
+        type=ConflictType.TIME,
+        evidence_ids=(document.id, base.evidence_id),
+        severity=ConflictSeverity.WARNING,
+        description=(
+            f"统计时点不一致：《{document.title}》自称统计期间 {claim.period}，"
+            f"但其统计截止日为 {claim.stat_cutoff}（早于该期间末 {last_day}），"
+            f"与业务数据库查得的该期间完整数据不可比{_scope_suffix(claim)}"
+        ),
+        detected_difference={
+            "metric_code": claim.metric_code,
+            "stat_period": claim.period,
+            "declared_cutoff": claim.stat_cutoff.isoformat() if claim.stat_cutoff else None,
+            "period_end": last_day,
+            "scope": claim.scope,
+            "database_scope": dict(base.scope),
+        },
+        possible_explanations=(
+            "报告出得早：统计截止日定在期末之前，后几天的数据还没进系统",
+            "口径惯例不同：该报告按「次月月初关账」取数，与本次查询的区间取法不同",
+        ),
+        # **默认 UNRESOLVED**：与 VALUE 同一条理由——谁对谁错要 Reviewer
+        # 按 13.2 的证据优先级判，检测器只负责"发现了不一致"
+        resolution=ConflictResolution.UNRESOLVED,
+        selected_basis=None,
+    )
+
+
+def _build_definition_conflict(document: Evidence, base: Evidence) -> Conflict:
+    """一条 DEFINITION 冲突（13.4 第 5 步）。"""
+    return Conflict(
+        id=new_id(IdPrefix.CONFLICT),
+        type=ConflictType.DEFINITION,
+        evidence_ids=(document.id, base.id),
+        severity=ConflictSeverity.WARNING,
+        description=(
+            f"口径版本不一致：《{document.title}》按 {document.definition_version} 口径"
+            f"说明 {document.metric_code}，而业务数据库按 {base.definition_version} 口径计算"
+        ),
+        detected_difference={
+            "metric_code": document.metric_code,
+            "document_definition_version": document.definition_version,
+            "database_definition_version": base.definition_version,
+        },
+        possible_explanations=(
+            "文档未随口径变更同步修订：指标目录的口径已升版，这份口径说明还停在旧版",
+            "文档先于口径变更发布：它描述的是当时有效的那一版口径",
+        ),
+        resolution=ConflictResolution.UNRESOLVED,
+        selected_basis=None,
+    )
+
+
 def _build_conflict(
     document: Evidence,
     base: _Point,
@@ -506,9 +740,7 @@ def _build_conflict(
     *,
     difference_ratio: float,
 ) -> Conflict:
-    scope = (
-        ("，范围 " + "、".join(f"{k}={v}" for k, v in claim.scope.items())) if claim.scope else ""
-    )
+    scope = _scope_suffix(claim)
     matched = (
         "表头与指标名精确相同"
         if claim.matched_by == "exact"
@@ -567,4 +799,4 @@ def render(conflicts: Sequence[Conflict]) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["build_conflict_node", "detect_value_conflicts", "render"]
+__all__ = ["build_conflict_node", "detect_conflicts", "render"]

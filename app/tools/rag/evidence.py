@@ -23,14 +23,20 @@ Reviewer 那里，看到的只有 `Evidence`，它不关心这条来自一次 `S
 那是**篡改证据原文**，而引用与原文不一致是 22.3 明写要测的东西。
 防注入的责任在 prompt 组装侧（把文档文本放在有标签的数据字段里），不在这里。
 
-## 两处拿不到的信息，如实留空而不是编
+## 三处信息按来源分类，拿不到的如实留空而不是编
 
-- **`metric_code` / `definition_version`**：分块不携带指标 code，而按
-  `logical_key` 反推（`metric/order-count-definition`）是把一个自由文本约定
-  当语义用。13.4 第 5 步的 DEFINITION 冲突因此暂时只覆盖 SQL 侧，
-  文档侧要等 Phase 9 把文档与指标目录挂钩。**留 `None` 是不报错的**，
-  所以这一条必须记在文档里，否则"冲突检测少了一半"不会有人发现。
-- **`scope`**：分块里没有区域/渠道/产品线维度字段（16.11.2 的
+- **`metric_code` / `definition_version`**：**逐字来自清单**（METRIC 类口径
+  说明文档声明 `metric_code` 与 `definition_version`），随 payload 一路带下来。
+  只有那 7 篇有值——一篇报告同时讲五个指标，给它一个文档级 code 会把它
+  **错分组**（13.4 第 1 步按 metric_code 分组）。**绝不按 `logical_key` 反推**
+  （`metric/order-count-definition`）：那是把一个自由文本约定当语义用。
+  其余文档留 `None`，而**留 `None` 是不报错的**，所以这条要记在文档里，
+  否则"口径冲突只在口径说明文档上有效"不会有人发现。
+- **`stat_cutoff`**：同样逐字来自清单（报告的 `report.cutoff`，
+  `month_end` 在入库侧已解成具体日期）。它与 `stat_period` 配对才说明问题——
+  自称的期间被自己的截止日截短即为 TIME 冲突（`conflict._claim_truncated`）。
+- **`scope`**：来自清单的 `report.region` / `report.channel`（**文档级**范围），
+  不是从分块正文里读的。分块里没有区域/渠道/产品线维度字段（16.11.2 的
   「区域范围不同」是文档**正文声称的**省份数与库不符，属于 Analysis
   从文本里读出来的结论，不是分块元数据）。硬塞 `{"department": ...}`
   会让 13.4 的维度比对多出一个永远对不上的键。
@@ -145,9 +151,12 @@ def _evidence_of(chunk: RetrievedChunk, *, question: str, retrieved_at: datetime
         },
         event_time=_effective_range(meta),
         retrieved_at=retrieved_at,
-        # 见模块 docstring：分块不带指标 code，留空而不是按 logical_key 反推
-        metric_code=None,
-        definition_version=None,
+        # **只有 METRIC 类口径说明文档带这两个**（清单里逐篇声明的
+        # `metric_code` / `definition_version`），其余文档恒为 None——
+        # 一篇报告同时讲五个指标，给它一个 code 会把它错分组（13.4 第 1 步）。
+        # 两侧都有值时，版本不等即 DEFINITION 冲突（`conflict._definition_conflicts`）。
+        metric_code=meta.metric_code,
+        definition_version=meta.definition_version,
         # **文档级范围**（《华东区域…专项分析》→ `{region: 华东}`），来自清单的
         # `report.region` / `report.channel`。它不是"这条分块的维度"，
         # 而是"这份文档说的是哪个总体"——同一个「分产品线」表头，
@@ -155,6 +164,7 @@ def _evidence_of(chunk: RetrievedChunk, *, question: str, retrieved_at: datetime
         # 冲突检测把它并进 claim 的 scope 再比，见 `conflict._document_points`。
         scope=dict(meta.document_scope),
         stat_period=meta.stat_period,
+        stat_cutoff=meta.stat_cutoff,
         reliability=_reliability(meta),
         # 对**正文**取哈希：同一段文字出现在两个版本里时，它们说的就是同一件事，
         # 13.4 第 1 步的"判同"要的正是这个粒度。版本差异由 locator 承担，

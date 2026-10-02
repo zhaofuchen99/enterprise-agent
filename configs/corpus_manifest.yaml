@@ -35,7 +35,11 @@
 #: 报告（`SR-EC-*` / `SR-CH-*`）里「分产品线」等表的数**全变了**——
 #: 原来那张表的分子是全公司、分母是华东，占比列出现过 187.4%。
 #: 内容变 = 语料变，所以按上面那条纪律升版本并重跑三门禁。
-version: "2026.09.27-1"
+#: 2026.10.02-1：**七篇指标口径说明各自声明了 `definition_version`**（原先只有
+#: `metric_code`），并且 **MD-005 有意注入了一处口径版本不一致**
+#: （文档 v1.1 vs 目录 v1.0），供 DEFINITION 冲突检测端到端取用。
+#: 七篇 METRIC 的正文也多了「口径版本」一行（`render_metric`）——正文变即语料变。
+version: "2026.10.02-1"
 
 # ---------------------------------------------------------------- 应缺席的制度（16.11.2 第 10 项）
 #
@@ -71,6 +75,11 @@ handwritten_dir: "configs/corpus_handwritten"
 defect_kinds:
   VERSION_PAIR:       # 16.11.2-1  同名制度两个版本，一失效一生效（≥2 组）
   VALUE_CONFLICT:     # 16.11.2-2  报告数字与 DB 差 1–2%（≥5 处）
+  DEFINITION_CONFLICT:  # 16.11.2-2 的另一维：**口径版本**不一致（1 处）
+  #                     ↑ 与 VALUE 同属「口径」这条线，但机制不同：VALUE 是
+  #                     同一版口径下数字对不上，这里是**两版口径**。
+  #                     靠 `definition_version` 与指标目录的 `version` 比对检出，
+  #                     与数值无关——所以独立编号，逐条断言。
   TIME_CONFLICT:      # 16.11.2-3  报告统计截止日不同（≥3 处）
   SCOPE_CONFLICT:     # 16.11.2-4  区域范围定义不同（≥2 处）
   SOURCE_PAIR:        # 16.11.2-5  外部称增长、内部在下降（≥2 组）
@@ -618,8 +627,13 @@ documents:
   # ============================================================ 五、指标口径说明（11 篇）
   #
   # 这批是 SQL 侧与 RAG 侧**口径的唯一权威出处**，与 `configs/schema_catalog.yaml`
-  # 的 `metrics` 段一一对应。版本号必须与目录里的 `version` 字段一致——
-  # 不一致就意味着「SQL 用一版口径、文档讲另一版」，是比缺文档更糟的状态。
+  # 的 `metrics` 段一一对应。每篇的 `definition_version` 必须与目录里的
+  # `version` 字段一致——不一致就意味着「SQL 用一版口径、文档讲另一版」，
+  # 那是比缺文档更糟的状态。**唯一的例外是 MD-005，它是有意注入的缺陷。**
+  #
+  # `definition_version` 与 `version` 是**两个字段**，别混：
+  # 后者是**文档修订版本**（进 `document_id`，决定归档、去重与版本对过滤），
+  # 前者只描述**口径版本**（随 payload 进证据，与目录比对出 DEFINITION 冲突）。
   - id: MD-001
     logical_key: metric/net-sales-definition
     title: 净销售额指标口径说明
@@ -628,6 +642,7 @@ documents:
     department: 财务部
     version: v1.2
     metric_code: net_sales
+    definition_version: v1.2
   - id: MD-002
     logical_key: metric/gross-sales-definition
     title: 含税销售额口径说明
@@ -636,6 +651,7 @@ documents:
     department: 财务部
     version: v1.2
     metric_code: gross_sales
+    definition_version: v1.2
   - id: MD-003
     logical_key: metric/discount-amount-definition
     title: 折扣金额口径说明
@@ -644,6 +660,7 @@ documents:
     department: 财务部
     version: v1.1
     metric_code: discount_amount
+    definition_version: v1.1
   - id: MD-004
     logical_key: metric/return-amount-definition
     title: 退货金额口径说明
@@ -652,7 +669,19 @@ documents:
     department: 财务部
     version: v1.1
     metric_code: return_amount
+    definition_version: v1.1
   - id: MD-005
+    #: DEFINITION_CONFLICT 的唯一一处注入：本文描述 v1.1 口径，
+    #: 而指标目录里 `order_count` 还是 v1.0 —— 「SQL 用一版口径、文档讲另一版」。
+    #
+    #: 选 `order_count` 的三条理由：① 报告的表格里**没有「订单行数」列**，
+    #: 所以这份文档端到端只产出一条干净的 DEFINITION，不会顺手带出别的冲突；
+    #: ② 没有第二份文档讲同一个指标（不像「退货金额」会被管理办法挤掉）；
+    #: ③ 现有评测里的订单行数用例是**单源 SQL**，不召回文档，不受影响。
+    #:
+    #: ⚠️ **只动 `definition_version`，不动 `version`**：后者是文档身份
+    #: （`document_id = logical_key@version`），改了它会让旧版本的向量点
+    #: 留在库里删不掉（重建只按新 key 删），同一篇文档被召回两版、两条证据。
     logical_key: metric/order-count-definition
     title: 订单行数口径说明
     type: METRIC
@@ -660,6 +689,8 @@ documents:
     department: 销售运营部
     version: v1.0
     metric_code: order_count
+    definition_version: v1.1
+    defects: [DEFINITION_CONFLICT]
   - id: MD-006
     #: PROMPT_INJECTION 第 3 份所在。选「目标达成率」这篇是因为它解释了
     #: 红绿灯阈值（≥100% 绿 / 80–100% 黄 / <80% 红）——一个带明确判定规则的文档，
@@ -671,6 +702,7 @@ documents:
     department: 财务部
     version: v1.0
     metric_code: sales_target_amount
+    definition_version: v1.0
     defects: [PROMPT_INJECTION]
     injection: injection_metric.md
   - id: MD-007
@@ -681,6 +713,7 @@ documents:
     department: 供应链部
     version: v1.0
     metric_code: available_qty
+    definition_version: v1.0
   - id: MD-008
     #: SCOPE_CONFLICT 第 2 处：本文写「华东含三省（沪、苏、浙）」，
     #: 而 `dim_region` 记 `province_count = 4`。选「区域划分说明」这篇承载它，

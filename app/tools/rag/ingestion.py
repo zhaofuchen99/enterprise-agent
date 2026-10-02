@@ -63,6 +63,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import logging
 import re
@@ -149,6 +150,15 @@ class DocumentMetadata(BaseModel):
     #: 文档级维度范围（报告的 `report.region` / `report.channel`）。见
     #: `ChunkMetadata.document_scope`——它决定了"这个表头说的是哪个总体"。
     document_scope: dict[str, str] = Field(default_factory=dict)
+    #: 统计截止日（报告的 `report.cutoff`，`month_end` 已解析成具体日期）。
+    #: 与 `stat_period` 配对判"自称的期间有没有被截短"，见 `ChunkMetadata.stat_cutoff`。
+    stat_cutoff: date | None = None
+    #: 文档级指标 code（只有 METRIC 类口径说明有）。有了它文档侧才有
+    #: `definition_version` 可比，见 `ChunkMetadata.metric_code`。
+    metric_code: str | None = None
+    #: 文档声明的口径版本（清单的 `definition_version`），与文档修订版本 `version`
+    #: 是两件事。见 `ChunkMetadata.definition_version`。
+    definition_version: str | None = None
     created_by: str | None = None
 
     @property
@@ -306,8 +316,21 @@ def validate_content(path: Path, fmt: str) -> None:
             "文本文件里出现 NUL 字节，内容可能是二进制",
             details={"path": str(path)},
         )
+    # ⚠️ **用增量解码器，不用 `head.decode("utf-8")`**：这里只采样了前
+    # `_BINARY_SAMPLE` 个字节，窗口边界**可能把一个多字节字符切成两半**
+    # ——那不是"内容非法"，是我们自己截断的。
+    #
+    # 实测（2026-10-02）：`MD-006.txt` 长 4108 字节，前 4096 正好落在一个汉字
+    # 中间，于是一份**完全合法**的 UTF-8 文件被报成"不是合法的 UTF-8：
+    # unexpected end of data"。症状极具误导性——排查方向会跑到生成器或编辑器上，
+    # 而它只在"文件长度跨过 4096 且边界压在字符中间"时出现，
+    # 所以它在此之前一直没被发现（那篇文档原先不到 4096 字节）。
+    #
+    # 增量解码器把**不完整的尾巴留在缓冲里**而不是报错，中间的坏字节照样会抛：
+    # 这正是"我手上是一个流的前缀"该有的语义。
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
-        head.decode("utf-8")
+        decoder.decode(head)
     except UnicodeDecodeError as exc:
         raise AgentError(
             ErrorCode.INVALID_ARGUMENT,
@@ -659,6 +682,9 @@ async def _vectorize(
             published_at=state.metadata.published_at,
             stat_period=state.metadata.stat_period,
             document_scope=state.metadata.document_scope,
+            stat_cutoff=state.metadata.stat_cutoff,
+            metric_code=state.metadata.metric_code,
+            definition_version=state.metadata.definition_version,
             status=DocumentStatus.PROCESSING,
         )
         points.append(

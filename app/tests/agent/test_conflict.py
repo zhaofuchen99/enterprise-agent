@@ -1,21 +1,41 @@
-"""多源冲突检测（详细设计 13.3 / 13.4 的 VALUE 一类）。
+"""多源冲突检测（详细设计 13.3 / 13.4 的 VALUE / DEFINITION / TIME 三类）。
 
 **这里最容易犯的错是"报出一个看起来被算出来的冲突"**——它格式正确、
 有数字、有差值，只是配错了对。所以用例大多在测"不该报的时候不报"：
-指标名不同不报、范围不同不报、容差内不报、单位读不出来不报。
+指标名不同不报、范围不同不报、容差内不报、单位读不出来不报；
+口径版本相同不报、"不知道版本"不报、截止日落在期末不报、期间解不出来不报。
+
+VALUE 用例统一走 `_only_value`（本文件的主要部分）；DEFINITION 与 TIME
+各自独立成段。**SCOPE 与 SOURCE 没有用例**——那两类还没实现，
+理由写在 `app/agent/nodes/conflict.py` 的模块 docstring 里。
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
 
-from app.agent.nodes.conflict import detect_value_conflicts, render
+from app.agent.nodes.conflict import detect_conflicts, render
 from app.core.ids import IdPrefix, new_id
-from app.domain.evidence import Evidence, TimeRange
+from app.domain.evidence import Conflict, ConflictType, Evidence, TimeRange
 from app.tools.sql.schemas import MetricSpec, SchemaCatalog
+
+
+def _only_value(evidence: list[Evidence], *, catalog: SchemaCatalog) -> tuple[Conflict, ...]:
+    """只取 VALUE 类。
+
+    本文件测的是「文档表格 × SQL 数值」这条配对路径上的**数值比对**，
+    而 `detect_conflicts` 是三类冲突的总入口。DEFINITION 走的是另一条路
+    （只看证据对，与表格无关），TIME 与 VALUE 共用这条配对路径但判据不同
+    ——各自有各自的用例文件。这里挑一类出来，用例才只说一件事。
+    """
+    return tuple(
+        item
+        for item in detect_conflicts(evidence, catalog=catalog)
+        if item.type is ConflictType.VALUE
+    )
 
 
 def _catalog(*metrics: MetricSpec) -> SchemaCatalog:
@@ -33,7 +53,13 @@ def _metric(code: str, name: str, aliases: tuple[str, ...] = ()) -> MetricSpec:
     )
 
 
-def _sql_evidence(value: float, *, metric: str = "net_sales", region: str = "华东") -> Evidence:
+def _sql_evidence(
+    value: float,
+    *,
+    metric: str = "net_sales",
+    region: str = "华东",
+    definition_version: str | None = None,
+) -> Evidence:
     return Evidence(
         id=new_id(IdPrefix.EVIDENCE),
         source_type="SQL",
@@ -45,20 +71,39 @@ def _sql_evidence(value: float, *, metric: str = "net_sales", region: str = "华
         ),
         retrieved_at=datetime(2026, 9, 18, tzinfo=UTC),
         metric_code=metric,
+        definition_version=definition_version,
         scope={"region": region},
         reliability="HIGH",
         content_hash="a" * 64,
     )
 
 
-def _document_evidence(text: str, *, title: str = "华东区域2025年第三季度专项分析") -> Evidence:
+def _document_evidence(
+    text: str,
+    *,
+    title: str = "华东区域2025年第三季度专项分析",
+    logical_key: str = "report/special-east-china-2025Q3",
+    metric_code: str | None = None,
+    definition_version: str | None = None,
+    stat_period: str | None = None,
+    stat_cutoff: date | None = None,
+) -> Evidence:
     return Evidence(
         id=new_id(IdPrefix.EVIDENCE),
         source_type="DOCUMENT",
         title=title,
         claim=text,
-        locator={"section_path": [title, "二、经营业绩回顾"], "chunk_id": "chk_x"},
+        locator={
+            "section_path": [title, "二、经营业绩回顾"],
+            "chunk_id": "chk_x",
+            # 冲突去重按它分组（同一篇文档可能召回多块），见 `_definition_conflicts`
+            "logical_key": logical_key,
+        },
         retrieved_at=datetime(2026, 9, 18, tzinfo=UTC),
+        metric_code=metric_code,
+        definition_version=definition_version,
+        stat_period=stat_period,
+        stat_cutoff=stat_cutoff,
         reliability="MEDIUM",
         content_hash="b" * 64,
     )
@@ -69,6 +114,14 @@ _TABLE = """华东区域2025年第三季度专项分析 > 二、经营业绩回�
 区域 | 销售额（万元） | 净销售额（万元） | 同比 | 占比 | 省份数
 华东 | 11,233.87 | 11,039.58 | -13.2% | 100.0% | 4"""
 
+#: 一篇口径说明的正文。**它没有表格**——DEFINITION 冲突看的是文档身份上的
+#: `metric_code` 与 `definition_version`，与分块正文里有几张表无关。
+#: 写成正文而不是表格，正是为了钉住这一点。
+_METRIC_DOC = """订单行数口径说明 > 一、指标定义
+指标编码：order_count
+口径版本：v1.1
+订单行数按销售订单明细表逐行计数，一个订单含三行商品即计 3。"""
+
 
 def test_detects_a_value_conflict_across_sources() -> None:
     """文档表格里的净销售额 vs 库里的净销售额，超出容差 → 报冲突。
@@ -77,7 +130,7 @@ def test_detects_a_value_conflict_across_sources() -> None:
     差四个数量级，报出来的差值毫无意义，而它看起来是一条正常的冲突。
     """
     catalog = _catalog(_metric("net_sales", "净销售额", ("净销售", "销售额")))
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
     )
 
@@ -107,7 +160,7 @@ def test_the_exact_column_wins_over_the_aliased_one() -> None:
     """
     catalog = _catalog(_metric("net_sales", "净销售额", ("销售额",)))
     only_aliased = _TABLE.replace("净销售额（万元） | ", "")
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(only_aliased), _sql_evidence(111_967_031.73)], catalog=catalog
     )
 
@@ -126,9 +179,7 @@ def test_no_conflict_when_the_difference_is_within_tolerance() -> None:
     # 差 0.05%（小于 0.1% 的相对容差）
     close = 110_395_800.0 * 1.0005
 
-    conflicts = detect_value_conflicts(
-        [_document_evidence(_TABLE), _sql_evidence(close)], catalog=catalog
-    )
+    conflicts = _only_value([_document_evidence(_TABLE), _sql_evidence(close)], catalog=catalog)
 
     assert conflicts == ()
 
@@ -140,7 +191,7 @@ def test_no_conflict_when_the_scope_differs() -> None:
     而它其实只是两个地方。
     """
     catalog = _catalog(_metric("net_sales", "净销售额"))
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_TABLE), _sql_evidence(111_967_031.73, region="华南")],
         catalog=catalog,
     )
@@ -174,7 +225,7 @@ def test_a_multi_dimension_table_is_not_compared_to_a_region_total() -> None:
     )
 
     # SQL 只按区域聚合 → 粒度 {region}；文档行是 {region, channel, product_line}
-    assert detect_value_conflicts([detail, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+    assert _only_value([detail, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
 
 
 def test_a_single_dimension_table_is_still_compared() -> None:
@@ -185,7 +236,7 @@ def test_a_single_dimension_table_is_still_compared() -> None:
     catalog = _catalog(_metric("net_sales", "净销售额"))
     single = _document_evidence(_TABLE)  # 表头只有「区域」一个维度列
 
-    conflicts = detect_value_conflicts([single, _sql_evidence(111_967_031.73)], catalog=catalog)
+    conflicts = _only_value([single, _sql_evidence(111_967_031.73)], catalog=catalog)
 
     assert len(conflicts) == 1
 
@@ -204,7 +255,7 @@ def test_an_unscoped_sql_aggregate_still_compares() -> None:
     catalog = _catalog(_metric("net_sales", "净销售额"))
     unscoped = _sql_evidence(111_967_031.73).model_copy(update={"scope": {}})
 
-    conflicts = detect_value_conflicts([_document_evidence(_TABLE), unscoped], catalog=catalog)
+    conflicts = _only_value([_document_evidence(_TABLE), unscoped], catalog=catalog)
 
     assert len(conflicts) == 1
 
@@ -220,7 +271,7 @@ def test_data_scope_is_not_a_dimension() -> None:
         update={"scope": {"region": "华东", "data_scope": ["华东"]}}
     )
 
-    conflicts = detect_value_conflicts([_document_evidence(_TABLE), scoped], catalog=catalog)
+    conflicts = _only_value([_document_evidence(_TABLE), scoped], catalog=catalog)
 
     assert len(conflicts) == 1
 
@@ -228,7 +279,7 @@ def test_data_scope_is_not_a_dimension() -> None:
 def test_no_conflict_when_the_metric_differs() -> None:
     """指标不同不报。`销售额` 那一列（含税口径）不该与净销售额比。"""
     catalog = _catalog(_metric("net_sales", "净销售额"))
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [
             _document_evidence(_TABLE),
             _sql_evidence(111_967_031.73, metric="gross_sales"),
@@ -250,7 +301,7 @@ def test_sql_without_a_matching_value_in_the_claim_is_skipped() -> None:
         update={"claim": "region_name=华东；gross_sales=12345"}
     )
 
-    assert detect_value_conflicts([_document_evidence(_TABLE), mismatched], catalog=catalog) == ()
+    assert _only_value([_document_evidence(_TABLE), mismatched], catalog=catalog) == ()
 
 
 def test_a_document_without_tables_produces_nothing() -> None:
@@ -259,14 +310,14 @@ def test_a_document_without_tables_produces_nothing() -> None:
     catalog = _catalog(_metric("net_sales", "净销售额"))
     prose = _document_evidence("报告期内，华东实现销售额 11,233.87 万元，净销售额11,039.58 万元。")
 
-    assert detect_value_conflicts([prose, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+    assert _only_value([prose, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
 
 
-def test_without_a_catalog_nothing_is_compared() -> None:
-    """没有指标目录就没有"表头 → metric_code"的桥，整条检测跳过。
+def test_without_a_catalog_the_table_route_is_skipped() -> None:
+    """没有指标目录就没有"表头 → metric_code"的桥，**表格那一路**（VALUE / TIME）跳过。
 
     **跳过不等于"没有冲突"**：`final` 的渲染会把这两种情形分开说
-    （见 `nodes/final.py`），否则读答案的人会以为五类都比过了。
+    （见 `nodes/final.py`），否则读答案的人会以为三类都比过了。
     """
     from app.agent.nodes.conflict import build_conflict_node
 
@@ -276,10 +327,39 @@ def test_without_a_catalog_nothing_is_compared() -> None:
     assert node(state) == {"conflicts": []}
 
 
+def test_definition_conflicts_do_not_need_a_catalog() -> None:
+    """对照：**DEFINITION 那一路不依赖目录**，`catalog=None` 时照报。
+
+    理由：它的两侧——文档 payload 里的口径版本与 SQL 证据里的——**都已经长在
+    证据上**，目录只是"表头 → metric_code"的桥，与版本比对无关。
+    把它们一起关掉的话，一个"没有目录"的装配（或目录加载失败）会连
+    "文档讲的是一版口径、库里算的是另一版"也一起静默——而那是**已经拿在手上的
+    两条事实**，不该因为另一个组件缺席就不说。
+    """
+    from app.agent.nodes.conflict import build_conflict_node
+
+    node = build_conflict_node(catalog=None)
+    state: Any = {
+        "evidence": [
+            _document_evidence(
+                _METRIC_DOC,
+                title="订单行数口径说明",
+                metric_code="order_count",
+                definition_version="v1.1",
+            ),
+            _sql_evidence(12_345, metric="order_count", definition_version="v1.0"),
+        ]
+    }
+
+    conflicts = node(state)["conflicts"]
+
+    assert [item.type for item in conflicts] == [ConflictType.DEFINITION]
+
+
 def test_render_lists_the_possible_explanations() -> None:
     """渲染给模型看的文本要带上可能原因——那是它披露冲突时的措辞依据。"""
     catalog = _catalog(_metric("net_sales", "净销售额"))
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
     )
 
@@ -314,7 +394,7 @@ def test_other_regions_are_not_compared_against_a_scoped_sql_aggregate() -> None
     只存在于 WHERE 里，把它抽出来放进证据的 `scope`，比对就自然对上了。
     """
     catalog = _catalog(_metric("net_sales", "净销售额"))
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_REGION_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
     )
 
@@ -333,9 +413,7 @@ def test_without_a_sql_side_scope_every_row_still_compares() -> None:
     catalog = _catalog(_metric("net_sales", "净销售额"))
     unscoped = _sql_evidence(111_967_031.73).model_copy(update={"scope": {}})
 
-    conflicts = detect_value_conflicts(
-        [_document_evidence(_REGION_TABLE), unscoped], catalog=catalog
-    )
+    conflicts = _only_value([_document_evidence(_REGION_TABLE), unscoped], catalog=catalog)
 
     assert len(conflicts) == 5
 
@@ -368,7 +446,7 @@ def test_a_coarser_document_row_is_not_compared_to_a_finer_sql_point() -> None:
         update={"scope": {"region": "华东", "product_line": "智能家居"}}
     )
 
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_PRODUCT_LINE_TABLE, title="2025年第三季度经营分析"), finer],
         catalog=catalog,
     )
@@ -387,7 +465,7 @@ def test_a_coarser_document_row_still_compares_when_the_sql_side_is_coarse_too()
         update={"scope": {"product_line": "智能家居"}}
     )
 
-    conflicts = detect_value_conflicts(
+    conflicts = _only_value(
         [_document_evidence(_PRODUCT_LINE_TABLE, title="2025年第三季度经营分析"), same_grain],
         catalog=catalog,
     )
@@ -417,13 +495,10 @@ def test_a_row_from_another_period_is_not_compared() -> None:
     august = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-08"})
     same_quarter = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-Q3"})
 
-    assert detect_value_conflicts([august, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
+    assert _only_value([august, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
     # 对照：同期的那一行照比——只加约束不加对照的话，
     # 一次"期间对不上就全不比"的改动也能让上面那条通过
-    assert (
-        len(detect_value_conflicts([same_quarter, _sql_evidence(111_967_031.73)], catalog=catalog))
-        == 1
-    )
+    assert len(_only_value([same_quarter, _sql_evidence(111_967_031.73)], catalog=catalog)) == 1
 
 
 @pytest.mark.parametrize("period", ["2025-H1", "2025-H2", "2025", "2025-Q1", "2025-07"])
@@ -436,9 +511,7 @@ def test_periods_that_merely_contain_the_query_period_are_still_skipped(period: 
     catalog = _catalog(_metric("net_sales", "净销售额"))
     containing = _document_evidence(_TABLE).model_copy(update={"stat_period": period})
 
-    assert (
-        detect_value_conflicts([containing, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
-    )
+    assert _only_value([containing, _sql_evidence(111_967_031.73)], catalog=catalog) == ()
 
 
 def test_an_unknown_period_still_compares() -> None:
@@ -451,7 +524,7 @@ def test_an_unknown_period_still_compares() -> None:
 
     assert (
         len(
-            detect_value_conflicts(
+            _only_value(
                 [_document_evidence(_TABLE), _sql_evidence(111_967_031.73)], catalog=catalog
             )
         )
@@ -476,7 +549,7 @@ def test_a_query_whose_range_is_not_a_period_has_no_period() -> None:
     monthly = _document_evidence(_TABLE).model_copy(update={"stat_period": "2025-08"})
 
     # SQL 侧期间未知 → 放行（多报方向），所以这条**照比**
-    assert len(detect_value_conflicts([monthly, nine_months], catalog=catalog)) == 1
+    assert len(_only_value([monthly, nine_months], catalog=catalog)) == 1
 
 
 def test_the_document_level_scope_is_merged_into_every_row() -> None:
@@ -499,10 +572,226 @@ def test_the_document_level_scope_is_merged_into_every_row() -> None:
         update={"scope": {"region": "华东", "product_line": "智能家居"}}
     )
 
-    conflicts = detect_value_conflicts([regional, finer], catalog=catalog)
+    conflicts = _only_value([regional, finer], catalog=catalog)
 
     assert len(conflicts) == 1, "文档级范围补上了 region，两个方向就对得上了"
     assert conflicts[0].detected_difference["scope"] == {
         "region": "华东",
         "product_line": "智能家居",
     }
+
+
+# ==================================================================== DEFINITION
+def test_a_definition_version_mismatch_is_reported() -> None:
+    """同一指标、两侧口径版本不等 → DEFINITION 冲突（13.4 第 5 步）。
+
+    载体是**口径说明文档**：它逐字声明 `metric_code` 与 `definition_version`
+    （清单里写的），而目录给 SQL 侧证据填的是目录自己的 `version`。
+    两者不等意味着「文档讲的是一版口径、库里算的是另一版」——
+    这比数值差异更根本：数的差往往正是它引出来的。
+    """
+    document = _document_evidence(
+        _METRIC_DOC, title="订单行数口径说明", metric_code="order_count", definition_version="v1.1"
+    )
+    base = _sql_evidence(12_345, metric="order_count", definition_version="v1.0")
+
+    conflicts = detect_conflicts([document, base], catalog=None)
+
+    assert len(conflicts) == 1
+    item = conflicts[0]
+    assert item.type is ConflictType.DEFINITION
+    assert item.evidence_ids == (document.id, base.id)
+    assert item.detected_difference["document_definition_version"] == "v1.1"
+    assert item.detected_difference["database_definition_version"] == "v1.0"
+    # 检测器不判谁对，同 VALUE
+    assert item.resolution.value == "UNRESOLVED"
+    # 版本号要出现在描述里，读的人才知道差在哪
+    assert "v1.1" in item.description
+    assert "v1.0" in item.description
+
+
+def test_matching_definition_versions_are_not_reported() -> None:
+    """对照：两边版本相同就没什么可说的。没有这条，一个"永远报一条"的实现也能过。"""
+    document = _document_evidence(
+        _METRIC_DOC, title="订单行数口径说明", metric_code="order_count", definition_version="v1.0"
+    )
+    base = _sql_evidence(12_345, metric="order_count", definition_version="v1.0")
+
+    assert detect_conflicts([document, base], catalog=None) == ()
+
+
+def test_a_definition_conflict_needs_both_versions_known() -> None:
+    """任一侧口径版本未知 → 不报。
+
+    **"不知道版本"推不出"版本不一致"。** 注意这条路与 `_comparable` 的
+    "未知就放行"方向看似相反，但动作不是一回事：那里放行的是**允许数值比对**
+    （多报方向），这里要产生的是**一条明确的口径指控**——凭不知道去指控就是编。
+    """
+    known = _document_evidence(
+        _METRIC_DOC, title="订单行数口径说明", metric_code="order_count", definition_version="v1.1"
+    )
+    unknown_base = _sql_evidence(12_345, metric="order_count")
+
+    assert detect_conflicts([known, unknown_base], catalog=None) == ()
+
+
+def test_one_metric_document_is_reported_once() -> None:
+    """**一篇口径说明被切成多块时只报一条**。
+
+    Top-8 召回里同一篇文档常有两块以上，每块一条证据。不去重的话
+    冲突列表里会出现两条一模一样的话——读的人会以为有两个问题。
+    按 `locator.logical_key` 去重（跨版本稳定），不按 `id`（每块一个）。
+    """
+    first = _document_evidence(
+        _METRIC_DOC, title="订单行数口径说明", metric_code="order_count", definition_version="v1.1"
+    )
+    second = first.model_copy(update={"id": new_id(IdPrefix.EVIDENCE)})
+    base = _sql_evidence(12_345, metric="order_count", definition_version="v1.0")
+
+    assert len(detect_conflicts([first, second, base], catalog=None)) == 1
+
+
+def test_definition_conflicts_ignore_scope_and_period() -> None:
+    """口径是**指标级**属性——范围与期间对不上也照报。
+
+    强行要求 scope 相同会把这条判据关掉：口径说明文档没有 `report` 块，
+    它的 `scope` 与 `stat_period` **恒为空**，而 SQL 侧通常带着 `region`。
+    """
+    document = _document_evidence(
+        _METRIC_DOC, title="订单行数口径说明", metric_code="order_count", definition_version="v1.1"
+    )
+    base = _sql_evidence(12_345, metric="order_count", region="华南", definition_version="v1.0")
+
+    assert len(detect_conflicts([document, base], catalog=None)) == 1
+
+
+# ======================================================================== TIME
+def test_a_truncated_period_is_reported_as_time() -> None:
+    """文档自称 2025-Q3，但统计截止日是 9/25（该季到 9/30）→ TIME 冲突。
+
+    判据是**文档自己前后矛盾**，不是"两个来源的期间不同"——
+    后者会把"问 Q3 却召回年度报告"这种常见情况全报出来（实测过 157%–1133%
+    的那一批假冲突），噪声大一个数量级。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 25))
+
+    conflicts = detect_conflicts([document, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert len(conflicts) == 1
+    item = conflicts[0]
+    assert item.type is ConflictType.TIME
+    assert item.detected_difference["stat_period"] == "2025-Q3"
+    assert item.detected_difference["declared_cutoff"] == "2025-09-25"
+    assert item.detected_difference["period_end"] == "2025-09-30"
+    # 描述里必须有期间末，读的人才看得出"早于哪一天"
+    assert "2025-09-30" in item.description
+
+
+def test_month_end_is_never_treated_as_truncated() -> None:
+    """截止日落在期间末（`month_end` 解析出来的就是它）→ 不是截短，**不报**。
+
+    这是这条判据不误报的根据：语料里绝大多数报告都是 `month_end`，
+    它们必须一条 TIME 都不产生。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 30))
+
+    conflicts = detect_conflicts([document, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.VALUE], "只剩数值那条"
+
+
+def test_time_replaces_value_on_the_same_pair() -> None:
+    """期间被截短的同一对证据**只报 TIME，不报 VALUE**。
+
+    两个数既然不是同一个区间的合计，数值比对的前提就不成立。
+    再报一条"数值差 1.4%"是把「少统计了几天」说成「数字错了」——
+    而 13.3 的 `possible_explanations` 里原本只能**猜**时点不同，现在能**判**了。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 25))
+
+    conflicts = detect_conflicts([document, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.TIME]
+
+
+def test_time_is_reported_even_when_the_numbers_agree() -> None:
+    """数值一致**不影响** TIME——它说的是声明，不是取值。
+
+    这是判据的已知代价，如实钉住：语料里 9/28 截止的那两份报告，
+    因为业务库的日粒度数据只到每月 27 日，数字其实与完整期间一致；
+    但"自称 Q3、截止 9/28"这件事本身仍然矛盾，仍然该说。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 25))
+
+    conflicts = detect_conflicts([document, _sql_evidence(110_395_800.0)], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.TIME]
+
+
+def test_an_unknown_cutoff_falls_back_to_value() -> None:
+    """截止日未知 → 不是 TIME，而且**不抑制** VALUE。
+
+    "不知道"不能推出"不一致"，但也没有理由因此剥夺数值比对
+    （与 `_comparable` 的"未知就放行"同向）。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_period="2025-Q3")
+
+    conflicts = detect_conflicts([document, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.VALUE]
+
+
+def test_an_unknown_period_is_not_a_time_conflict() -> None:
+    """期间未知（解不成四种记号）→ 不报 TIME，即使截止日早得离谱。
+
+    没有"自称的期间"就没有可矛盾的对象——`2025-01` 到 `2025-09` 这种
+    九个月的区间归不到任何记号，它就不是"某一期被截短"。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    document = _document_evidence(_TABLE, stat_cutoff=date(2025, 9, 25))
+
+    conflicts = detect_conflicts([document, _sql_evidence(111_967_031.73)], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.VALUE]
+
+
+def test_the_time_description_carries_the_scope_suffix() -> None:
+    """TIME 的描述必须带上 `，范围 region=…` 后缀。
+
+    评测判据（`scripts/agent_harness.py`）对描述做的是**子串匹配**，
+    几条真冲突用例正是靠 `region=华南` / `region=华东` 钉住"报的是哪一行"。
+    TIME 与 VALUE 各写一遍这个后缀的话，改了一处会让另一处的用例变成
+    永远匹配不上的红，而红的原因看起来与文案毫无关系。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    row = _TABLE.replace("华东 |", "华南 |")
+    document = _document_evidence(row, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 25))
+
+    conflicts = detect_conflicts(
+        [document, _sql_evidence(111_967_031.73, region="华南")], catalog=catalog
+    )
+
+    assert len(conflicts) == 1
+    assert "region=华南" in conflicts[0].description
+
+
+def test_one_time_conflict_per_document_per_period() -> None:
+    """同一篇文档的多个行块只报**一条** TIME。
+
+    一篇报告被切成多块、一张表有好几行——不去重的话"自称 Q3 却只统计到 9/25"
+    会按行重复报出来，冲突列表里堆着十几条同义句，而读者会以为有十几个问题。
+    TIME 说的是**文档级**的声明，收敛成一条才对应得上。
+    """
+    catalog = _catalog(_metric("net_sales", "净销售额"))
+    first = _document_evidence(_TABLE, stat_period="2025-Q3", stat_cutoff=date(2025, 9, 25))
+    second = first.model_copy(update={"id": new_id(IdPrefix.EVIDENCE)})
+    scoped = _sql_evidence(111_967_031.73)
+
+    conflicts = detect_conflicts([first, second, scoped], catalog=catalog)
+
+    assert [item.type for item in conflicts] == [ConflictType.TIME]

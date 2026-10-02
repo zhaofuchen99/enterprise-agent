@@ -24,7 +24,7 @@ Phase 5 的 RAG 往同一张表里写。
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -80,6 +80,12 @@ class Evidence(BaseModel):
             而报告类文档的生效区间恒为空、统计期间才是它的"这一版说的是哪段时间"。
             `None` 表示**不知道**（制度与产品资料没有统计期间）——
             **不是**"不限期间"。判据里"不知道"要放行，见 `conflict._comparable`。
+        stat_cutoff: **统计截止日**（含入的最后一天），来自报告自身的声明
+            （清单的 `report.cutoff`，`month_end` 在入库时已解析成具体日期）。
+            它回答的是「这份报告自称的期间，实际统计到哪一天」——
+            截短了即为 TIME 冲突（`conflict._claim_truncated`）。
+            **与 `stat_period` 配对使用**：单独一个截止日说明不了问题，
+            要与它自称的期间末端比。`None` 同样表示**不知道**。
         reliability: 可靠性等级。
         content_hash: 证据内容的哈希，用于判同与去重。
         access_level: 访问级别（TBC-07 的 INTERNAL / CONFIDENTIAL）。
@@ -93,6 +99,7 @@ class Evidence(BaseModel):
     locator: dict[str, object]
     event_time: TimeRange | None = None
     stat_period: str | None = None
+    stat_cutoff: date | None = None
     retrieved_at: datetime
     metric_code: str | None = None
     definition_version: str | None = None

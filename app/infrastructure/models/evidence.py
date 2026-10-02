@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Float, Index, Integer, String, Text, UniqueConstraint
+from datetime import date
+
+from sqlalchemy import Date, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.db import Base
@@ -51,6 +53,12 @@ class AgentEvidence(Base):
     metric_code: Mapped[str | None] = mapped_column(String(64))
     #: 指标口径版本（16.8 的 embedding_version 之外，证据还要记口径版本）
     definition_version: Mapped[str | None] = mapped_column(String(32))
+    #: 统计期间记号（报告的 `report.period`）。**与 `event_time_*` 是两件事**：
+    #: 那是生效区间，报告类文档没有它，只有统计期间。
+    stat_period: Mapped[str | None] = mapped_column(String(16))
+    #: 统计截止日（`report.cutoff`，`month_end` 已在入库侧解成具体日期）。
+    #: 与 `stat_period` 配对判"自称的期间有没有被截短"（TIME 冲突）。
+    stat_cutoff: Mapped[date | None] = mapped_column(Date)
     #: 范围口径：区域/产品/渠道的取值集合，SCOPE 冲突的比对依据
     scope_json: Mapped[json_obj_opt]
     #: 可靠性等级。外部来源默认低于内部业务库与已发布制度（详细设计 12.3）。

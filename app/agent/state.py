@@ -230,7 +230,8 @@ class AgentState(TypedDict, total=False):
 
     # ---------------------------------------------------------- 证据与结论
     evidence: Annotated[list[Evidence], merge_by_id]
-    #: 【Phase 9 未接】多源冲突检测
+    #: 多源冲突检测的结果（`domain.evidence.Conflict`）。**五类里的三类**：
+    #: VALUE / DEFINITION / TIME，SCOPE 与 SOURCE 的缺前提见 `nodes/conflict.py`
     conflicts: list[Scalar]
     analysis_result: AnalysisResult | None
     #: `ReviewResult`（标成 `Scalar` 是为了避开与 `schemas.review` 的循环引用）
