@@ -1,353 +1,66 @@
-# 企业智能数据分析与决策 Agent
+# Enterprise Agent｜企业智能数据分析与决策 Agent
 
-把「自然语言问题」转化为「可追溯的数据结论」的多 Agent 系统：SQL 查询、知识检索、
-结果校验与冲突识别在同一个任务循环里协作，全过程可观测、可重放、有界收敛。
+基于大语言模型与 Agent 技术构建的企业智能数据分析系统，支持通过自然语言进行业务数据查询、企业知识检索与智能分析，帮助用户快速获取有依据、可追溯的业务决策结论。
 
-设计文档见 [`docs/`](docs/)：
+## 项目简介
 
-| 文档 | 内容 |
+项目采用多 Agent 协作架构，将企业结构化数据与非结构化知识相结合，通过任务规划、工具调用、数据查询、知识检索和结果验证，构建完整的智能分析工作流。
+
+## 核心功能
+
+- **多 Agent 协作**：基于 LangGraph 构建 Supervisor + State 架构，实现任务识别、拆解、调度与执行。
+- **智能数据分析**：基于 Text-to-SQL 将自然语言转换为 SQL，支持数据库 Schema 注入、SQL 安全校验及错误自修复。
+- **企业知识检索**：基于 RAG 构建知识库，结合向量检索、BM25、RRF 融合及 Reranker 提升检索质量。
+- **结果验证**：结合结构化数据与知识证据，通过 Reviewer 机制进行结果审核与冲突检测。
+- **实时交互**：基于 SSE 实现 Agent 执行过程的实时反馈。
+
+## 技术栈
+
+| 分类 | 技术 |
 |---|---|
-| `企业智能数据分析与决策Agent-需求规格说明书.md` | 功能与非功能需求 |
-| `企业智能数据分析与决策Agent-详细设计说明书.md` | 架构、Schema、接口、错误码 |
-| `企业智能数据分析与决策Agent-开发流程.md` | 阶段划分、验收命令、门禁 |
+| 开发语言 | Python 3.12 |
+| Web 框架 | FastAPI |
+| Agent 编排 | LangGraph、LangChain |
+| 大语言模型 | DeepSeek |
+| 关系型数据库 | MySQL 8 |
+| 缓存 | Redis |
+| 向量数据库 | Milvus |
+| Embedding | BGE-M3 |
+| Reranker | BGE-Reranker-v2-M3 |
+| 检索技术 | Hybrid Search、BM25、RRF |
+| 异步任务 | arq |
+| 可观测性 | OpenTelemetry |
 
----
-
-## 现在能做什么
-
-一句话问题 → 系统自己决定查哪几路（业务库 / 知识库）→ 拿证据 → 交叉核对 → 给出带引用的答案。
-
-```bash
-make run       # 一个终端：api + worker
-make demo      # 另一个终端：跑固化下来的九条问题
-```
-
-**演示控制台**：起了之后打开 <http://localhost:8000/> —— 提一个问题，
-左边的时间线会**一条条实时出现**后端正在做的事（`node.started` / `progress.assessed` /
-`review.completed` …），右边出结论、证据、冲突与限制。单文件 HTML、零依赖、无构建，
-走的就是公开接口（SSE 那条路用的是浏览器唯一能走的订阅令牌）。
-九条固化问题在里面做成了快捷按钮，面试时点一下就跑。
-
-九条问题覆盖了四条验收标准，**每条都有可断言的判据**（`configs/demo_questions.yaml`），
-而不是打出来让人自己看：
-
-| 用例 | 问题 | 证明什么 |
-|---|---|---|
-| `demo-sql` | 2025年Q3华东地区的净销售额是多少？ | 简单指标查询**只走 SQL**（FR-PLAN-002 规则 1） |
-| `demo-sql-q2` | 2025年Q2华东地区的净销售额是多少？ | 同上、**换一个期间**——防「固化了一个数而它碰巧总能被抄对」 |
-| `demo-sql-annual` | 2025年华东地区全年的净销售额是多少？ | 同上、**跨四个季度**，与单季构成粒度对照 |
-| `demo-rag` | 华东区域渠道折扣政策对直营渠道的折扣上限？ | 制度问法**只走 RAG**，不去查库 |
-| `demo-cross` | …专项分析表里华东的净销售额是多少？与库里一致吗？ | 双源并列 + **检出数值冲突并披露** |
-| `demo-expand` | 2026年1月华南地区的净销售额是多少？ | SQL 查不到时**补一路 RAG**（「能根据工具结果继续分析」） |
-| `demo-scope` | （受限账号）2025年Q3华南地区的净销售额是多少？ | SQL 被数据权限拦成空 → 说清「**看不到**」而不是「没有」，并声明文档来源未经权限过滤 |
-| `demo-absent` | 跨境出海业务管理办法怎么规定？ | 语料里没有 → **拒答**，不编 |
-| `demo-clarify` | 上个季度卖得怎么样？ | 缺时间与指标 → **澄清**，且一次问全 |
-
-> 后两条依赖模型的意图判定与检索排序，**同一个问题两次跑可能不一样**。
-> 演示脚本把它们单列成「观察用例」，不混进通过率——那会把
-> "模型这次判歪了"说成"系统坏了"。
-
-## 实测数据（这些是跑出来的，不是目标值）
-
-| 门禁 | 命令 | 实测 |
-|---|---|---|
-| SQL 安全与越权 | `make check` | **28 条 100% 阻断**（含绕开模型、直接喂危险 SQL） |
-| 金标 SQL 正确率 | `make eval-sql` | **10/10**（结果集等价） |
-| RAG Recall@8（重排关闭） | `make eval-rag` | 19/20 = 95%（门禁 ≥85%） |
-| RAG Recall@8（重排开启） | `make eval-rag` | **20/20 = 100%**，定位一致率 17/20 → **19/20** |
-| 重排阈值 | `make calibrate-rerank` | 有答案 0.1364–0.9989 vs 不存在 0.0008–0.0125 → 取 **0.07** |
-| 语料缺陷注入 | `make verify-corpus` | **10/10 类**（其中 2 类只验证了语料侧，见下） |
-| 重排阈值仍成立（语料重建后） | `make calibrate-rerank` | 有答案最低 **0.1350** vs 不存在最高 **0.0127** → 0.07 仍在可用区间 |
-| **Agent 端到端** | `make eval-agent` | **稳定用例 19/19**，观察用例 1/1（工具选择 / 冲突 / 审查 / 澄清各 5 条，需 `make run`） |
-| 全量检查 | `make check` | **924 单测 + 108 集成** |
-
-> **重排是默认关闭的**（`.env` 里 `RERANKER_ENABLED`），上表两行 Recall@8 是同一份
-> 语料与金标下的开/关对比：提升全部来自 `rag-06` 那条**同义词误拒**
-> （「报备」vs 语料里的「备案」）——纯词汇规则救不回来，语义判据能。
-> 样本 20 条，一条就是 5 个百分点，所以这里如实写成"那一条被救回来了"，
-> 而不是"提升了 5 个点"。
-
----
-
-## 架构总览
+## 系统架构
 
 ```mermaid
-flowchart LR
-    A[HTTP /api/agent/chat] --> B[(Redis 队列)]
-    B --> C[Worker]
-    C --> D{{最小 Graph}}
+flowchart TD
+    A[用户自然语言输入] --> B[Supervisor]
+    B --> C[任务规划与拆解]
+    C --> D[LangGraph 工作流]
 
-    subgraph D [十节点任务循环]
-        direction TB
-        S[supervisor<br/>意图 + 计划] --> T1[sql]
-        S --> T2[rag]
-        T1 --> R[reflect<br/>确定性判定]
-        T2 --> R
-        R -->|该补一路| PE[plan_extend<br/>唯一改计划的节点]
-        PE --> T1
-        PE --> T2
-        R -->|收敛| F[conflict<br/>数值冲突检测]
-        F --> AN[analysis<br/>模型组织证据]
-        AN --> RV[reviewer<br/>两阶段检查]
-        RV --> RR[retry_router<br/>14.4 路由表]
-        RR -->|审查要求补证| T2
-        RR -->|审查要求下钻| PE
-        RR -->|不重试| FI[final<br/>代码渲染引用]
-    end
+    D --> E[SQL Agent]
+    D --> F[RAG Agent]
 
-    T1 --> M[(MySQL<br/>业务演示库·只读)]
-    T2 --> Q[(Qdrant<br/>1871 chunk 混合检索)]
-    T2 --> O[Ollama<br/>bge-m3 本地向量化]
-    D --> G[云模型<br/>意图/改写/分析]
-    FI --> E[(agent_task<br/>答案 + 计划 + 结构化结果)]
+    E --> G[SQL 生成与安全校验]
+    G --> H[(MySQL)]
+
+    F --> I[混合检索与重排序]
+    I --> J[(Milvus)]
+
+    H --> K[结果汇总]
+    J --> K
+    K --> L[Reviewer]
+    L --> M[分析结论与 SSE 输出]
 ```
 
-**三条边界是硬约束，由 `scripts/check_layering.py` 在 CI 里强制**：
-API 进程不得加载 LangGraph 与 Tool（启动变慢、内存翻倍）；
-Worker 不得依赖 FastAPI（无法独立扩缩容）；`domain/` 不依赖任何基础设施。
-分层表与目录结构见下方「架构」一节。
+## 核心技术亮点
 
-**`reflect` 与 `retry_router` 都是确定性的**（不调模型）：前者只看 State 里的
-事实——还有没有待执行步骤、哪条路跑了但空、演进预算还剩多少；后者按 14.4 的
-路由表分派，**预算耗尽就降级，不借用其他类预算**。「SQL 空了就补一路 RAG」
-这条链路因此不依赖云模型连通性，而它正是验收标准第③条的核心。
+1. **Agent 工作流编排**：通过 Supervisor 统一调度任务，利用 LangGraph 管理节点状态、条件路由及多步骤执行。
+2. **SQL 安全控制**：通过 SQL AST 解析、白名单约束、只读数据库权限等多层机制，降低大模型生成 SQL 的安全风险。
+3. **混合检索优化**：融合向量检索与 BM25 关键词检索，通过 RRF 和 Reranker 提升知识召回与排序质量。
+4. **结果可信度控制**：利用 Evidence 与 Reviewer 机制，对数据结果和知识依据进行验证，减少错误结论与模型幻觉。
 
-**审查分两个阶段，`retry_router` 让「只能整体拦下」变成「能自纠」**。
-第一阶段是代码：必需步骤跑没跑、结论有没有引用、引用在不在、敏感字段、未决问题
-——它判的是**事实**，所以它握着否决权（一票否决 → 输出「审查未通过」）。
-第二阶段是模型：引用的那些**够不够**支撑这句话、推断有没有越界、限制说清楚没有
-——它判的是**尺度**，所以它只记 `WARNING`，但可以要求补证据、
-也可以在「需要你先定口径」时让答案变成一句问句（14.3 的 `CLARIFY`）。
+## 项目目标
 
-`retry_router` 消费的是后者的请求（也消费第一阶段的）：按 14.4 的路由表分派，
-**预算耗尽就降级，不借用其他类预算**。回边用**追加新步骤**而不是重置步骤状态
-——后者会让 `pending_steps` 的「已完成的步骤不重跑」失效，而那是个
-**不报错、只烧递归额度的死循环**。
-
-**`plan_extend` 是唯一能改计划的节点，而它有两个入口。** `reflect` 判"该补一路"
-时把算好的那一步交给它（**不调模型**——所以"SQL 空了就补 RAG"这条链路不依赖
-云模型连通性）；审查判"缺一整类信息"时它走模型生成步骤（14.3 明写 Reviewer
-不直接指定 SQL）。每次演进的**原因、加了哪几步、由哪条中间发现催生**都落进
-`plan_deltas` 与 `agent_plan_revision`，而"哪些步骤是下钻出来的"由
-`agent_task_step.origin` 回答。**这一层是「自适应下钻」这四个字唯一有实体的地方。**
-
----
-
-## 快速开始（30 分钟内）
-
-### 0. 前置条件
-
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| Python | 3.12.x | 由 `uv` 自动安装，无需手动准备 |
-| uv | 最新 | <https://docs.astral.sh/uv/> |
-| Docker + Compose | 最新稳定 | 承载有状态组件 |
-| 内存 | ≥ 8GB 可用 | 向量库改判 Qdrant 后实测仅占 300MB（见下方「已知限制」） |
-
-### 1. 初始化
-
-```bash
-make bootstrap     # 生成 .env 并安装依赖
-```
-
-然后编辑 `.env`，**至少填上模型相关密钥**：
-
-```
-MODEL_PROVIDER / MODEL_NAME / MODEL_API_KEY
-EMBEDDING_MODEL / EMBEDDING_API_KEY
-```
-
-> 密钥只从环境变量加载。`.env` 已在 `.gitignore` 中，任何情况下不得提交或写入 Compose 明文。
-
-### 2. 起有状态组件
-
-```bash
-make up            # redis / agent-mysql / business-mysql / minio
-```
-
-### 3. 起服务
-
-```bash
-make run           # 同时起 api + worker
-```
-
-> **不要只跑 `make api`。** API 与 Worker 是两个进程，只起 API 会让任务永远停在
-> `QUEUED`，且从 API 日志里几乎看不出原因——这是本项目最常见的自伤方式（开发流程 4.5）。
-
-### 4. 验证
-
-```bash
-curl -s localhost:8000/health/live     # {"status":"ok","service":"api"}
-curl -s localhost:8000/health/ready    # {"status":"ready","checked":["redis"]}
-make check                             # lint + 类型 + 分层约束 + 测试
-```
-
-### 5. 调一次接口（Phase 1 起可用）
-
-演示账号 `analyst` / `admin`，口令见 `app/repositories/user_repo.py` 的 `DEMO_ACCOUNTS`
-（开发环境占位，`APP_ENV=prod` 时不会写入任何用户）。
-
-```bash
-TOKEN=$(curl -s -X POST localhost:8000/api/auth/login -H 'Content-Type: application/json' \
-  -d '{"username":"analyst","password":"analyst-dev-pass"}' | python -c 'import sys,json;print(json.load(sys.stdin)["data"]["access_token"])')
-
-curl -s -X POST localhost:8000/api/agent/chat -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
-  -d '{"message":"华东区第三季度销售额是多少"}'
-
-# 拿上一步返回的 task_id 查状态
-curl -s localhost:8000/api/agent/tasks/<task_id> -H "Authorization: Bearer $TOKEN"
-```
-
-所有响应（含错误）都是统一外壳 `{code, message, data, trace_id, retryable}`；
-`trace_id` 与响应头 `X-Trace-Id` 一致，可直接拿去日志里检索。
-
-> 建完任务后由 Worker 领取并跑完整张图，答案写回 `agent_task`。**只起 API
-> 不起 Worker 的话，任务会停在 `QUEUED`**——这是本项目最常见的自伤方式。
->
-> 任务详情（`GET /api/agent/tasks/{id}`）除答案外还返回**步骤进度、证据、
-> 冲突、审查结论与限制**，它们落在 `agent_task` 的两个 JSON 列里。
-> "答案为什么成立"就是从那里查的。
-
----
-
-## 常用命令
-
-```
-make up         启动有状态组件          make check      提交前必跑（lint+类型+分层+测试）
-make rag-up     额外启动 Qdrant         make lint       仅静态检查
-make down       停止全部                make typecheck  仅类型检查
-make redis-cli  进入 Redis 排查         make layering   仅分层约束检查
-make api        只起 API 进程           make test       仅单元测试
-make worker     只起 Worker 进程        make test-integration  需要真实 Redis 的用例
-make run        同时起两个进程          make fmt        格式化并自动修复
-
-make demo       端到端演示九条固化问题   make eval-sql   金标 SQL 评测
-make eval-rag   RAG Recall@8 评测        make verify-corpus  语料缺陷注入门禁
-make eval-agent Agent 端到端评测 25 条    make eval-agent-ask  先跑一遍再固化
-make ingest     语料入库并发布            make retrieve   单次混合检索（调试用）
-make reindex    从归档原文重建向量索引     make sql        单次自然语言 → SQL 证据
-make tokenize   中文分词逐条核对
-```
-
-演示控制台（`app/static/index.html`）在 <http://localhost:8000/>，需要 `make run`。
-它不占命令行入口：页面要展示的东西全是接口现成的，没有后端专用接口。
-
-多实例验收用 `make api PORT=8001`。
-
-排查任务卡住时：
-
-```bash
-make redis-cli
-> ZCARD q:agent                         # 队列里还有多少没被领走
-> HGETALL task:tsk_xxx:record           # 任务状态、worker_id、心跳时间
-> XRANGE task:tsk_xxx:events - +        # 事件流（这个任务发布过什么）
-> TTL task:tsk_xxx:events               # 事件流保留期（结束后 1 小时）
-> ZCARD idx:task:active:usr_xxx         # 该用户占用的并发配额
-```
-
-`HGET task:tsk_xxx:record status` 停在 `RUNNING` 而 `heartbeat_at` 很旧，
-说明执行它的 Worker 挂了——孤儿回收（每 30 秒一次）会把它置为 `FAILED` + `WORKER_INTERRUPTED`
-并释放并发配额。
-
----
-
-## 架构
-
-### 分层与依赖方向
-
-```
-api  →  services  →  agent / domain / tools  →  repositories / infrastructure
-```
-
-依赖只能向右。领域 Schema **不依赖** FastAPI，也不依赖具体数据库客户端。
-
-| 层 | 职责 | 禁止 |
-|---|---|---|
-| `api/` | 鉴权、参数校验、调用 service | 执行 SQL、调用模型、写业务规则、导入 `agent/` 编排实现 |
-| `services/` | 编排、事务、事件、队列与限流封装 | 拼接 SQL 字符串、直接实例化 LangGraph |
-| `agent/nodes/` | 读写 State、调用 Tool 接口 | 在 Node 内建数据库连接、导入 FastAPI |
-| `domain/` | 纯数据模型与校验逻辑 | 依赖 FastAPI、依赖具体数据库客户端 |
-| `repositories/` | 数据访问实现 | 包含业务判断 |
-| `infrastructure/` | 外部系统客户端与协议实现 | 包含业务规则 |
-
-### 两条进程边界硬约束
-
-1. `app/main.py` 与 `app/api/**` 不得 import `agent.graph`、`agent.nodes.*`、`tools.*`；
-2. `app/worker.py` 与 `app/agent/**`、`app/tools/**` 不得 import `fastapi`。
-
-这两条**由 `scripts/check_layering.py` 在 CI 中强制**，而非靠人工 review。破坏后 API 进程
-会加载 LangGraph 与全部 Tool，启动变慢、内存翻倍，且 Worker 无法独立扩缩容——影响要到
-运行时才暴露。
-
-```bash
-make layering
-```
-
-### 目录结构
-
-```
-app/
-├── main.py                     # API 进程入口
-├── worker.py                   # Worker 进程入口
-├── api/            schemas / errors / middleware / deps / auth / chat / tasks / ...
-├── agent/          LangGraph 编排：graph / state / routing / nodes / prompts / schemas
-├── tools/          sql（schema/generator/validator/executor）、rag、search
-├── domain/         user / conversation / task / evidence / conflict / plan / loop / review（纯模型）
-├── services/       auth_service / task_service / task_runner / event_bus / rate_limit / ...
-├── repositories/   user_repo / conversation_repo / task_repo（Protocol + 实现）
-├── infrastructure/ db / redis / qdrant / storage / model_gateway / observability / logging
-├── core/           config / ids / cache / errors / security
-└── tests/
-```
-
----
-
-## 配置
-
-全部配置项在 `app/core/config.py` 以 Pydantic Settings 声明，带默认值与上下限。
-环境变量清单见 `.env.example`。嵌套配置用双下划线覆盖：
-
-```bash
-LOOP__MAX_TOTAL_STEPS=30
-```
-
-**循环预算**（`LOOP__*`）直接约束任务循环的收敛性。四类预算
-（`MAX_SQL_REPAIRS` / `MAX_REPLANS` / `MAX_REVIEWER_EVIDENCE` / `MAX_EXPANSIONS`）
-相互独立、不可借用；任何一项调整后必须重跑循环类评测集。
-
----
-
-## 已知限制
-
-| 限制 | 影响 | 处理 |
-|---|---|---|
-| 本机 WSL 内存 7.6GB | Milvus Standalone 需 8GB 起，跑不起来 | **已由 TBC-05 结案解决**：向量库改判 Qdrant（实测 300MB、多进程并发正常），见详细设计 23.1.1 |
-| 项目位于 WSL 原生 ext4 | Windows 侧需经 `\\wsl$\` 访问 | 有意为之：`/mnt/c` 走 9p，`uv sync` 与 `pytest` 会慢一个数量级 |
-| **Reranker 默认关闭**（已实现，需配置启用） | 关闭时检索用 RRF 融合后的 Top-8 直接出证据；打开才走 cross-encoder 重排 | 已实现 11.7 第 ⑥⑦ 步（`app/tools/rag/reranker.py`，`BAAI/bge-reranker-v2-m3` 云服务）。**本机跑不了本地重排**：Ollama 无 rerank 端点（实测 404），本地 cross-encoder 与 7.6GB 内存不相称。11.7 的 ⑥⑦⑧ 三步都已实现，⑧「邻近块扩展」有 `RAG__TABLE_EXPAND_MAX_ROWS` 边界（默认 12 行）——语料里那张 80 行的明细表装不下，超边界的表维持"如实说明 + 建议查库" |
-| **SSE 重放暂走 Redis Stream** | 断线重连在流保留期（1 小时）内可完整补齐，超出窗口只能拿到 `snapshot` + `replay_lost=true` | 18.3 的「MySQL 权威重放」要先把 Worker 的每条事件**先落 `agent_trace_event` 取 sequence 再 XADD**，而现在的轨迹是收尾时批量落的（两批事件不是同一批）；合并已登记 |
-| **冲突检测只做 VALUE 一类** | 口径 / 时点 / 范围 / 来源四类没做，各有各的缺前提（见 `app/agent/nodes/conflict.py` 的清单） | Phase 9 |
-| **已知误报：表格的合计行与分项行不分** | 实测里一张表的分项行被当成区域合计去比，报出过 92% 的"差异" | 需要表格的合计标记或指标口径的 `grain`；模型能在 `claims` 里自己纠正，检测器这一层还不能 |
-| **`plan_extend` 的校验没做全** | 6.6.3 的八条循环校验里做了四条（总步数、单轮步数、工具闭集、去重键）；**去重的语义相似度**、**下钻深度**（`objective` 是自由文本，判不出"同一实体维度链"）、**`success_criteria`**（`TaskStep` 没这个字段）三条没做 | 已登记在 CLAUDE.md 的【后续扩展】 |
-| **`retry_router` 的 `replan` 分支走不到** | 模型审查的四个布尔里没有哪一个问的是"计划本身不可执行"，所以 `choose_retry` 能路由、却没有产出者 | 要接就得给 `ModelReview` 加一条判断，而那会让"计划是否可执行"变成模型说了算——需重新论证 |
-| **`agent_finding` 表仍是空的** | `findings` 进 State 也进推理链（`investigation_chain`），但**没有落库的调用方**，所以库里查不到那些 `fnd_` id | 已登记 |
-| **`WAITING_CLARIFICATION` 没有状态位** | 澄清在答案文本里表达，任务终态仍是 `SUCCEEDED`——前端判不出"这条在等你回话" | 要动任务终态与 API/SSE 三处，已登记 |
-| 登录接口未限流 | 可被口令爆破 | Phase 12；已登记在详细设计 19.3 |
-| 同义词会导致误拒 | `报备` vs 语料里的 `备案`，余弦 0.74 仍被拒答（金标 rag-06） | **重排生效时已解**（拒答改由逐候选的相关性分判）；重排关闭时仍会误拒——两条路径的差别写在 CLAUDE.md 约定 57 |
-| 跨进程 trace 用内存 exporter 断言 | 未接真实追踪后端，线上看不到链路 | 本机无 Jaeger/Grafana；OTLP 开关已就绪，Phase 11 接后端 |
-
----
-
-## 开发约定
-
-- **分支**：主干开发 + 短生命周期特性分支（`feat/phase-04-sql-validator`）
-- **提交**：Conventional Commits（`feat(sql): 增加 AST 表字段白名单校验`）
-- **每个 Phase 的节奏**：读文档 → 定 Schema → 写会失败的测试 → 实现 → 本地验证 → 埋点 → 更新配置 → 对照门禁 → 提交
-- **完成的定义**：`make check` 全绿、验收命令可重复执行、需求条目逐条核对、Trace 与结构化日志可按 `task_id` 定位、新增配置有默认值与上下限、设计偏离已回写文档、无未标注 TODO
-
-### 日志与脱敏
-
-结构化日志字段固定为
-`timestamp、level、service、trace_id、conversation_id、task_id、step_id、node、tool、status、duration_ms、error_code、message`。
-
-**日志、SSE、Trace 默认脱敏**：禁止记录 Token、密码、密钥、完整敏感字段、模型隐藏思维链、SQL 原始行数据。
+构建一个具备自主任务规划、工具调用、知识检索、数据分析及结果验证能力的企业级智能 Agent，让自然语言成为连接企业数据与业务决策的入口。
